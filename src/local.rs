@@ -236,7 +236,12 @@ fn scan_songs_dir_streaming_inner(
             }
 
             let _ = tx.send(ScanEvent::Parsing { path: path.clone() });
-            match parse_osu_file_with_timeout(path.clone(), Duration::from_secs(8)) {
+            let calculate_local_stars = db_index.is_none();
+            match parse_osu_file_with_timeout(
+                path.clone(),
+                Duration::from_secs(8),
+                calculate_local_stars,
+            ) {
                 Ok(mut map) => {
                     if let Some(index) = &db_index {
                         if map.stars.is_none()
@@ -246,6 +251,14 @@ fn scan_songs_dir_streaming_inner(
                         {
                             map.stars = meta.standard_stars;
                         }
+                    }
+                    if map.stars.is_none() {
+                        map.stars = calculate_stars_for_path_with_timeout(
+                            path.clone(),
+                            Duration::from_secs(8),
+                        )
+                        .ok()
+                        .flatten();
                     }
                     let issues = find_repair_issues(&map);
                     maps.push(map.clone());
@@ -308,10 +321,15 @@ fn build_sets(maps: &[LocalBeatmap]) -> Vec<LocalBeatmapSet> {
 fn parse_osu_file_with_timeout(
     path: PathBuf,
     timeout: Duration,
+    calculate_local_stars: bool,
 ) -> std::result::Result<LocalBeatmap, (ParseIssueKind, anyhow::Error)> {
+    if !calculate_local_stars {
+        return parse_osu_file_inner(&path, false).map_err(|err| (ParseIssueKind::ParseError, err));
+    }
+
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(parse_osu_file(&path));
+        let _ = tx.send(parse_osu_file_inner(&path, calculate_local_stars));
     });
 
     match rx.recv_timeout(timeout) {
@@ -329,6 +347,10 @@ fn parse_osu_file_with_timeout(
 }
 
 pub fn parse_osu_file(path: &Path) -> Result<LocalBeatmap> {
+    parse_osu_file_inner(path, true)
+}
+
+fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<LocalBeatmap> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let md5 = format!("{:x}", md5::compute(&bytes));
     let text = String::from_utf8_lossy(&bytes);
@@ -379,7 +401,9 @@ pub fn parse_osu_file(path: &Path) -> Result<LocalBeatmap> {
 
     let folder = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
 
-    let stars = calculate_stars(&bytes);
+    let stars = calculate_local_stars
+        .then(|| calculate_stars(&bytes))
+        .flatten();
 
     Ok(LocalBeatmap {
         path: path.to_owned(),
@@ -413,6 +437,20 @@ fn calculate_stars(bytes: &[u8]) -> Option<f32> {
     let beatmap = Beatmap::from_bytes(bytes).ok()?;
     let attributes = Difficulty::new().checked_calculate(&beatmap).ok()?;
     Some(attributes.stars() as f32)
+}
+
+fn calculate_stars_for_path_with_timeout(
+    path: PathBuf,
+    timeout: Duration,
+) -> std::result::Result<Option<f32>, mpsc::RecvTimeoutError> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stars = fs::read(path)
+            .ok()
+            .and_then(|bytes| calculate_stars(&bytes));
+        let _ = tx.send(stars);
+    });
+    rx.recv_timeout(timeout)
 }
 
 fn find_repair_issues(map: &LocalBeatmap) -> Vec<RepairIssue> {

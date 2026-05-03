@@ -19,6 +19,9 @@ use std::{
     time::Duration,
 };
 
+const UPDATE_CHECK_DELAY: Duration = Duration::from_millis(25);
+const BEATMAPSET_DOWNLOAD_DELAY: Duration = Duration::from_millis(750);
+
 pub struct MapManagerApp {
     query: BeatmapQuery,
     songs_dir: String,
@@ -26,6 +29,11 @@ pub struct MapManagerApp {
     collection_name: String,
     repair_backend_url: String,
     selected_maps: Vec<LocalBeatmap>,
+    selected_md5s: BTreeSet<String>,
+    filtered_map_indexes: Vec<usize>,
+    filtered_cache_key: String,
+    repair_jobs_cache: Vec<RepairJob>,
+    repair_jobs_cache_key: String,
     scan: Option<LibraryScan>,
     is_scanning: bool,
     is_repairing: bool,
@@ -214,6 +222,11 @@ impl MapManagerApp {
             collection_name: "osu-map-manager".to_owned(),
             repair_backend_url: "https://osu-map-manager.stanislavberman.workers.dev".to_owned(),
             selected_maps: Vec::new(),
+            selected_md5s: BTreeSet::new(),
+            filtered_map_indexes: Vec::new(),
+            filtered_cache_key: String::new(),
+            repair_jobs_cache: Vec::new(),
+            repair_jobs_cache_key: String::new(),
             scan: None,
             is_scanning: false,
             is_repairing: false,
@@ -258,7 +271,16 @@ impl MapManagerApp {
     fn poll_background(&mut self) {
         if let Some(rx) = self.scan_rx.take() {
             let mut keep_rx = true;
-            while let Ok(event) = rx.try_recv() {
+            let mut disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
                 match event {
                     ScanEvent::Started {
                         songs_dir,
@@ -267,6 +289,8 @@ impl MapManagerApp {
                     } => {
                         self.scan = Some(LibraryScan::default());
                         self.selected_maps.clear();
+                        self.selected_md5s.clear();
+                        self.invalidate_scan_caches();
                         self.is_scanning = true;
                         self.current_folder.clear();
                         self.current_map.clear();
@@ -389,20 +413,29 @@ impl MapManagerApp {
                 }
             }
 
-            match rx.try_recv() {
-                Err(mpsc::TryRecvError::Empty) if keep_rx => self.scan_rx = Some(rx),
-                Err(mpsc::TryRecvError::Disconnected) if keep_rx => {
+            if keep_rx {
+                if disconnected {
                     self.is_scanning = false;
                     self.scan_cancel = None;
                     self.status = "Scan worker disconnected".to_owned();
+                } else {
+                    self.scan_rx = Some(rx);
                 }
-                _ => {}
             }
         }
 
         if let Some(rx) = self.repair_rx.take() {
             let mut keep_rx = true;
-            while let Ok(event) = rx.try_recv() {
+            let mut disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
                 match event {
                     RepairEvent::Started { total } => {
                         self.is_repairing = true;
@@ -473,19 +506,28 @@ impl MapManagerApp {
                 }
             }
 
-            match rx.try_recv() {
-                Err(mpsc::TryRecvError::Empty) if keep_rx => self.repair_rx = Some(rx),
-                Err(mpsc::TryRecvError::Disconnected) if keep_rx => {
+            if keep_rx {
+                if disconnected {
                     self.is_repairing = false;
                     self.status = "Repair worker disconnected".to_owned();
+                } else {
+                    self.repair_rx = Some(rx);
                 }
-                _ => {}
             }
         }
 
         if let Some(rx) = self.update_rx.take() {
             let mut keep_rx = true;
-            while let Ok(event) = rx.try_recv() {
+            let mut disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
                 match event {
                     UpdateEvent::CheckStarted { total } => {
                         self.is_checking_updates = true;
@@ -588,14 +630,14 @@ impl MapManagerApp {
                 }
             }
 
-            match rx.try_recv() {
-                Err(mpsc::TryRecvError::Empty) if keep_rx => self.update_rx = Some(rx),
-                Err(mpsc::TryRecvError::Disconnected) if keep_rx => {
+            if keep_rx {
+                if disconnected {
                     self.is_checking_updates = false;
                     self.is_updating_maps = false;
                     self.status = "Update worker disconnected".to_owned();
+                } else {
+                    self.update_rx = Some(rx);
                 }
-                _ => {}
             }
         }
     }
@@ -717,9 +759,11 @@ impl MapManagerApp {
             scan.problems
                 .retain(|issue| !deleted.contains(&issue.beatmap));
             scan.sets = build_sets_for_scan(&scan.maps);
-            self.selected_maps.retain(|map| {
-                !deleted.contains(&map.path) && (!self.only_osu_std || is_osu_std(map))
+            let only_osu_std = self.only_osu_std;
+            self.retain_selected_maps(|map| {
+                !deleted.contains(&map.path) && (!only_osu_std || is_osu_std(map))
             });
+            self.invalidate_scan_caches();
         }
 
         self.status = if failures.is_empty() {
@@ -740,12 +784,13 @@ impl MapManagerApp {
             return;
         }
 
-        let Some(scan) = &self.scan else {
+        if self.scan.is_none() {
             self.status = "Scan your Songs directory before repairing maps".to_owned();
             return;
-        };
+        }
 
-        let jobs = repair_jobs(scan);
+        self.refresh_repair_jobs();
+        let jobs = self.repair_jobs_cache.clone();
         if jobs.is_empty() {
             self.status = "No repairable corrupted beatmapsets found".to_owned();
             return;
@@ -850,17 +895,75 @@ impl MapManagerApp {
         added
     }
 
-    fn filtered_maps(&self) -> Vec<LocalBeatmap> {
-        self.scan
-            .as_ref()
-            .map(|scan| {
-                scan.maps
-                    .iter()
-                    .filter(|map| matches_visible_filters(&self.query, self.only_osu_std, map))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn invalidate_scan_caches(&mut self) {
+        self.filtered_cache_key.clear();
+        self.filtered_map_indexes.clear();
+        self.repair_jobs_cache_key.clear();
+        self.repair_jobs_cache.clear();
+    }
+
+    fn filtered_cache_key(&self) -> String {
+        let map_count = self.scan.as_ref().map_or(0, |scan| scan.maps.len());
+        let query = serde_json::to_string(&self.query).unwrap_or_default();
+        format!("{map_count}:{}:{query}", self.only_osu_std)
+    }
+
+    fn refresh_filtered_maps(&mut self) {
+        let key = self.filtered_cache_key();
+        if key == self.filtered_cache_key {
+            return;
+        }
+
+        self.filtered_map_indexes.clear();
+        if let Some(scan) = &self.scan {
+            self.filtered_map_indexes
+                .extend(scan.maps.iter().enumerate().filter_map(|(index, map)| {
+                    matches_visible_filters(&self.query, self.only_osu_std, map).then_some(index)
+                }));
+        }
+        self.filtered_cache_key = key;
+    }
+
+    fn repair_jobs_cache_key(&self) -> String {
+        let Some(scan) = &self.scan else {
+            return String::new();
+        };
+        format!("{}:{}", scan.maps.len(), scan.problems.len())
+    }
+
+    fn refresh_repair_jobs(&mut self) {
+        let key = self.repair_jobs_cache_key();
+        if key == self.repair_jobs_cache_key {
+            return;
+        }
+
+        self.repair_jobs_cache = self.scan.as_ref().map(repair_jobs).unwrap_or_default();
+        self.repair_jobs_cache_key = key;
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_maps.clear();
+        self.selected_md5s.clear();
+    }
+
+    fn select_map(&mut self, map: &LocalBeatmap) {
+        if self.selected_md5s.insert(map.md5.clone()) {
+            self.selected_maps.push(map.clone());
+        }
+    }
+
+    fn deselect_md5(&mut self, md5: &str) {
+        self.selected_md5s.remove(md5);
+        self.selected_maps.retain(|selected| selected.md5 != md5);
+    }
+
+    fn retain_selected_maps(&mut self, mut keep: impl FnMut(&LocalBeatmap) -> bool) {
+        self.selected_maps.retain(|map| keep(map));
+        self.selected_md5s = self
+            .selected_maps
+            .iter()
+            .map(|map| map.md5.clone())
+            .collect();
     }
 
     fn map_result_label(&self, map: &LocalBeatmap) -> String {
@@ -954,7 +1057,7 @@ impl eframe::App for MapManagerApp {
                 ui.separator();
                 ui.checkbox(&mut self.only_osu_std, "Only osu!std maps");
                 if self.only_osu_std {
-                    self.selected_maps.retain(is_osu_std);
+                    self.retain_selected_maps(is_osu_std);
                 }
                 ui.separator();
                 ui.label("Scan issue handling");
@@ -967,8 +1070,10 @@ impl eframe::App for MapManagerApp {
                 ui.label("Some osu!web-only fields, such as ranked status and favourites, require database/API metadata and will not match local .osu files yet.");
             });
 
+        self.refresh_filtered_maps();
+        self.refresh_repair_jobs();
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            let filtered_maps = self.filtered_maps();
             ui.columns(2, |columns| {
                 columns[0].heading("Local library");
                 egui::Grid::new("library_paths")
@@ -1023,24 +1128,29 @@ impl eframe::App for MapManagerApp {
                     }
                 }
 
-                if let Some(scan) = &self.scan {
-                    let scanned_maps = scan.maps.len();
-                    let scanned_sets = scan.sets.len();
-                    let repair_issues = scan.problems.len();
+                if self.scan.is_some() {
+                    let (scanned_maps, scanned_sets, repair_issues) =
+                        self.scan.as_ref().map_or((0, 0, 0), |scan| {
+                            (scan.maps.len(), scan.sets.len(), scan.problems.len())
+                        });
                     columns[0].horizontal(|ui| {
                         if ui.button("Select all filtered").clicked() {
-                            for map in &filtered_maps {
-                                if !self
-                                    .selected_maps
-                                    .iter()
-                                    .any(|selected| selected.md5 == map.md5)
-                                {
-                                    self.selected_maps.push(map.clone());
-                                }
+                            let maps = self
+                                .scan
+                                .as_ref()
+                                .map(|scan| {
+                                    self.filtered_map_indexes
+                                        .iter()
+                                        .filter_map(|&index| scan.maps.get(index).cloned())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            for map in &maps {
+                                self.select_map(map);
                             }
                         }
                         if ui.button("Clear selection").clicked() {
-                            self.selected_maps.clear();
+                            self.clear_selection();
                         }
                     });
                     columns[0].label(format!("{} selected map(s)", self.selected_maps.len()));
@@ -1059,28 +1169,34 @@ impl eframe::App for MapManagerApp {
                     columns[0].add_space(8.0);
                     columns[0].label(format!(
                         "{} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
-                        filtered_maps.len(),
+                        self.filtered_map_indexes.len(),
                         scanned_maps,
                         scanned_sets,
                         repair_issues
                     ));
-                    egui::ScrollArea::vertical().id_source("local_maps").show(
+                    egui::ScrollArea::vertical().id_source("local_maps").show_rows(
                         &mut columns[0],
-                        |ui| {
-                            for map in &filtered_maps {
-                                let mut selected = self
-                                    .selected_maps
-                                    .iter()
-                                    .any(|selected| selected.md5 == map.md5);
+                        24.0,
+                        self.filtered_map_indexes.len(),
+                        |ui, row_range| {
+                            for row in row_range {
+                                let Some(map) = self.scan.as_ref().and_then(|scan| {
+                                    self.filtered_map_indexes
+                                        .get(row)
+                                        .and_then(|&index| scan.maps.get(index))
+                                        .cloned()
+                                }) else {
+                                    continue;
+                                };
+                                let mut selected = self.selected_md5s.contains(&map.md5);
                                 if ui
-                                    .checkbox(&mut selected, self.map_result_label(map))
+                                    .checkbox(&mut selected, self.map_result_label(&map))
                                     .changed()
                                 {
                                     if selected {
-                                        self.selected_maps.push(map.clone());
+                                        self.select_map(&map);
                                     } else {
-                                        self.selected_maps
-                                            .retain(|selected| selected.md5 != map.md5);
+                                        self.deselect_md5(&map.md5);
                                     }
                                 }
                             }
@@ -1094,7 +1210,7 @@ impl eframe::App for MapManagerApp {
                 let mut update_check_requested = false;
                 let mut update_all_requested = false;
                 if let Some(scan) = &self.scan {
-                    let jobs = repair_jobs(scan);
+                    let jobs = &self.repair_jobs_cache;
                     let missing_file_issues = scan
                         .problems
                         .iter()
@@ -1236,6 +1352,7 @@ impl eframe::App for MapManagerApp {
                         .id_source("update_findings")
                         .max_height(180.0)
                         .show(&mut columns[1], |ui| {
+                            ui.set_width(ui.available_width());
                             for job in &self.update_jobs {
                                 ui.group(|ui| {
                                     ui.label(format!(
@@ -1244,7 +1361,7 @@ impl eframe::App for MapManagerApp {
                                         job.reasons.len()
                                     ));
                                     for reason in &job.reasons {
-                                        ui.label(format!("  {reason}"));
+                                        wrapped_label(ui, format!("  {reason}"));
                                     }
                                 });
                             }
@@ -1254,7 +1371,7 @@ impl eframe::App for MapManagerApp {
                                     RepairLogStatus::Success => "updated",
                                     RepairLogStatus::Failed => "failed",
                                 };
-                                ui.label(format!(
+                                wrapped_label(ui, format!(
                                     "{status}: set {} - {}",
                                     entry.beatmapset_id, entry.message
                                 ));
@@ -1265,13 +1382,14 @@ impl eframe::App for MapManagerApp {
 
                 if let Some(scan) = &self.scan {
                     columns[1].label("Repair findings");
-                    let jobs = repair_jobs(scan);
+                    let jobs = &self.repair_jobs_cache;
                     if !jobs.is_empty() {
                         egui::ScrollArea::vertical()
                             .id_source("repairable_sets")
                             .max_height(220.0)
                             .show(&mut columns[1], |ui| {
-                                for job in &jobs {
+                                ui.set_width(ui.available_width());
+                                for job in jobs {
                                     ui.group(|ui| {
                                         ui.label(format!(
                                             "Set {}: {} corrupted map(s)",
@@ -1279,7 +1397,7 @@ impl eframe::App for MapManagerApp {
                                             job.labels.len()
                                         ));
                                         for issue in &job.issues {
-                                            ui.label(format!("  {issue}"));
+                                            wrapped_label(ui, format!("  {issue}"));
                                         }
                                     });
                                 }
@@ -1289,15 +1407,16 @@ impl eframe::App for MapManagerApp {
                             .id_source("repair")
                             .max_height(180.0)
                             .show(&mut columns[1], |ui| {
-                            for issue in &scan.problems {
-                                let severity = match issue.severity {
-                                    RepairSeverity::MissingRequiredFile => "missing",
-                                    RepairSeverity::ParseWarning => "parse",
-                                };
-                                ui.label(format!(
-                                    "{severity}: {} ({})",
-                                    issue.message,
-                                    issue.beatmap.display()
+                                ui.set_width(ui.available_width());
+                                for issue in &scan.problems {
+                                    let severity = match issue.severity {
+                                        RepairSeverity::MissingRequiredFile => "missing",
+                                        RepairSeverity::ParseWarning => "parse",
+                                    };
+                                    wrapped_label(ui, format!(
+                                        "{severity}: {} ({})",
+                                        issue.message,
+                                        issue.beatmap.display()
                                 ));
                             }
                             });
@@ -1356,7 +1475,6 @@ struct UpdateCandidate {
     beatmapset_id: i64,
     maps: Vec<LocalBeatmap>,
     folders: Vec<PathBuf>,
-    local_osu_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1414,6 +1532,10 @@ fn scan_status_label(ui: &mut egui::Ui, prefix: &str, value: &str) {
         .on_hover_text(text);
 }
 
+fn wrapped_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.add(egui::Label::new(text).wrap(true));
+}
+
 fn is_osu_std(map: &LocalBeatmap) -> bool {
     map.mode.unwrap_or(0) == 0
 }
@@ -1454,31 +1576,23 @@ fn format_duration(seconds: f32) -> String {
 }
 
 fn update_candidates(scan: &LibraryScan) -> Vec<UpdateCandidate> {
-    let mut grouped =
-        BTreeMap::<i64, (Vec<LocalBeatmap>, BTreeSet<PathBuf>, BTreeSet<PathBuf>)>::new();
+    let mut grouped = BTreeMap::<i64, (Vec<LocalBeatmap>, BTreeSet<PathBuf>)>::new();
     for map in &scan.maps {
         let Some(beatmapset_id) = map.beatmapset_id else {
             continue;
         };
-        if map.beatmap_id.is_none() {
-            continue;
-        }
         let entry = grouped.entry(beatmapset_id).or_default();
         entry.0.push(map.clone());
         entry.1.insert(map.folder.clone());
-        entry.2.insert(map.path.clone());
     }
 
     grouped
         .into_iter()
-        .map(
-            |(beatmapset_id, (maps, folders, local_osu_paths))| UpdateCandidate {
-                beatmapset_id,
-                maps,
-                folders: folders.into_iter().collect(),
-                local_osu_paths: local_osu_paths.into_iter().collect(),
-            },
-        )
+        .map(|(beatmapset_id, (maps, folders))| UpdateCandidate {
+            beatmapset_id,
+            maps,
+            folders: folders.into_iter().collect(),
+        })
         .collect()
 }
 
@@ -1491,6 +1605,7 @@ fn check_update_jobs(
     let _ = tx.send(UpdateEvent::CheckStarted { total });
     let mut jobs = Vec::new();
     let mut failures = 0;
+    let client = reqwest::blocking::Client::new();
 
     for (index, candidate) in candidates.iter().enumerate() {
         let current = index + 1;
@@ -1500,9 +1615,12 @@ fn check_update_jobs(
             total,
         });
 
-        match fetch_remote_beatmapset(candidate.beatmapset_id, &backend_url)
-            .and_then(|remote| update_job_from_remote(candidate, &remote))
-        {
+        match fetch_remote_beatmapset(&client, candidate.beatmapset_id, &backend_url).and_then(
+            |remote| match remote {
+                Some(remote) => update_job_from_remote(candidate, &remote),
+                None => Ok(None),
+            },
+        ) {
             Ok(Some(job)) => jobs.push(job),
             Ok(None) => {}
             Err(err) => {
@@ -1514,13 +1632,17 @@ fn check_update_jobs(
             }
         }
 
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(UPDATE_CHECK_DELAY);
     }
 
     let _ = tx.send(UpdateEvent::CheckFinished { jobs, failures });
 }
 
-fn fetch_remote_beatmapset(beatmapset_id: i64, backend_url: &str) -> Result<RemoteBeatmapset> {
+fn fetch_remote_beatmapset(
+    client: &reqwest::blocking::Client,
+    beatmapset_id: i64,
+    backend_url: &str,
+) -> Result<Option<RemoteBeatmapset>> {
     if backend_url.trim().is_empty() {
         anyhow::bail!("backend URL is required for update checks");
     }
@@ -1530,10 +1652,18 @@ fn fetch_remote_beatmapset(beatmapset_id: i64, backend_url: &str) -> Result<Remo
         backend_url.trim().trim_end_matches('/'),
         beatmapset_id
     );
-    reqwest::blocking::get(&url)?
-        .error_for_status()?
+    let response = client.get(&url).send()?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status} while fetching update metadata");
+    }
+    let remote = response
         .json::<RemoteBeatmapset>()
-        .with_context(|| format!("fetching update metadata for set {beatmapset_id}"))
+        .with_context(|| format!("fetching update metadata for set {beatmapset_id}"))?;
+    Ok(Some(remote))
 }
 
 fn update_job_from_remote(
@@ -1545,23 +1675,52 @@ fn update_job_from_remote(
         .iter()
         .map(|beatmap| (beatmap.id, beatmap))
         .collect::<BTreeMap<_, _>>();
+    let remote_by_version = remote
+        .beatmaps
+        .iter()
+        .filter_map(|beatmap| {
+            let version = normalized_version(&beatmap.version);
+            (!version.is_empty()).then_some((version, beatmap))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let local_ids = candidate
+        .maps
+        .iter()
+        .filter_map(|map| map.beatmap_id)
+        .collect::<BTreeSet<_>>();
+    let local_versions = candidate
+        .maps
+        .iter()
+        .map(|map| normalized_version(&map.version))
+        .filter(|version| !version.is_empty())
+        .collect::<BTreeSet<_>>();
     let mut reasons = Vec::new();
+    let mut local_osu_paths = BTreeSet::new();
 
     for map in &candidate.maps {
-        let Some(beatmap_id) = map.beatmap_id else {
+        let remote_map = map
+            .beatmap_id
+            .and_then(|beatmap_id| remote_by_id.get(&beatmap_id).copied())
+            .or_else(|| {
+                remote_by_version
+                    .get(&normalized_version(&map.version))
+                    .copied()
+            });
+
+        let Some(remote_map) = remote_map else {
+            if map.beatmap_id.is_some() {
+                reasons.push(format!(
+                    "{} is no longer present in the latest set",
+                    map.label()
+                ));
+                local_osu_paths.insert(map.path.clone());
+            }
             continue;
         };
-        let Some(remote_map) = remote_by_id.get(&beatmap_id) else {
-            reasons.push(format!(
-                "{} is no longer present in the latest set",
-                map.label()
-            ));
-            continue;
-        };
-        let Some(remote_checksum) = remote_map.checksum.as_deref() else {
-            continue;
-        };
-        if !remote_checksum.eq_ignore_ascii_case(&map.md5) {
+
+        if let Some(remote_checksum) = remote_map.checksum.as_deref()
+            && !remote_checksum.eq_ignore_ascii_case(&map.md5)
+        {
             reasons.push(format!(
                 "{} [{}] checksum changed",
                 map.artist,
@@ -1571,7 +1730,20 @@ fn update_job_from_remote(
                     remote_map.version.as_str()
                 }
             ));
+            local_osu_paths.insert(map.path.clone());
         }
+    }
+
+    for remote_map in &remote.beatmaps {
+        if local_ids.contains(&remote_map.id)
+            || local_versions.contains(&normalized_version(&remote_map.version))
+        {
+            continue;
+        }
+        reasons.push(format!(
+            "New difficulty available: [{}]",
+            remote_map.version
+        ));
     }
 
     if reasons.is_empty() {
@@ -1581,9 +1753,13 @@ fn update_job_from_remote(
     Ok(Some(UpdateJob {
         beatmapset_id: candidate.beatmapset_id,
         folders: candidate.folders.clone(),
-        local_osu_paths: candidate.local_osu_paths.clone(),
+        local_osu_paths: local_osu_paths.into_iter().collect(),
         reasons,
     }))
+}
+
+fn normalized_version(version: &str) -> String {
+    version.trim().to_ascii_lowercase()
 }
 
 fn repair_jobs(scan: &LibraryScan) -> Vec<RepairJob> {
@@ -1662,18 +1838,19 @@ fn repair_jobs(scan: &LibraryScan) -> Vec<RepairJob> {
 fn run_repair_jobs(jobs: Vec<RepairJob>, backend_url: String, tx: mpsc::Sender<RepairEvent>) {
     let total = jobs.len();
     let _ = tx.send(RepairEvent::Started { total });
+    let client = reqwest::blocking::Client::new();
 
     for (index, job) in jobs.iter().enumerate() {
         let current = index + 1;
         if index > 0 {
-            thread::sleep(Duration::from_secs(8));
+            thread::sleep(BEATMAPSET_DOWNLOAD_DELAY);
         }
         let _ = tx.send(RepairEvent::Opening {
             beatmapset_id: job.beatmapset_id,
             index: current,
             total,
         });
-        if let Err(err) = repair_beatmapset(job, &backend_url) {
+        if let Err(err) = repair_beatmapset(&client, job, &backend_url) {
             let _ = tx.send(RepairEvent::Failed {
                 beatmapset_id: job.beatmapset_id,
                 message: format!("{err:#}"),
@@ -1694,11 +1871,12 @@ fn run_repair_jobs(jobs: Vec<RepairJob>, backend_url: String, tx: mpsc::Sender<R
 fn run_update_jobs(jobs: Vec<UpdateJob>, backend_url: String, tx: mpsc::Sender<UpdateEvent>) {
     let total = jobs.len();
     let _ = tx.send(UpdateEvent::UpdateStarted { total });
+    let client = reqwest::blocking::Client::new();
 
     for (index, job) in jobs.iter().enumerate() {
         let current = index + 1;
         if index > 0 {
-            thread::sleep(Duration::from_secs(8));
+            thread::sleep(BEATMAPSET_DOWNLOAD_DELAY);
         }
         let _ = tx.send(UpdateEvent::Updating {
             beatmapset_id: job.beatmapset_id,
@@ -1706,7 +1884,7 @@ fn run_update_jobs(jobs: Vec<UpdateJob>, backend_url: String, tx: mpsc::Sender<U
             total,
         });
 
-        if let Err(err) = update_beatmapset(job, &backend_url) {
+        if let Err(err) = update_beatmapset(&client, job, &backend_url) {
             let _ = tx.send(UpdateEvent::UpdateFailed {
                 beatmapset_id: job.beatmapset_id,
                 message: format!("{err:#}"),
@@ -1723,7 +1901,11 @@ fn run_update_jobs(jobs: Vec<UpdateJob>, backend_url: String, tx: mpsc::Sender<U
     let _ = tx.send(UpdateEvent::UpdateFinished);
 }
 
-fn repair_beatmapset(job: &RepairJob, backend_url: &str) -> Result<()> {
+fn repair_beatmapset(
+    client: &reqwest::blocking::Client,
+    job: &RepairJob,
+    backend_url: &str,
+) -> Result<()> {
     if backend_url.trim().is_empty() {
         anyhow::bail!("backend URL is required for automatic repair downloads");
     }
@@ -1740,7 +1922,7 @@ fn repair_beatmapset(job: &RepairJob, backend_url: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    download_file(&url, &temp_path).with_context(|| format!("downloading {url}"))?;
+    download_file(client, &url, &temp_path).with_context(|| format!("downloading {url}"))?;
     for folder in &job.folders {
         extract_osz_into_folder(&temp_path, folder)
             .with_context(|| format!("extracting into {}", folder.display()))?;
@@ -1748,7 +1930,11 @@ fn repair_beatmapset(job: &RepairJob, backend_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn update_beatmapset(job: &UpdateJob, backend_url: &str) -> Result<()> {
+fn update_beatmapset(
+    client: &reqwest::blocking::Client,
+    job: &UpdateJob,
+    backend_url: &str,
+) -> Result<()> {
     if backend_url.trim().is_empty() {
         anyhow::bail!("backend URL is required for automatic update downloads");
     }
@@ -1765,7 +1951,7 @@ fn update_beatmapset(job: &UpdateJob, backend_url: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    download_file(&url, &temp_path).with_context(|| format!("downloading {url}"))?;
+    download_file(client, &url, &temp_path).with_context(|| format!("downloading {url}"))?;
     for path in &job.local_osu_paths {
         if path.exists() {
             fs::remove_file(path)
@@ -1779,8 +1965,8 @@ fn update_beatmapset(job: &UpdateJob, backend_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let mut response = reqwest::blocking::get(url)?.error_for_status()?;
+fn download_file(client: &reqwest::blocking::Client, url: &str, destination: &Path) -> Result<()> {
+    let mut response = client.get(url).send()?.error_for_status()?;
     let mut file = fs::File::create(destination)?;
     io::copy(&mut response, &mut file)?;
     Ok(())
