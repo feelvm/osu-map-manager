@@ -1,7 +1,7 @@
 # osu! Map Manager
 
 osu! Map Manager is a desktop tool for creating and maintaining osu! collections from the
-beatmaps already installed on your computer.
+beatmaps already installed on your Windows computer.
 
 Use it to scan your osu! `Songs` folder, filter maps by artist, title, mapper, difficulty values,
 star rating, length, mode, and other fields, then write the selected results into osu!'s
@@ -14,15 +14,16 @@ star rating, length, mode, and other fields, then write the selected results int
 - Save that collection directly to `collection.db`.
 - Export a TSV list of selected maps for review.
 - Detect maps with missing audio or background files.
-- Repair or update affected beatmapsets when a download backend is configured.
+- Repair or update affected beatmapsets.
 
 ## Before You Start
 
 You need:
 
-- osu! installed on your computer.
+- [osu!](https://osu.ppy.sh/home/download) installed on your computer.
 - A local osu! `Songs` folder with beatmaps in it.
 - This app built or downloaded for your system.
+- [Rustup](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed for building from source.
 
 If you are running from source, start it with:
 
@@ -120,18 +121,9 @@ beatmapsets and restore missing files.
 The update workflow checks whether installed beatmapsets have newer metadata or downloads
 available through the configured backend.
 
-As with repair, update downloads require a backend URL. Without one, local scanning and collection
-creation still work.
-
 ## Exporting a Map List
 
 Use TSV export when you want a plain-text list of the selected maps before writing a collection.
-
-This is useful for:
-
-- reviewing large result sets
-- comparing filter changes
-- keeping a record of what was selected
 
 ## Notes and Limitations
 

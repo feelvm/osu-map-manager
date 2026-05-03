@@ -1366,15 +1366,15 @@ impl eframe::App for MapManagerApp {
                                 });
                             }
                             for entry in &self.update_log {
-                                let status = match entry.status {
-                                    RepairLogStatus::InProgress => "updating",
-                                    RepairLogStatus::Success => "updated",
-                                    RepairLogStatus::Failed => "failed",
-                                };
-                                wrapped_label(ui, format!(
-                                    "{status}: set {} - {}",
-                                    entry.beatmapset_id, entry.message
-                                ));
+                                status_log_label(
+                                    ui,
+                                    entry.status,
+                                    "updating",
+                                    "updated",
+                                    "failed",
+                                    entry.beatmapset_id,
+                                    &entry.message,
+                                );
                             }
                         });
                     columns[1].separator();
@@ -1383,12 +1383,23 @@ impl eframe::App for MapManagerApp {
                 if let Some(scan) = &self.scan {
                     columns[1].label("Repair findings");
                     let jobs = &self.repair_jobs_cache;
-                    if !jobs.is_empty() {
+                    if !jobs.is_empty() || !self.repair_log.is_empty() {
                         egui::ScrollArea::vertical()
                             .id_source("repairable_sets")
                             .max_height(220.0)
                             .show(&mut columns[1], |ui| {
                                 ui.set_width(ui.available_width());
+                                for entry in &self.repair_log {
+                                    status_log_label(
+                                        ui,
+                                        entry.status,
+                                        "repairing",
+                                        "repaired",
+                                        "failed",
+                                        entry.beatmapset_id,
+                                        &entry.message,
+                                    );
+                                }
                                 for job in jobs {
                                     ui.group(|ui| {
                                         ui.label(format!(
@@ -1534,6 +1545,71 @@ fn scan_status_label(ui: &mut egui::Ui, prefix: &str, value: &str) {
 
 fn wrapped_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).wrap(true));
+}
+
+fn status_log_label(
+    ui: &mut egui::Ui,
+    status: RepairLogStatus,
+    in_progress: &'static str,
+    success: &'static str,
+    failed: &'static str,
+    beatmapset_id: i64,
+    message: &str,
+) {
+    let (label, color) = match status {
+        RepairLogStatus::InProgress => (in_progress, None),
+        RepairLogStatus::Success => (success, Some(egui::Color32::from_rgb(0x0b, 0xb9, 0x41))),
+        RepairLogStatus::Failed => (failed, Some(egui::Color32::from_rgb(0xa1, 0x09, 0x27))),
+    };
+    let number_color = egui::Color32::from_rgb(0x0e, 0xa5, 0xe9);
+
+    ui.horizontal_wrapped(|ui| {
+        let mut rich = egui::RichText::new(format!("{label}:")).strong();
+        if let Some(color) = color {
+            rich = rich.color(color);
+        }
+        ui.label(rich);
+        ui.label("set");
+        ui.label(
+            egui::RichText::new(beatmapset_id.to_string())
+                .color(number_color)
+                .strong(),
+        );
+        ui.label("-");
+        colored_number_text(ui, message, number_color);
+    });
+}
+
+fn colored_number_text(ui: &mut egui::Ui, text: &str, number_color: egui::Color32) {
+    let mut chunk = String::new();
+    let mut chunk_is_number = false;
+
+    for ch in text.chars() {
+        let is_number = ch.is_ascii_digit();
+        if !chunk.is_empty() && is_number != chunk_is_number {
+            add_number_text_chunk(ui, &chunk, chunk_is_number, number_color);
+            chunk.clear();
+        }
+        chunk.push(ch);
+        chunk_is_number = is_number;
+    }
+
+    if !chunk.is_empty() {
+        add_number_text_chunk(ui, &chunk, chunk_is_number, number_color);
+    }
+}
+
+fn add_number_text_chunk(
+    ui: &mut egui::Ui,
+    text: &str,
+    is_number: bool,
+    number_color: egui::Color32,
+) {
+    if is_number {
+        ui.label(egui::RichText::new(text).color(number_color).strong());
+    } else {
+        ui.label(text);
+    }
 }
 
 fn is_osu_std(map: &LocalBeatmap) -> bool {
