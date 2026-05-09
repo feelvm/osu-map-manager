@@ -11,7 +11,9 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 760.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([1160.0, 620.0]),
         ..Default::default()
     };
 

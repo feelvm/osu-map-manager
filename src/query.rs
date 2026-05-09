@@ -65,29 +65,19 @@ pub enum SearchField {
 }
 
 impl SearchField {
-    pub const SORTED: [Self; 26] = [
+    pub const SORTED: [Self; 16] = [
         Self::ApproachRate,
         Self::Artist,
         Self::Bpm,
         Self::CircleSize,
-        Self::Circles,
         Self::Creator,
-        Self::Difficulty,
-        Self::Divisor,
-        Self::Favourites,
-        Self::FeaturedArtist,
-        Self::FreeText,
         Self::HpDrain,
-        Self::Keys,
         Self::Length,
         Self::Mode,
         Self::OverallDifficulty,
         Self::Ranked,
         Self::Created,
-        Self::Sliders,
-        Self::Source,
         Self::StarRating,
-        Self::Submitted,
         Self::Status,
         Self::Tag,
         Self::Title,

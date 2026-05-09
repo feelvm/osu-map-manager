@@ -14,7 +14,7 @@ star rating, length, mode, and other fields, then write the selected results int
 - Save that collection directly to `collection.db`.
 - Export a TSV list of selected maps for review.
 - Detect maps with missing audio or background files.
-- Repair or update affected beatmapsets.
+- Repair affected beatmapsets.
 
 ## Before You Start
 
@@ -115,11 +115,6 @@ background files.
 
 If repair downloads are configured, you can use the repair workflow to redownload affected
 beatmapsets and restore missing files.
-
-## Updating Maps
-
-The update workflow checks whether installed beatmapsets have newer metadata or downloads
-available through the configured backend.
 
 ## Exporting a Map List
 

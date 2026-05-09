@@ -65,7 +65,6 @@ pub struct LibraryScan {
 #[derive(Debug)]
 pub enum ScanEvent {
     Started {
-        songs_dir: PathBuf,
         star_ratings_loaded: usize,
         star_parse_error: Option<String>,
     },
@@ -196,7 +195,6 @@ fn scan_songs_dir_streaming_inner(
         ),
     };
     let _ = tx.send(ScanEvent::Started {
-        songs_dir: songs_dir.to_owned(),
         star_ratings_loaded: db_index.as_ref().map_or(0, OsuDbIndex::len),
         star_parse_error,
     });

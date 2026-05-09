@@ -8,7 +8,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    fs,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -19,8 +20,7 @@ use std::{
     time::Duration,
 };
 
-const UPDATE_CHECK_DELAY: Duration = Duration::from_millis(25);
-const BEATMAPSET_DOWNLOAD_DELAY: Duration = Duration::from_millis(750);
+const BEATMAPSET_DOWNLOAD_DELAY: Duration = Duration::from_secs(2);
 
 pub struct MapManagerApp {
     query: BeatmapQuery,
@@ -37,8 +37,6 @@ pub struct MapManagerApp {
     scan: Option<LibraryScan>,
     is_scanning: bool,
     is_repairing: bool,
-    is_checking_updates: bool,
-    is_updating_maps: bool,
     current_folder: String,
     current_map: String,
     skip_parse_timeouts: bool,
@@ -60,18 +58,10 @@ pub struct MapManagerApp {
     repair_failures: usize,
     repair_log: Vec<RepairLogEntry>,
     repair_ignores: RepairIgnoreStore,
-    update_jobs: Vec<UpdateJob>,
-    update_progress: String,
-    update_total: usize,
-    update_done: usize,
-    update_successes: usize,
-    update_failures: usize,
-    update_log: Vec<UpdateLogEntry>,
     status: String,
     scan_rx: Option<Receiver<ScanEvent>>,
     scan_cancel: Option<Arc<AtomicBool>>,
     repair_rx: Option<Receiver<RepairEvent>>,
-    update_rx: Option<Receiver<UpdateEvent>>,
 }
 
 #[derive(Debug)]
@@ -96,52 +86,8 @@ enum RepairEvent {
     Finished,
 }
 
-#[derive(Debug)]
-enum UpdateEvent {
-    CheckStarted {
-        total: usize,
-    },
-    Checking {
-        beatmapset_id: i64,
-        index: usize,
-        total: usize,
-    },
-    CheckFailed {
-        beatmapset_id: i64,
-        message: String,
-    },
-    CheckFinished {
-        jobs: Vec<UpdateJob>,
-        failures: usize,
-    },
-    UpdateStarted {
-        total: usize,
-    },
-    Updating {
-        beatmapset_id: i64,
-        index: usize,
-        total: usize,
-    },
-    Updated {
-        beatmapset_id: i64,
-        folder_count: usize,
-    },
-    UpdateFailed {
-        beatmapset_id: i64,
-        message: String,
-    },
-    UpdateFinished,
-}
-
 #[derive(Debug, Clone)]
 struct RepairLogEntry {
-    beatmapset_id: i64,
-    status: RepairLogStatus,
-    message: String,
-}
-
-#[derive(Debug, Clone)]
-struct UpdateLogEntry {
     beatmapset_id: i64,
     status: RepairLogStatus,
     message: String,
@@ -189,14 +135,16 @@ impl RepairIgnoreStore {
 }
 
 impl MapManagerApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_theme(&cc.egui_ctx);
+
         let osu_root = default_osu_root()
-            .map(|path| path.display().to_string())
+            .map(|path| display_prefilled_path(&path))
             .unwrap_or_default();
         let songs_dir = if osu_root.is_empty() {
             String::new()
         } else {
-            PathBuf::from(&osu_root).join("Songs").display().to_string()
+            format!("{osu_root}\\Songs")
         };
         let repair_ignores = load_repair_ignores(&osu_root).unwrap_or_default();
 
@@ -204,13 +152,13 @@ impl MapManagerApp {
             query: BeatmapQuery {
                 clauses: vec![
                     QueryClause {
-                        field: SearchField::ApproachRate,
+                        field: SearchField::StarRating,
                         operator: Operator::Ge,
-                        value: "9".to_owned(),
+                        value: "6".to_owned(),
                         enabled: true,
                     },
                     QueryClause {
-                        field: SearchField::Length,
+                        field: SearchField::Bpm,
                         operator: Operator::Le,
                         value: "180".to_owned(),
                         enabled: true,
@@ -230,8 +178,6 @@ impl MapManagerApp {
             scan: None,
             is_scanning: false,
             is_repairing: false,
-            is_checking_updates: false,
-            is_updating_maps: false,
             current_folder: String::new(),
             current_map: String::new(),
             skip_parse_timeouts: false,
@@ -253,18 +199,10 @@ impl MapManagerApp {
             repair_failures: 0,
             repair_log: Vec::new(),
             repair_ignores,
-            update_jobs: Vec::new(),
-            update_progress: String::new(),
-            update_total: 0,
-            update_done: 0,
-            update_successes: 0,
-            update_failures: 0,
-            update_log: Vec::new(),
             status: "Ready".to_owned(),
             scan_rx: None,
             scan_cancel: None,
             repair_rx: None,
-            update_rx: None,
         }
     }
 
@@ -283,7 +221,6 @@ impl MapManagerApp {
                 };
                 match event {
                     ScanEvent::Started {
-                        songs_dir,
                         star_ratings_loaded,
                         star_parse_error,
                     } => {
@@ -300,7 +237,7 @@ impl MapManagerApp {
                         self.star_ratings_loaded = star_ratings_loaded;
                         self.maps_with_stars = 0;
                         self.star_parse_error = star_parse_error;
-                        self.status = format!("Scanning {}", songs_dir.display());
+                        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
                     }
                     ScanEvent::Folder { path } => {
                         if self.scan_cancel.is_none() {
@@ -312,10 +249,7 @@ impl MapManagerApp {
                             .and_then(|name| name.to_str())
                             .unwrap_or_default()
                             .to_owned();
-                        self.status = format!(
-                            "Scanning folder {}: {}",
-                            self.scanned_folders, self.current_folder
-                        );
+                        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
                     }
                     ScanEvent::Parsing { path } => {
                         if self.scan_cancel.is_none() {
@@ -346,10 +280,7 @@ impl MapManagerApp {
                             scan.problems.extend(visible_issues);
                             scan.maps.push(map);
                         }
-                        self.status = format!(
-                            "Scanning... {} maps read, {} match current filters",
-                            self.scanned_maps, self.matched_maps
-                        );
+                        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
                     }
                     ScanEvent::Problem { issue } => {
                         if let Some(scan) = &mut self.scan {
@@ -516,130 +447,6 @@ impl MapManagerApp {
             }
         }
 
-        if let Some(rx) = self.update_rx.take() {
-            let mut keep_rx = true;
-            let mut disconnected = false;
-            loop {
-                let event = match rx.try_recv() {
-                    Ok(event) => event,
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                };
-                match event {
-                    UpdateEvent::CheckStarted { total } => {
-                        self.is_checking_updates = true;
-                        self.update_jobs.clear();
-                        self.update_log.clear();
-                        self.update_total = total;
-                        self.update_done = 0;
-                        self.update_failures = 0;
-                        self.update_successes = 0;
-                        self.update_progress =
-                            format!("Checking {total} beatmapset(s) for updates");
-                        self.status = self.update_progress.clone();
-                    }
-                    UpdateEvent::Checking {
-                        beatmapset_id,
-                        index,
-                        total,
-                    } => {
-                        self.update_done = index;
-                        self.update_progress =
-                            format!("Checking updates {index}/{total}: set {beatmapset_id}");
-                        self.status = self.update_progress.clone();
-                    }
-                    UpdateEvent::CheckFailed {
-                        beatmapset_id,
-                        message,
-                    } => {
-                        self.update_failures += 1;
-                        self.upsert_update_log(beatmapset_id, RepairLogStatus::Failed, message);
-                    }
-                    UpdateEvent::CheckFinished { jobs, failures } => {
-                        self.is_checking_updates = false;
-                        self.update_jobs = jobs;
-                        self.update_failures = failures;
-                        self.update_progress = format!(
-                            "Update check finished: {} beatmapset(s) need update, {} check(s) failed",
-                            self.update_jobs.len(),
-                            self.update_failures
-                        );
-                        self.status = self.update_progress.clone();
-                        keep_rx = false;
-                    }
-                    UpdateEvent::UpdateStarted { total } => {
-                        self.is_updating_maps = true;
-                        self.update_total = total;
-                        self.update_done = 0;
-                        self.update_successes = 0;
-                        self.update_failures = 0;
-                        self.update_log.clear();
-                        self.update_progress = format!("Updating {total} beatmapset(s)");
-                        self.status = self.update_progress.clone();
-                    }
-                    UpdateEvent::Updating {
-                        beatmapset_id,
-                        index,
-                        total,
-                    } => {
-                        self.upsert_update_log(
-                            beatmapset_id,
-                            RepairLogStatus::InProgress,
-                            format!("Downloading {index}/{total}"),
-                        );
-                        self.update_progress =
-                            format!("Downloading update {index}/{total}: set {beatmapset_id}");
-                        self.status = self.update_progress.clone();
-                    }
-                    UpdateEvent::Updated {
-                        beatmapset_id,
-                        folder_count,
-                    } => {
-                        self.update_done += 1;
-                        self.update_successes += 1;
-                        self.upsert_update_log(
-                            beatmapset_id,
-                            RepairLogStatus::Success,
-                            format!("Updated {folder_count} folder(s)"),
-                        );
-                        self.update_progress =
-                            format!("Updated set {beatmapset_id} in {folder_count} folder(s)");
-                        self.status = self.update_progress.clone();
-                    }
-                    UpdateEvent::UpdateFailed {
-                        beatmapset_id,
-                        message,
-                    } => {
-                        self.update_done += 1;
-                        self.update_failures += 1;
-                        self.upsert_update_log(beatmapset_id, RepairLogStatus::Failed, message);
-                    }
-                    UpdateEvent::UpdateFinished => {
-                        self.is_updating_maps = false;
-                        self.update_jobs.clear();
-                        self.update_progress = format!(
-                            "Map update finished: {} succeeded, {} failed out of {}. Rescan to refresh local data.",
-                            self.update_successes, self.update_failures, self.update_total
-                        );
-                        self.status = self.update_progress.clone();
-                        keep_rx = false;
-                    }
-                }
-            }
-
-            if keep_rx {
-                if disconnected {
-                    self.is_checking_updates = false;
-                    self.is_updating_maps = false;
-                    self.status = "Update worker disconnected".to_owned();
-                } else {
-                    self.update_rx = Some(rx);
-                }
-            }
-        }
     }
 
     fn start_scan(&mut self) {
@@ -648,9 +455,9 @@ impl MapManagerApp {
             return;
         }
 
-        let songs_dir = PathBuf::from(self.songs_dir.trim());
+        let songs_dir = expand_prefilled_path(&self.songs_dir);
         let osu_root =
-            (!self.osu_root.trim().is_empty()).then(|| PathBuf::from(self.osu_root.trim()));
+            (!self.osu_root.trim().is_empty()).then(|| expand_prefilled_path(&self.osu_root));
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -661,7 +468,7 @@ impl MapManagerApp {
         if self.skip_parse_errors {
             skip_issue_kinds.insert("parse_error".to_owned());
         }
-        self.status = format!("Scanning {}", songs_dir.display());
+        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
         std::thread::spawn(move || {
             local::scan_songs_dir_streaming(
                 songs_dir,
@@ -696,7 +503,7 @@ impl MapManagerApp {
         let path = if self.osu_root.trim().is_empty() {
             PathBuf::from("collection.db")
         } else {
-            PathBuf::from(self.osu_root.trim()).join("collection.db")
+            expand_prefilled_path(&self.osu_root).join("collection.db")
         };
 
         match collection::write_collection_db(&path, &self.collection_name, &self.selected_maps) {
@@ -710,6 +517,25 @@ impl MapManagerApp {
         match collection::write_manifest(&path, &self.selected_maps) {
             Ok(()) => self.status = format!("Wrote {}", path.display()),
             Err(err) => self.status = format!("Manifest export failed: {err:#}"),
+        }
+    }
+
+    fn restore_collection_backup(&mut self) {
+        let path = if self.osu_root.trim().is_empty() {
+            PathBuf::from("collection.db")
+        } else {
+            expand_prefilled_path(&self.osu_root).join("collection.db")
+        };
+
+        match collection::restore_collection_backup(&path) {
+            Ok(()) => {
+                self.status = format!(
+                    "Restored {} from {}",
+                    path.display(),
+                    path.with_extension("db.bak").display()
+                )
+            }
+            Err(err) => self.status = format!("Collection restore failed: {err:#}"),
         }
     }
 
@@ -803,48 +629,6 @@ impl MapManagerApp {
         self.repair_rx = Some(rx);
     }
 
-    fn start_update_check(&mut self) {
-        if self.is_checking_updates || self.is_updating_maps {
-            self.status = "An update job is already running".to_owned();
-            return;
-        }
-
-        let Some(scan) = &self.scan else {
-            self.status = "Scan your Songs directory before checking for map updates".to_owned();
-            return;
-        };
-
-        let sets = update_candidates(scan);
-        if sets.is_empty() {
-            self.status = "No beatmapsets with usable IDs found for update checking".to_owned();
-            return;
-        }
-
-        let backend_url = self.repair_backend_url.trim().to_owned();
-        let (tx, rx) = mpsc::channel();
-        self.status = format!("Checking {} beatmapset(s) for updates", sets.len());
-        thread::spawn(move || check_update_jobs(sets, backend_url, tx));
-        self.update_rx = Some(rx);
-    }
-
-    fn start_update_all(&mut self) {
-        if self.is_checking_updates || self.is_updating_maps {
-            self.status = "An update job is already running".to_owned();
-            return;
-        }
-        if self.update_jobs.is_empty() {
-            self.status = "Check for map updates before updating".to_owned();
-            return;
-        }
-
-        let jobs = self.update_jobs.clone();
-        let backend_url = self.repair_backend_url.trim().to_owned();
-        let (tx, rx) = mpsc::channel();
-        self.status = format!("Updating {} beatmapset(s)", jobs.len());
-        thread::spawn(move || run_update_jobs(jobs, backend_url, tx));
-        self.update_rx = Some(rx);
-    }
-
     fn upsert_repair_log(&mut self, beatmapset_id: i64, status: RepairLogStatus, message: String) {
         if let Some(entry) = self
             .repair_log
@@ -855,23 +639,6 @@ impl MapManagerApp {
             entry.message = message;
         } else {
             self.repair_log.push(RepairLogEntry {
-                beatmapset_id,
-                status,
-                message,
-            });
-        }
-    }
-
-    fn upsert_update_log(&mut self, beatmapset_id: i64, status: RepairLogStatus, message: String) {
-        if let Some(entry) = self
-            .update_log
-            .iter_mut()
-            .find(|entry| entry.beatmapset_id == beatmapset_id)
-        {
-            entry.status = status;
-            entry.message = message;
-        } else {
-            self.update_log.push(UpdateLogEntry {
                 beatmapset_id,
                 status,
                 message,
@@ -995,458 +762,575 @@ impl MapManagerApp {
 impl eframe::App for MapManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background();
-        if self.is_scanning
-            || self.is_repairing
-            || self.is_checking_updates
-            || self.is_updating_maps
-        {
+        if self.is_scanning || self.is_repairing {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("osu! Map Manager");
-                ui.separator();
-                ui.label(&self.status);
+        egui::TopBottomPanel::top("top")
+            .frame(panel_frame(ctx.style().as_ref()))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("osu! Map Manager");
+                    ui.separator();
+                    let status = if self.is_scanning {
+                        scan_progress_status(self.scanned_maps, self.matched_maps)
+                    } else {
+                        self.status.clone()
+                    };
+                    let status_text = if self.is_scanning {
+                        egui::RichText::new(status.clone()).monospace()
+                    } else {
+                        egui::RichText::new(status.clone())
+                    };
+                    ui.add_sized(
+                        [ui.available_width(), 20.0],
+                        egui::Label::new(status_text).truncate(true),
+                    )
+                    .on_hover_text(status);
+                });
             });
-        });
 
         egui::SidePanel::left("filters")
-            .resizable(true)
-            .default_width(410.0)
+            .resizable(false)
+            .exact_width(400.0)
+            .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
-                ui.heading("Local filters");
-                ui.label("Rows are combined with AND against scanned maps in your Songs directory.");
-                ui.add_space(8.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Local filters");
+                    muted_label(
+                        ui,
+                        "Rows are combined with AND against scanned maps in your Songs directory.",
+                    );
+                    ui.add_space(10.0);
 
-                for clause in &mut self.query.clauses {
+                    for clause in &mut self.query.clauses {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut clause.enabled, "");
+                            egui::ComboBox::from_id_source(("field", clause as *const _ as usize))
+                                .selected_text(clause.field.label())
+                                .width(132.0)
+                                .show_ui(ui, |ui| {
+                                    for field in SearchField::SORTED {
+                                        ui.selectable_value(&mut clause.field, field, field.label());
+                                    }
+                                });
+                            egui::ComboBox::from_id_source(("op", clause as *const _ as usize))
+                                .selected_text(clause.operator.as_str())
+                                .width(54.0)
+                                .show_ui(ui, |ui| {
+                                    for operator in Operator::ALL {
+                                        ui.selectable_value(
+                                            &mut clause.operator,
+                                            operator,
+                                            operator.as_str(),
+                                        );
+                                    }
+                                });
+                            let value_width = ui.available_width().max(64.0);
+                            ui.add_sized(
+                                [value_width, 28.0],
+                                egui::TextEdit::singleline(&mut clause.value)
+                                    .vertical_align(egui::Align::Center),
+                            );
+                        });
+                    }
+
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut clause.enabled, "");
-                        egui::ComboBox::from_id_source(("field", clause as *const _ as usize))
-                            .selected_text(clause.field.label())
-                            .show_ui(ui, |ui| {
-                                for field in SearchField::SORTED {
-                                    ui.selectable_value(&mut clause.field, field, field.label());
-                                }
-                            });
-                        egui::ComboBox::from_id_source(("op", clause as *const _ as usize))
-                            .selected_text(clause.operator.as_str())
-                            .width(52.0)
-                            .show_ui(ui, |ui| {
-                                for operator in Operator::ALL {
-                                    ui.selectable_value(
-                                        &mut clause.operator,
-                                        operator,
-                                        operator.as_str(),
-                                    );
-                                }
-                            });
-                        ui.text_edit_singleline(&mut clause.value);
+                        if ui.button("+ Add filter").clicked() {
+                            self.query.clauses.push(QueryClause::default());
+                        }
+                        if ui.button("Remove disabled").clicked() {
+                            self.query.clauses.retain(|clause| clause.enabled);
+                        }
                     });
-                }
 
-                ui.horizontal(|ui| {
-                    if ui.button("+ Add filter").clicked() {
-                        self.query.clauses.push(QueryClause::default());
+                    ui.separator();
+                    ui.checkbox(&mut self.only_osu_std, "Only osu!std maps");
+                    if self.only_osu_std {
+                        self.retain_selected_maps(is_osu_std);
                     }
-                    if ui.button("Remove disabled").clicked() {
-                        self.query.clauses.retain(|clause| clause.enabled);
-                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Scan issue handling").strong());
+                    ui.checkbox(&mut self.skip_parse_timeouts, "Skip map parse timeouts");
+                    ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Equivalent query text").strong());
+                    let mut query_text = self.query.to_osu_search();
+                    ui.add_sized(
+                        [ui.available_width(), 76.0],
+                        egui::TextEdit::multiline(&mut query_text),
+                    );
+                    muted_label(
+                        ui,
+                        "Some osu!web-only fields require database/API metadata and will not match local .osu files yet.",
+                    );
                 });
-
-                ui.separator();
-                ui.checkbox(&mut self.only_osu_std, "Only osu!std maps");
-                if self.only_osu_std {
-                    self.retain_selected_maps(is_osu_std);
-                }
-                ui.separator();
-                ui.label("Scan issue handling");
-                ui.checkbox(&mut self.skip_parse_timeouts, "Skip map parse timeouts");
-                ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
-                ui.separator();
-                ui.label("Equivalent query text");
-                let mut query_text = self.query.to_osu_search();
-                ui.text_edit_multiline(&mut query_text);
-                ui.label("Some osu!web-only fields, such as ranked status and favourites, require database/API metadata and will not match local .osu files yet.");
             });
 
         self.refresh_filtered_maps();
         self.refresh_repair_jobs();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.columns(2, |columns| {
-                columns[0].heading("Local library");
-                egui::Grid::new("library_paths")
-                    .num_columns(3)
-                    .spacing([8.0, 6.0])
-                    .show(&mut columns[0], |ui| {
-                        ui.label("osu! root");
-                        ui.add_sized([260.0, 22.0], egui::TextEdit::singleline(&mut self.osu_root));
-                        if ui.button("Pick").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.osu_root = path.display().to_string();
-                                self.songs_dir = path.join("Songs").display().to_string();
-                                self.repair_ignores =
-                                    load_repair_ignores(&self.osu_root).unwrap_or_default();
-                            }
-                        }
-                        ui.end_row();
-                        ui.label("Songs");
-                        ui.add_sized([260.0, 22.0], egui::TextEdit::singleline(&mut self.songs_dir));
-                        if self.is_scanning {
-                            if ui.button("Stop").clicked() {
-                                self.stop_scan();
-                            }
-                        } else if ui.button("Scan").clicked() {
-                            self.start_scan();
-                        }
-                        ui.end_row();
-                    });
+        let mut repair_requested = false;
+        let mut delete_non_std_requested = false;
 
-                if self.is_scanning {
-                    columns[0].add(egui::Spinner::new());
-                    columns[0].label(format!(
-                        "Reading folder {} | {} maps scanned | {} matches",
-                        self.scanned_folders, self.scanned_maps, self.matched_maps
-                    ));
-                    columns[0].label(format!(
-                        "Star ratings: {} db entries, {} matched scanned maps",
-                        self.star_ratings_loaded, self.maps_with_stars
-                    ));
-                    if let Some(err) = &self.star_parse_error {
-                        columns[0].label(format!("osu!.db fallback parser active: {err}"));
-                    }
-                    if !self.current_folder.is_empty() {
-                        scan_status_label(
-                            &mut columns[0],
-                            "Current",
-                            &self.current_folder,
-                        );
-                    }
-                    if !self.current_map.is_empty() {
-                        scan_status_label(&mut columns[0], "Parsing", &self.current_map);
-                    }
-                }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ctx.style().as_ref()))
+            .show(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                let gap = 8.0;
+                let library_width = 430.0_f32.min(rect.width());
+                let library_content_width = (library_width - 48.0).max(1.0);
+                let actions_left = rect.left() + library_content_width + gap;
+                let actions_width = (rect.right() - actions_left).clamp(0.0, 330.0);
+                let library_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(library_width, rect.height()),
+                );
+                let actions_rect = egui::Rect::from_min_size(
+                    egui::pos2(actions_left, rect.top()),
+                    egui::vec2(actions_width, rect.height()),
+                );
 
-                if self.scan.is_some() {
-                    let (scanned_maps, scanned_sets, repair_issues) =
-                        self.scan.as_ref().map_or((0, 0, 0), |scan| {
-                            (scan.maps.len(), scan.sets.len(), scan.problems.len())
-                        });
-                    columns[0].horizontal(|ui| {
-                        if ui.button("Select all filtered").clicked() {
-                            let maps = self
-                                .scan
-                                .as_ref()
-                                .map(|scan| {
-                                    self.filtered_map_indexes
-                                        .iter()
-                                        .filter_map(|&index| scan.maps.get(index).cloned())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-                            for map in &maps {
-                                self.select_map(map);
-                            }
-                        }
-                        if ui.button("Clear selection").clicked() {
-                            self.clear_selection();
-                        }
-                    });
-                    columns[0].label(format!("{} selected map(s)", self.selected_maps.len()));
-                    columns[0].horizontal(|ui| {
-                        ui.label("Collection");
-                        ui.text_edit_singleline(&mut self.collection_name);
-                    });
-                    columns[0].horizontal(|ui| {
-                        if ui.button("Write collection.db").clicked() {
-                            self.export_collection();
-                        }
-                        if ui.button("Write TSV manifest").clicked() {
-                            self.export_manifest();
-                        }
-                    });
-                    columns[0].add_space(8.0);
-                    columns[0].label(format!(
-                        "{} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
-                        self.filtered_map_indexes.len(),
-                        scanned_maps,
-                        scanned_sets,
-                        repair_issues
-                    ));
-                    egui::ScrollArea::vertical().id_source("local_maps").show_rows(
-                        &mut columns[0],
-                        24.0,
-                        self.filtered_map_indexes.len(),
-                        |ui, row_range| {
-                            for row in row_range {
-                                let Some(map) = self.scan.as_ref().and_then(|scan| {
-                                    self.filtered_map_indexes
-                                        .get(row)
-                                        .and_then(|&index| scan.maps.get(index))
-                                        .cloned()
-                                }) else {
-                                    continue;
-                                };
-                                let mut selected = self.selected_md5s.contains(&map.md5);
-                                if ui
-                                    .checkbox(&mut selected, self.map_result_label(&map))
-                                    .changed()
-                                {
-                                    if selected {
-                                        self.select_map(&map);
-                                    } else {
-                                        self.deselect_md5(&map.md5);
+                let mut library_ui = ui.child_ui_with_id_source(
+                    library_rect,
+                    egui::Layout::top_down(egui::Align::Min),
+                    "library_fixed",
+                );
+                library_ui.set_clip_rect(library_rect);
+                library_ui.set_width(library_width);
+                library_ui.set_max_width(library_width);
+                let middle_width = library_ui.available_width();
+                egui::ScrollArea::vertical()
+                    .id_source("library_pane")
+                    .auto_shrink([false, false])
+                    .show(&mut library_ui, |ui| {
+                        let content_width = library_content_width.min(middle_width).max(1.0);
+                        let card_item_spacing = ui.spacing().item_spacing;
+                        let card_gap = gap;
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        fix_ui_width(ui, content_width);
+                        section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = card_item_spacing;
+                            fill_tile_width(ui);
+                            ui.heading("Local library");
+                            ui.label(egui::RichText::new("osu! root").strong());
+                            ui.horizontal(|ui| {
+                                let input_width = (ui.available_width() - 58.0).max(80.0);
+                                ui.add_sized(
+                                    [input_width, 28.0],
+                                    egui::TextEdit::singleline(&mut self.osu_root)
+                                        .vertical_align(egui::Align::Center),
+                                );
+                                if ui.button("Pick").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.osu_root = path.display().to_string();
+                                        self.songs_dir = path.join("Songs").display().to_string();
+                                        self.repair_ignores =
+                                            load_repair_ignores(&self.osu_root).unwrap_or_default();
                                     }
                                 }
-                            }
-                        },
-                    );
-                }
+                            });
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Songs").strong());
+                            ui.horizontal(|ui| {
+                                let input_width = (ui.available_width() - 58.0).max(80.0);
+                                ui.add_sized(
+                                    [input_width, 28.0],
+                                    egui::TextEdit::singleline(&mut self.songs_dir)
+                                        .vertical_align(egui::Align::Center),
+                                );
+                                if self.is_scanning {
+                                    if ui.button("Stop").clicked() {
+                                        self.stop_scan();
+                                    }
+                                } else if ui.button("Scan").clicked() {
+                                    self.start_scan();
+                                }
+                            });
+                        });
 
-                columns[1].heading("Results and actions");
-                let mut repair_requested = false;
-                let mut delete_non_std_requested = false;
-                let mut update_check_requested = false;
-                let mut update_all_requested = false;
-                if let Some(scan) = &self.scan {
-                    let jobs = &self.repair_jobs_cache;
-                    let missing_file_issues = scan
-                        .problems
-                        .iter()
-                        .filter(|issue| issue.severity == RepairSeverity::MissingRequiredFile)
-                        .count();
-                    columns[1].group(|ui| {
-                        ui.heading("Repair corrupted beatmaps");
-                        ui.label(format!(
-                            "{} missing-file issue(s), {} downloadable beatmapset(s)",
-                            missing_file_issues,
-                            jobs.len()
-                        ));
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.is_repairing && !jobs.is_empty(),
-                                    egui::Button::new("Repair"),
-                                )
-                                .clicked()
-                            {
-                                repair_requested = true;
-                            }
-                            if self.is_repairing {
+                        if self.is_scanning {
+                            ui.add_space(card_gap);
+                            fix_ui_width(ui, content_width);
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
                                 ui.add(egui::Spinner::new());
-                            }
-                        });
-                        if jobs.is_empty() && missing_file_issues > 0 {
-                            ui.label("These findings do not have a usable beatmapset ID. Rescan after this build; the app now infers IDs from osu! song folder names.");
+                                wrapped_label(
+                                    ui,
+                                    format!(
+                                        "Reading folder {} | {} maps scanned | {} matches",
+                                        self.scanned_folders,
+                                        self.scanned_maps,
+                                        self.matched_maps
+                                    ),
+                                );
+                                wrapped_label(
+                                    ui,
+                                    format!(
+                                        "Star ratings: {} db entries, {} matched scanned maps",
+                                        self.star_ratings_loaded, self.maps_with_stars
+                                    ),
+                                );
+                                if let Some(err) = &self.star_parse_error {
+                                    scan_status_label(ui, "osu!.db", err);
+                                }
+                                if !self.current_folder.is_empty() {
+                                    scan_status_label(ui, "Current", &self.current_folder);
+                                }
+                                if !self.current_map.is_empty() {
+                                    scan_status_label(ui, "Parsing", &self.current_map);
+                                }
+                            });
                         }
-                        if self.is_repairing {
-                            ui.label(&self.repair_progress);
-                        }
-                        if self.repair_total > 0 {
-                            let progress = self.repair_done as f32 / self.repair_total as f32;
-                            ui.add(egui::ProgressBar::new(progress).text(format!(
-                                "{}/{} complete | {} succeeded | {} failed",
-                                self.repair_done,
-                                self.repair_total,
-                                self.repair_successes,
-                                self.repair_failures
-                            )));
-                        }
-                    });
-                    columns[1].separator();
-                }
 
-                if self.scan.is_some() {
-                    columns[1].group(|ui| {
-                        ui.heading("Update outdated maps");
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.is_scanning
-                                        && !self.is_repairing
-                                        && !self.is_checking_updates
-                                        && !self.is_updating_maps,
-                                    egui::Button::new("Check updates"),
-                                )
-                                .clicked()
-                            {
-                                update_check_requested = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.is_scanning
-                                        && !self.is_repairing
-                                        && !self.is_checking_updates
-                                        && !self.is_updating_maps
-                                        && !self.update_jobs.is_empty(),
-                                    egui::Button::new("Update all"),
-                                )
-                                .clicked()
-                            {
-                                update_all_requested = true;
-                            }
-                            if self.is_checking_updates || self.is_updating_maps {
-                                ui.add(egui::Spinner::new());
-                            }
-                        });
-                        ui.label(format!(
-                            "{} beatmapset(s) require update",
-                            self.update_jobs.len()
-                        ));
-                        if self.is_checking_updates || self.is_updating_maps {
-                            ui.label(&self.update_progress);
-                        }
-                        if self.update_total > 0
-                            && (self.is_checking_updates || self.is_updating_maps)
-                        {
-                            let progress =
-                                self.update_done as f32 / self.update_total.max(1) as f32;
-                            ui.add(egui::ProgressBar::new(progress).text(format!(
-                                "{}/{} complete | {} succeeded | {} failed",
-                                self.update_done,
-                                self.update_total,
-                                self.update_successes,
-                                self.update_failures
-                            )));
-                        }
-                    });
-                    columns[1].separator();
-                }
-
-                if let Some(scan) = &self.scan {
-                    let delete_selection = DeleteModeSelection {
-                        taiko: self.delete_taiko,
-                        catch: self.delete_catch,
-                        mania: self.delete_mania,
-                    };
-                    let delete_count = scan
-                        .maps
-                        .iter()
-                        .filter(|map| delete_selection.matches(map.mode))
-                        .count();
-                    columns[1].group(|ui| {
-                        ui.heading("Delete non-std maps");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.delete_taiko, "Taiko");
-                            ui.checkbox(&mut self.delete_catch, "Catch");
-                            ui.checkbox(&mut self.delete_mania, "Mania");
-                        });
-                        ui.label(format!("{delete_count} scanned .osu file(s) match selected mode(s)"));
-                        if ui
-                            .add_enabled(
-                                !self.is_scanning && !self.is_repairing && delete_count > 0,
-                                egui::Button::new("Delete selected non-std maps"),
-                            )
-                            .clicked()
-                        {
-                            delete_non_std_requested = true;
-                        }
-                    });
-                    columns[1].separator();
-                }
-
-                if !self.update_jobs.is_empty() || !self.update_log.is_empty() {
-                    columns[1].label("Update findings");
-                    egui::ScrollArea::vertical()
-                        .id_source("update_findings")
-                        .max_height(180.0)
-                        .show(&mut columns[1], |ui| {
-                            ui.set_width(ui.available_width());
-                            for job in &self.update_jobs {
-                                ui.group(|ui| {
-                                    ui.label(format!(
-                                        "Set {}: {} outdated map(s)",
-                                        job.beatmapset_id,
-                                        job.reasons.len()
-                                    ));
-                                    for reason in &job.reasons {
-                                        wrapped_label(ui, format!("  {reason}"));
+                        if self.scan.is_some() {
+                            let (scanned_maps, scanned_sets, repair_issues) =
+                                self.scan.as_ref().map_or((0, 0, 0), |scan| {
+                                    (scan.maps.len(), scan.sets.len(), scan.problems.len())
+                            });
+                            ui.add_space(card_gap);
+                            fix_ui_width(ui, content_width);
+                            let results_card_height = ui.available_height().max(0.0);
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
+                                ui.set_min_height((results_card_height - 24.0).max(0.0));
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Select all filtered").clicked() {
+                                        let maps = self
+                                            .scan
+                                            .as_ref()
+                                            .map(|scan| {
+                                                self.filtered_map_indexes
+                                                    .iter()
+                                                    .filter_map(|&index| {
+                                                        scan.maps.get(index).cloned()
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+                                        for map in &maps {
+                                            self.select_map(map);
+                                        }
+                                    }
+                                    if ui.button("Clear selection").clicked() {
+                                        self.clear_selection();
                                     }
                                 });
-                            }
-                            for entry in &self.update_log {
-                                status_log_label(
-                                    ui,
-                                    entry.status,
-                                    "updating",
-                                    "updated",
-                                    "failed",
-                                    entry.beatmapset_id,
-                                    &entry.message,
-                                );
-                            }
-                        });
-                    columns[1].separator();
-                }
-
-                if let Some(scan) = &self.scan {
-                    columns[1].label("Repair findings");
-                    let jobs = &self.repair_jobs_cache;
-                    if !jobs.is_empty() || !self.repair_log.is_empty() {
-                        egui::ScrollArea::vertical()
-                            .id_source("repairable_sets")
-                            .max_height(220.0)
-                            .show(&mut columns[1], |ui| {
-                                ui.set_width(ui.available_width());
-                                for entry in &self.repair_log {
-                                    status_log_label(
-                                        ui,
-                                        entry.status,
-                                        "repairing",
-                                        "repaired",
-                                        "failed",
-                                        entry.beatmapset_id,
-                                        &entry.message,
+                                ui.label(format!("{} selected map(s)", self.selected_maps.len()));
+                                ui.horizontal(|ui| {
+                                    ui.label("Collection");
+                                    let input_width = (ui.available_width() - 8.0).max(80.0);
+                                    ui.add_sized(
+                                        [input_width, 28.0],
+                                        egui::TextEdit::singleline(&mut self.collection_name)
+                                            .vertical_align(egui::Align::Center),
                                     );
-                                }
-                                for job in jobs {
-                                    ui.group(|ui| {
-                                        ui.label(format!(
-                                            "Set {}: {} corrupted map(s)",
-                                            job.beatmapset_id,
-                                            job.labels.len()
-                                        ));
-                                        for issue in &job.issues {
-                                            wrapped_label(ui, format!("  {issue}"));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Write collection").clicked() {
+                                        self.export_collection();
+                                    }
+                                    if ui.button("Write TSV manifest").clicked() {
+                                        self.export_manifest();
+                                    }
+                                    ui.add_enabled_ui(true, |ui| {
+                                        if ui.button("Restore backup").clicked() {
+                                            self.restore_collection_backup();
                                         }
-                                    });
+                                    })
+                                    .response
+                                    .on_hover_text("Restore collection.db from collection.db.bak");
+                                });
+                                ui.add_space(8.0);
+                                wrapped_label(
+                                    ui,
+                                    format!(
+                                        "{} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
+                                        self.filtered_map_indexes.len(),
+                                        scanned_maps,
+                                        scanned_sets,
+                                        repair_issues
+                                    ),
+                                );
+                                fix_ui_width(ui, ui.available_width());
+                                let list_height = ui.available_height().max(120.0);
+                                egui::ScrollArea::vertical()
+                                    .id_source("local_maps")
+                                    .max_height(list_height)
+                                    .auto_shrink([false, false])
+                                    .show_rows(
+                                        ui,
+                                        30.0,
+                                        self.filtered_map_indexes.len(),
+                                        |ui, row_range| {
+                                            let row_width = ui.available_width().max(1.0);
+                                            fix_ui_width(ui, row_width);
+                                            let row_height = 30.0;
+                                            let visible_rows = row_range.len() as f32;
+                                            let (list_rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(row_width, visible_rows * row_height),
+                                                egui::Sense::hover(),
+                                            );
+                                            for (visible_index, row) in row_range.enumerate() {
+                                                let Some(map) =
+                                                    self.scan.as_ref().and_then(|scan| {
+                                                        self.filtered_map_indexes
+                                                            .get(row)
+                                                            .and_then(|&index| scan.maps.get(index))
+                                                            .cloned()
+                                                    })
+                                                else {
+                                                    continue;
+                                                };
+                                                let mut selected =
+                                                    self.selected_md5s.contains(&map.md5);
+                                                let label = self.map_result_label(&map);
+                                                let row_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(
+                                                        list_rect.left(),
+                                                        list_rect.top()
+                                                            + visible_index as f32 * row_height,
+                                                    ),
+                                                    egui::vec2(row_width, row_height),
+                                                );
+                                                let checkbox_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(
+                                                        row_rect.left(),
+                                                        row_rect.center().y - 9.0,
+                                                    ),
+                                                    egui::vec2(18.0, 18.0),
+                                                );
+                                                let response = ui
+                                                    .put(
+                                                        checkbox_rect,
+                                                        egui::Checkbox::new(&mut selected, ""),
+                                                    )
+                                                    .changed();
+                                                let label_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(row_rect.left() + 28.0, row_rect.top()),
+                                                    row_rect.right_bottom(),
+                                                );
+                                                ui.painter().with_clip_rect(label_rect).text(
+                                                    label_rect.left_center(),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    label.clone(),
+                                                    egui::TextStyle::Body.resolve(ui.style()),
+                                                    ui.visuals().text_color(),
+                                                );
+                                                ui.interact(
+                                                    label_rect,
+                                                    ui.id().with(("map_row_label", row)),
+                                                    egui::Sense::hover(),
+                                                )
+                                                .on_hover_text(label);
+                                                if response {
+                                                    if selected {
+                                                        self.select_map(&map);
+                                                    } else {
+                                                        self.deselect_md5(&map.md5);
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                            });
+                        }
+                    });
+                if actions_width > 1.0 {
+                    let mut actions_ui = ui.child_ui_with_id_source(
+                        actions_rect,
+                        egui::Layout::top_down(egui::Align::Min),
+                        "actions_fixed",
+                    );
+                    actions_ui.set_clip_rect(actions_rect);
+                    actions_ui.set_width(actions_width);
+                    actions_ui.set_max_width(actions_width);
+                    egui::ScrollArea::vertical()
+                        .id_source("actions_pane")
+                        .auto_shrink([false, false])
+                        .show(&mut actions_ui, |ui| {
+                            let actions_content_width = (actions_width - 12.0).max(1.0);
+                            let card_item_spacing = ui.spacing().item_spacing;
+                            let card_gap = gap;
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            fix_ui_width(ui, actions_content_width);
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
+                                ui.heading("Results and actions");
+                            });
+
+                        if let Some(scan) = &self.scan {
+                            let jobs = &self.repair_jobs_cache;
+                            let missing_file_issues = scan
+                                .problems
+                                .iter()
+                                .filter(|issue| {
+                                    issue.severity == RepairSeverity::MissingRequiredFile
+                                })
+                                .count();
+                            ui.add_space(card_gap);
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
+                                ui.heading("Repair corrupted beatmaps");
+                                muted_label(
+                                    ui,
+                                    format!(
+                                        "{} missing-file issue(s), {} downloadable beatmapset(s)",
+                                        missing_file_issues,
+                                        jobs.len()
+                                    ),
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !self.is_repairing && !jobs.is_empty(),
+                                            egui::Button::new("Repair"),
+                                        )
+                                        .clicked()
+                                    {
+                                        repair_requested = true;
+                                    }
+                                    if self.is_repairing {
+                                        ui.add(egui::Spinner::new());
+                                    }
+                                });
+                                if jobs.is_empty() && missing_file_issues > 0 {
+                                    wrapped_label(ui, "These findings do not have a usable beatmapset ID. Rescan after this build; the app now infers IDs from osu! song folder names.");
+                                }
+                                if self.is_repairing {
+                                    wrapped_label(ui, &self.repair_progress);
+                                }
+                                if self.repair_total > 0 {
+                                    let progress =
+                                        self.repair_done as f32 / self.repair_total as f32;
+                                    ui.add(egui::ProgressBar::new(progress).text(format!(
+                                        "{}/{} complete | {} succeeded | {} failed",
+                                        self.repair_done,
+                                        self.repair_total,
+                                        self.repair_successes,
+                                        self.repair_failures
+                                    )));
                                 }
                             });
-                    } else {
-                        egui::ScrollArea::vertical()
-                            .id_source("repair")
-                            .max_height(180.0)
-                            .show(&mut columns[1], |ui| {
-                                ui.set_width(ui.available_width());
-                                for issue in &scan.problems {
-                                    let severity = match issue.severity {
-                                        RepairSeverity::MissingRequiredFile => "missing",
-                                        RepairSeverity::ParseWarning => "parse",
-                                    };
-                                    wrapped_label(ui, format!(
-                                        "{severity}: {} ({})",
-                                        issue.message,
-                                        issue.beatmap.display()
-                                ));
-                            }
+                        }
+
+                        if let Some(scan) = &self.scan {
+                            let delete_selection = DeleteModeSelection {
+                                taiko: self.delete_taiko,
+                                catch: self.delete_catch,
+                                mania: self.delete_mania,
+                            };
+                            let delete_count = scan
+                                .maps
+                                .iter()
+                                .filter(|map| delete_selection.matches(map.mode))
+                                .count();
+                            ui.add_space(card_gap);
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
+                                ui.heading("Delete non-std maps");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut self.delete_taiko, "Taiko");
+                                    ui.checkbox(&mut self.delete_catch, "Catch");
+                                    ui.checkbox(&mut self.delete_mania, "Mania");
+                                });
+                                muted_label(
+                                    ui,
+                                    format!(
+                                        "{delete_count} scanned .osu file(s) match selected mode(s)"
+                                    ),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !self.is_scanning && !self.is_repairing && delete_count > 0,
+                                        egui::Button::new("Delete selected non-std maps"),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_non_std_requested = true;
+                                }
                             });
-                    }
-                }
-                if repair_requested {
-                    self.start_repair_all();
-                }
-                if delete_non_std_requested {
-                    self.delete_selected_non_std_modes();
-                }
-                if update_check_requested {
-                    self.start_update_check();
-                }
-                if update_all_requested {
-                    self.start_update_all();
+                        }
+
+                        if let Some(scan) = &self.scan {
+                            ui.add_space(card_gap);
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
+                                ui.heading("Repair findings");
+                                let jobs = &self.repair_jobs_cache;
+                                if !jobs.is_empty() || !self.repair_log.is_empty() {
+                                    egui::ScrollArea::vertical()
+                                        .id_source("repairable_sets")
+                                        .max_height(220.0)
+                                        .show(ui, |ui| {
+                                            for entry in &self.repair_log {
+                                                status_log_label(
+                                                    ui,
+                                                    entry.status,
+                                                    "repairing",
+                                                    "repaired",
+                                                    "failed",
+                                                    entry.beatmapset_id,
+                                                    &entry.message,
+                                                );
+                                            }
+                                            for job in jobs {
+                                                nested_frame(ui.style()).show(ui, |ui| {
+                                                    fill_tile_width(ui);
+                                                    wrapped_label(
+                                                        ui,
+                                                        format!(
+                                                            "Set {}: {} corrupted map(s)",
+                                                            job.beatmapset_id,
+                                                            job.labels.len()
+                                                        ),
+                                                    );
+                                                    for issue in &job.issues {
+                                                        wrapped_label(ui, format!("  {issue}"));
+                                                    }
+                                                });
+                                            }
+                                        });
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .id_source("repair")
+                                        .max_height(180.0)
+                                        .show(ui, |ui| {
+                                            for issue in &scan.problems {
+                                                let severity = match issue.severity {
+                                                    RepairSeverity::MissingRequiredFile => "missing",
+                                                    RepairSeverity::ParseWarning => "parse",
+                                                };
+                                                wrapped_label(
+                                                    ui,
+                                                    format!(
+                                                        "{severity}: {} ({})",
+                                                        issue.message,
+                                                        issue.beatmap.display()
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                }
+                            });
+                        }
+                    });
                 }
             });
-        });
+
+        if repair_requested {
+            self.start_repair_all();
+        }
+        if delete_non_std_requested {
+            self.delete_selected_non_std_modes();
+        }
     }
 }
 
@@ -1481,36 +1365,6 @@ struct RepairJob {
     ignore_after_success: Vec<IgnoredRepairIssue>,
 }
 
-#[derive(Debug, Clone)]
-struct UpdateCandidate {
-    beatmapset_id: i64,
-    maps: Vec<LocalBeatmap>,
-    folders: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-struct UpdateJob {
-    beatmapset_id: i64,
-    folders: Vec<PathBuf>,
-    local_osu_paths: Vec<PathBuf>,
-    reasons: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RemoteBeatmapset {
-    #[serde(default)]
-    beatmaps: Vec<RemoteBeatmap>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RemoteBeatmap {
-    id: i64,
-    #[serde(default)]
-    checksum: Option<String>,
-    #[serde(default)]
-    version: String,
-}
-
 fn label_value_for_field(map: &LocalBeatmap, field: SearchField) -> Option<String> {
     match field {
         SearchField::StarRating => map.stars.map(|value| format!("*{}", format_number(value))),
@@ -1536,15 +1390,125 @@ fn matches_visible_filters(query: &BeatmapQuery, only_osu_std: bool, map: &Local
     (!only_osu_std || is_osu_std(map)) && query.matches_local(map)
 }
 
+fn scan_progress_status(scanned_maps: usize, matched_maps: usize) -> String {
+    format!("Maps read: {scanned_maps:>6} | Current filters: {matched_maps:>6}")
+}
+
+fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let bg = egui::Color32::from_rgb(0x15, 0x16, 0x18);
+    let panel = egui::Color32::from_rgb(0x1e, 0x1f, 0x22);
+    let surface = egui::Color32::from_rgb(0x26, 0x27, 0x2b);
+    let surface_hover = egui::Color32::from_rgb(0x30, 0x31, 0x35);
+    let border = egui::Color32::from_rgb(0x3b, 0x3c, 0x41);
+    let text = egui::Color32::from_rgb(0xe3, 0xdf, 0xd7);
+    let muted = egui::Color32::from_rgb(0xb3, 0xad, 0xa5);
+    let accent = egui::Color32::from_rgb(0x9a, 0x8f, 0x78);
+    let accent_soft = egui::Color32::from_rgb(0x3a, 0x35, 0x2b);
+
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.interact_size = egui::vec2(80.0, 28.0);
+    style.visuals = egui::Visuals::dark();
+    style.visuals.override_text_color = Some(text);
+    style.visuals.panel_fill = bg;
+    style.visuals.window_fill = panel;
+    style.visuals.extreme_bg_color = bg;
+    style.visuals.faint_bg_color = surface;
+    style.visuals.code_bg_color = surface;
+    style.visuals.hyperlink_color = accent;
+    style.visuals.selection.bg_fill = accent_soft;
+    style.visuals.selection.stroke = egui::Stroke::new(1.0, text);
+    style.visuals.warn_fg_color = egui::Color32::from_rgb(0xc4, 0xa2, 0x6a);
+    style.visuals.error_fg_color = egui::Color32::from_rgb(0xc2, 0x6b, 0x72);
+    style.visuals.window_rounding = egui::Rounding::same(10.0);
+    style.visuals.menu_rounding = egui::Rounding::same(8.0);
+    style.visuals.window_stroke = egui::Stroke::new(1.0, border);
+    style.visuals.widgets.noninteractive.bg_fill = surface;
+    style.visuals.widgets.noninteractive.weak_bg_fill = surface;
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, muted);
+    style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+    style.visuals.widgets.inactive.bg_fill = surface;
+    style.visuals.widgets.inactive.weak_bg_fill = surface;
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+    style.visuals.widgets.hovered.bg_fill = surface_hover;
+    style.visuals.widgets.hovered.weak_bg_fill = surface_hover;
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
+    style.visuals.widgets.active.bg_fill = accent_soft;
+    style.visuals.widgets.active.weak_bg_fill = accent_soft;
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
+    ctx.set_style(style);
+}
+
+fn panel_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::side_top_panel(style)
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .fill(egui::Color32::from_rgb(0x18, 0x19, 0x1c))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0x32, 0x33, 0x37),
+        ))
+}
+
+fn section_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::group(style)
+        .inner_margin(egui::Margin::same(12.0))
+        .outer_margin(egui::Margin::same(0.0))
+        .rounding(egui::Rounding::same(10.0))
+        .fill(egui::Color32::from_rgb(0x20, 0x21, 0x24))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
+        ))
+}
+
+fn nested_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::group(style)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(8.0))
+        .fill(egui::Color32::from_rgb(0x26, 0x27, 0x2b))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
+        ))
+}
+
+fn muted_label(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text.into()).color(egui::Color32::from_rgb(0xb3, 0xad, 0xa5)),
+        )
+        .wrap(true),
+    );
+}
+
 fn scan_status_label(ui: &mut egui::Ui, prefix: &str, value: &str) {
     let text = format!("{prefix}: {value}");
-    let width = ui.available_width().max(160.0);
+    let width = ui.available_width().max(1.0);
     ui.add_sized([width, 18.0], egui::Label::new(text.clone()).truncate(true))
         .on_hover_text(text);
 }
 
 fn wrapped_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).wrap(true));
+}
+
+fn fix_ui_width(ui: &mut egui::Ui, width: f32) {
+    let width = width.max(1.0);
+    ui.set_width(width);
+    ui.set_min_width(width);
+    ui.set_max_width(width);
+}
+
+fn fill_tile_width(ui: &mut egui::Ui) {
+    fix_ui_width(ui, ui.available_width());
 }
 
 fn status_log_label(
@@ -1558,10 +1522,10 @@ fn status_log_label(
 ) {
     let (label, color) = match status {
         RepairLogStatus::InProgress => (in_progress, None),
-        RepairLogStatus::Success => (success, Some(egui::Color32::from_rgb(0x0b, 0xb9, 0x41))),
-        RepairLogStatus::Failed => (failed, Some(egui::Color32::from_rgb(0xa1, 0x09, 0x27))),
+        RepairLogStatus::Success => (success, Some(egui::Color32::from_rgb(0x7f, 0xa6, 0x86))),
+        RepairLogStatus::Failed => (failed, Some(egui::Color32::from_rgb(0xc2, 0x6b, 0x72))),
     };
-    let number_color = egui::Color32::from_rgb(0x0e, 0xa5, 0xe9);
+    let number_color = egui::Color32::from_rgb(0xb0, 0x9d, 0x7d);
 
     ui.horizontal_wrapped(|ui| {
         let mut rich = egui::RichText::new(format!("{label}:")).strong();
@@ -1649,193 +1613,6 @@ fn format_number(value: f32) -> String {
 fn format_duration(seconds: f32) -> String {
     let total = seconds.round().max(0.0) as u32;
     format!("{}:{:02}", total / 60, total % 60)
-}
-
-fn update_candidates(scan: &LibraryScan) -> Vec<UpdateCandidate> {
-    let mut grouped = BTreeMap::<i64, (Vec<LocalBeatmap>, BTreeSet<PathBuf>)>::new();
-    for map in &scan.maps {
-        let Some(beatmapset_id) = map.beatmapset_id else {
-            continue;
-        };
-        let entry = grouped.entry(beatmapset_id).or_default();
-        entry.0.push(map.clone());
-        entry.1.insert(map.folder.clone());
-    }
-
-    grouped
-        .into_iter()
-        .map(|(beatmapset_id, (maps, folders))| UpdateCandidate {
-            beatmapset_id,
-            maps,
-            folders: folders.into_iter().collect(),
-        })
-        .collect()
-}
-
-fn check_update_jobs(
-    candidates: Vec<UpdateCandidate>,
-    backend_url: String,
-    tx: mpsc::Sender<UpdateEvent>,
-) {
-    let total = candidates.len();
-    let _ = tx.send(UpdateEvent::CheckStarted { total });
-    let mut jobs = Vec::new();
-    let mut failures = 0;
-    let client = reqwest::blocking::Client::new();
-
-    for (index, candidate) in candidates.iter().enumerate() {
-        let current = index + 1;
-        let _ = tx.send(UpdateEvent::Checking {
-            beatmapset_id: candidate.beatmapset_id,
-            index: current,
-            total,
-        });
-
-        match fetch_remote_beatmapset(&client, candidate.beatmapset_id, &backend_url).and_then(
-            |remote| match remote {
-                Some(remote) => update_job_from_remote(candidate, &remote),
-                None => Ok(None),
-            },
-        ) {
-            Ok(Some(job)) => jobs.push(job),
-            Ok(None) => {}
-            Err(err) => {
-                failures += 1;
-                let _ = tx.send(UpdateEvent::CheckFailed {
-                    beatmapset_id: candidate.beatmapset_id,
-                    message: format!("{err:#}"),
-                });
-            }
-        }
-
-        thread::sleep(UPDATE_CHECK_DELAY);
-    }
-
-    let _ = tx.send(UpdateEvent::CheckFinished { jobs, failures });
-}
-
-fn fetch_remote_beatmapset(
-    client: &reqwest::blocking::Client,
-    beatmapset_id: i64,
-    backend_url: &str,
-) -> Result<Option<RemoteBeatmapset>> {
-    if backend_url.trim().is_empty() {
-        anyhow::bail!("backend URL is required for update checks");
-    }
-
-    let url = format!(
-        "{}/beatmapsets/{}",
-        backend_url.trim().trim_end_matches('/'),
-        beatmapset_id
-    );
-    let response = client.get(&url).send()?;
-    let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        anyhow::bail!("HTTP {status} while fetching update metadata");
-    }
-    let remote = response
-        .json::<RemoteBeatmapset>()
-        .with_context(|| format!("fetching update metadata for set {beatmapset_id}"))?;
-    Ok(Some(remote))
-}
-
-fn update_job_from_remote(
-    candidate: &UpdateCandidate,
-    remote: &RemoteBeatmapset,
-) -> Result<Option<UpdateJob>> {
-    let remote_by_id = remote
-        .beatmaps
-        .iter()
-        .map(|beatmap| (beatmap.id, beatmap))
-        .collect::<BTreeMap<_, _>>();
-    let remote_by_version = remote
-        .beatmaps
-        .iter()
-        .filter_map(|beatmap| {
-            let version = normalized_version(&beatmap.version);
-            (!version.is_empty()).then_some((version, beatmap))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let local_ids = candidate
-        .maps
-        .iter()
-        .filter_map(|map| map.beatmap_id)
-        .collect::<BTreeSet<_>>();
-    let local_versions = candidate
-        .maps
-        .iter()
-        .map(|map| normalized_version(&map.version))
-        .filter(|version| !version.is_empty())
-        .collect::<BTreeSet<_>>();
-    let mut reasons = Vec::new();
-    let mut local_osu_paths = BTreeSet::new();
-
-    for map in &candidate.maps {
-        let remote_map = map
-            .beatmap_id
-            .and_then(|beatmap_id| remote_by_id.get(&beatmap_id).copied())
-            .or_else(|| {
-                remote_by_version
-                    .get(&normalized_version(&map.version))
-                    .copied()
-            });
-
-        let Some(remote_map) = remote_map else {
-            if map.beatmap_id.is_some() {
-                reasons.push(format!(
-                    "{} is no longer present in the latest set",
-                    map.label()
-                ));
-                local_osu_paths.insert(map.path.clone());
-            }
-            continue;
-        };
-
-        if let Some(remote_checksum) = remote_map.checksum.as_deref()
-            && !remote_checksum.eq_ignore_ascii_case(&map.md5)
-        {
-            reasons.push(format!(
-                "{} [{}] checksum changed",
-                map.artist,
-                if remote_map.version.is_empty() {
-                    map.version.as_str()
-                } else {
-                    remote_map.version.as_str()
-                }
-            ));
-            local_osu_paths.insert(map.path.clone());
-        }
-    }
-
-    for remote_map in &remote.beatmaps {
-        if local_ids.contains(&remote_map.id)
-            || local_versions.contains(&normalized_version(&remote_map.version))
-        {
-            continue;
-        }
-        reasons.push(format!(
-            "New difficulty available: [{}]",
-            remote_map.version
-        ));
-    }
-
-    if reasons.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(UpdateJob {
-        beatmapset_id: candidate.beatmapset_id,
-        folders: candidate.folders.clone(),
-        local_osu_paths: local_osu_paths.into_iter().collect(),
-        reasons,
-    }))
-}
-
-fn normalized_version(version: &str) -> String {
-    version.trim().to_ascii_lowercase()
 }
 
 fn repair_jobs(scan: &LibraryScan) -> Vec<RepairJob> {
@@ -1944,39 +1721,6 @@ fn run_repair_jobs(jobs: Vec<RepairJob>, backend_url: String, tx: mpsc::Sender<R
     let _ = tx.send(RepairEvent::Finished);
 }
 
-fn run_update_jobs(jobs: Vec<UpdateJob>, backend_url: String, tx: mpsc::Sender<UpdateEvent>) {
-    let total = jobs.len();
-    let _ = tx.send(UpdateEvent::UpdateStarted { total });
-    let client = reqwest::blocking::Client::new();
-
-    for (index, job) in jobs.iter().enumerate() {
-        let current = index + 1;
-        if index > 0 {
-            thread::sleep(BEATMAPSET_DOWNLOAD_DELAY);
-        }
-        let _ = tx.send(UpdateEvent::Updating {
-            beatmapset_id: job.beatmapset_id,
-            index: current,
-            total,
-        });
-
-        if let Err(err) = update_beatmapset(&client, job, &backend_url) {
-            let _ = tx.send(UpdateEvent::UpdateFailed {
-                beatmapset_id: job.beatmapset_id,
-                message: format!("{err:#}"),
-            });
-            continue;
-        }
-
-        let _ = tx.send(UpdateEvent::Updated {
-            beatmapset_id: job.beatmapset_id,
-            folder_count: job.folders.len(),
-        });
-    }
-
-    let _ = tx.send(UpdateEvent::UpdateFinished);
-}
-
 fn repair_beatmapset(
     client: &reqwest::blocking::Client,
     job: &RepairJob,
@@ -1999,41 +1743,6 @@ fn repair_beatmapset(
     }
 
     download_file(client, &url, &temp_path).with_context(|| format!("downloading {url}"))?;
-    for folder in &job.folders {
-        extract_osz_into_folder(&temp_path, folder)
-            .with_context(|| format!("extracting into {}", folder.display()))?;
-    }
-    Ok(())
-}
-
-fn update_beatmapset(
-    client: &reqwest::blocking::Client,
-    job: &UpdateJob,
-    backend_url: &str,
-) -> Result<()> {
-    if backend_url.trim().is_empty() {
-        anyhow::bail!("backend URL is required for automatic update downloads");
-    }
-
-    let url = format!(
-        "{}/beatmapsets/{}/download",
-        backend_url.trim().trim_end_matches('/'),
-        job.beatmapset_id
-    );
-    let temp_path = std::env::temp_dir()
-        .join("osu-map-manager-updates")
-        .join(format!("{}.osz", job.beatmapset_id));
-    if let Some(parent) = temp_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    download_file(client, &url, &temp_path).with_context(|| format!("downloading {url}"))?;
-    for path in &job.local_osu_paths {
-        if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("removing old map file {}", path.display()))?;
-        }
-    }
     for folder in &job.folders {
         extract_osz_into_folder(&temp_path, folder)
             .with_context(|| format!("extracting into {}", folder.display()))?;
@@ -2090,17 +1799,53 @@ fn save_repair_ignores(osu_root: &str, store: &RepairIgnoreStore) -> Result<()> 
 }
 
 fn repair_ignore_path(osu_root: &str) -> PathBuf {
+    app_data_path(osu_root).join("repair_ignores.json")
+}
+
+fn app_data_path(osu_root: &str) -> PathBuf {
     let root = if osu_root.trim().is_empty() {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
-        PathBuf::from(osu_root.trim())
+        expand_prefilled_path(osu_root)
     };
-    root.join(".osu-map-manager").join("repair_ignores.json")
+    root.join(".osu-map-manager")
 }
 
 fn default_osu_root() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|path| path.join("osu!"))
-        .filter(|path| path.exists())
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(path.join("osu!"));
+    }
+    if let Some(path) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        candidates.push(path.join("AppData").join("Local").join("osu!"));
+    }
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn display_prefilled_path(path: &Path) -> String {
+    if let Some(user_profile) = std::env::var_os("USERPROFILE").map(PathBuf::from)
+        && let Ok(suffix) = path.strip_prefix(&user_profile)
+    {
+        let suffix = suffix.display().to_string();
+        return if suffix.is_empty() {
+            "%USERPROFILE%".to_owned()
+        } else {
+            format!("%USERPROFILE%\\{suffix}")
+        };
+    }
+
+    path.display().to_string()
+}
+
+fn expand_prefilled_path(path: &str) -> PathBuf {
+    let path = path.trim();
+    if let Some(user_profile) = std::env::var_os("USERPROFILE")
+        && let Some(suffix) = path.strip_prefix("%USERPROFILE%")
+    {
+        let suffix = suffix.trim_start_matches(['\\', '/']);
+        return PathBuf::from(user_profile).join(suffix);
+    }
+
+    PathBuf::from(path)
 }
