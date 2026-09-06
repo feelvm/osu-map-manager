@@ -31,6 +31,9 @@ pub struct LocalBeatmap {
     pub audio_filename: Option<String>,
     pub background_filename: Option<String>,
     pub mode: Option<u8>,
+    /// Whether the .osu file declared a `Mode` field at all. std maps usually
+    /// omit it; its absence is a fact about the file, not a parse failure.
+    pub has_mode_field: bool,
     pub ar: Option<f32>,
     pub cs: Option<f32>,
     pub od: Option<f32>,
@@ -129,7 +132,7 @@ pub fn scan_songs_dir(songs_dir: &Path) -> Result<LibraryScan> {
         for osu in fs::read_dir(entry.path())? {
             let osu = osu?;
             let path = osu.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("osu") {
+            if !is_osu_file(&path) {
                 continue;
             }
 
@@ -155,6 +158,7 @@ pub fn scan_songs_dir(songs_dir: &Path) -> Result<LibraryScan> {
 pub fn scan_songs_dir_streaming(
     songs_dir: PathBuf,
     osu_root: Option<PathBuf>,
+    cached_scan: Option<LibraryScan>,
     cancel: Arc<AtomicBool>,
     skip_issue_kinds: BTreeSet<String>,
     tx: Sender<ScanEvent>,
@@ -162,6 +166,7 @@ pub fn scan_songs_dir_streaming(
     let result = scan_songs_dir_streaming_inner(
         &songs_dir,
         osu_root.as_deref(),
+        cached_scan,
         &cancel,
         &skip_issue_kinds,
         &tx,
@@ -176,6 +181,7 @@ pub fn scan_songs_dir_streaming(
 fn scan_songs_dir_streaming_inner(
     songs_dir: &Path,
     osu_root: Option<&Path>,
+    cached_scan: Option<LibraryScan>,
     cancel: &AtomicBool,
     skip_issue_kinds: &BTreeSet<String>,
     tx: &Sender<ScanEvent>,
@@ -199,6 +205,29 @@ fn scan_songs_dir_streaming_inner(
         star_parse_error,
     });
     let mut maps = Vec::new();
+    let cached_maps = cached_scan
+        .as_ref()
+        .map(|scan| {
+            scan.maps
+                .iter()
+                .map(|map| (map.path.clone(), map.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let cached_problems = cached_scan
+        .as_ref()
+        .map(|scan| {
+            let mut grouped = BTreeMap::<PathBuf, Vec<RepairIssue>>::new();
+            for issue in &scan.problems {
+                grouped
+                    .entry(issue.beatmap.clone())
+                    .or_default()
+                    .push(issue.clone());
+            }
+            grouped
+        })
+        .unwrap_or_default();
+
     for entry in
         fs::read_dir(songs_dir).with_context(|| format!("reading {}", songs_dir.display()))?
     {
@@ -229,11 +258,21 @@ fn scan_songs_dir_streaming_inner(
 
             let osu = osu?;
             let path = osu.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("osu") {
+            if !is_osu_file(&path) {
                 continue;
             }
 
             let _ = tx.send(ScanEvent::Parsing { path: path.clone() });
+            if let Some(map) = cached_maps.get(&path) {
+                let issues = cached_problems.get(&path).cloned().unwrap_or_default();
+                maps.push(map.clone());
+                let _ = tx.send(ScanEvent::Map {
+                    map: map.clone(),
+                    issues,
+                });
+                continue;
+            }
+
             let calculate_local_stars = db_index.is_none();
             match parse_osu_file_with_timeout(
                 path.clone(),
@@ -250,7 +289,7 @@ fn scan_songs_dir_streaming_inner(
                             map.stars = meta.standard_stars;
                         }
                     }
-                    if map.stars.is_none() {
+                    if map.stars.is_none() && map.mode.unwrap_or(0) == 0 {
                         map.stars = calculate_stars_for_path_with_timeout(
                             path.clone(),
                             Duration::from_secs(8),
@@ -321,13 +360,18 @@ fn parse_osu_file_with_timeout(
     timeout: Duration,
     calculate_local_stars: bool,
 ) -> std::result::Result<LocalBeatmap, (ParseIssueKind, anyhow::Error)> {
-    if !calculate_local_stars {
-        return parse_osu_file_inner(&path, false).map_err(|err| (ParseIssueKind::ParseError, err));
-    }
-
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(parse_osu_file_inner(&path, calculate_local_stars));
+        let mut result = parse_osu_file_inner(&path, false);
+        if calculate_local_stars
+            && let Ok(map) = &mut result
+            && map.mode.unwrap_or(0) == 0
+        {
+            map.stars = fs::read(&path)
+                .ok()
+                .and_then(|bytes| calculate_stars(&bytes));
+        }
+        let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
@@ -398,6 +442,7 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
     }
 
     let folder = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
+    let has_mode_field = values.keys().any(|key| key.eq_ignore_ascii_case("mode"));
 
     let stars = calculate_local_stars
         .then(|| calculate_stars(&bytes))
@@ -418,7 +463,8 @@ fn parse_osu_file_inner(path: &Path, calculate_local_stars: bool) -> Result<Loca
         tags: values.get("Tags").cloned().unwrap_or_default(),
         audio_filename: values.get("AudioFilename").cloned(),
         background_filename,
-        mode: parse_u8(values.get("Mode")),
+        mode: parse_mode(&values),
+        has_mode_field,
         ar: parse_f32(values.get("ApproachRate")),
         cs: parse_f32(values.get("CircleSize")),
         od: parse_f32(values.get("OverallDifficulty")),
@@ -554,8 +600,36 @@ fn parse_folder_set_id(folder: &Path) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|value| *value > 0)
 }
 
-fn parse_u8(value: Option<&String>) -> Option<u8> {
-    value.and_then(|value| value.parse().ok())
+/// Looks up the game mode tolerantly: the key match ignores case (some
+/// third-party files write `mode:`), and the value parses a leading integer so
+/// trailing comments or whitespace cannot silently drop the mode. A missing
+/// `Mode` field means osu!std and stays `None`.
+fn parse_mode(values: &BTreeMap<String, String>) -> Option<u8> {
+    let value = values
+        .get("Mode")
+        .or_else(|| {
+            values
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("mode"))
+                .map(|(_, value)| value)
+        })?;
+    let digits: String = value
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether a directory entry is a beatmap file. The comparison ignores case
+/// so packs using `.OSU`/`.Osu` are not silently skipped.
+pub fn is_osu_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("osu"))
 }
 
 fn parse_f32(value: Option<&String>) -> Option<f32> {
@@ -609,6 +683,75 @@ ApproachRate:9
         let issues = find_repair_issues(&map);
 
         assert!(issues.is_empty());
+
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn game_mode_parsing_is_tolerant() {
+        let mut values = BTreeMap::new();
+        assert_eq!(parse_mode(&values), None);
+
+        values.insert("Mode".to_owned(), "3".to_owned());
+        assert_eq!(parse_mode(&values), Some(3));
+
+        values.insert("Mode".to_owned(), "1 // taiko".to_owned());
+        assert_eq!(parse_mode(&values), Some(1));
+
+        let mut lower = BTreeMap::new();
+        lower.insert("mode".to_owned(), "2".to_owned());
+        assert_eq!(parse_mode(&lower), Some(2));
+
+        let mut bad = BTreeMap::new();
+        bad.insert("Mode".to_owned(), "mania".to_owned());
+        assert_eq!(parse_mode(&bad), None);
+    }
+
+    #[test]
+    fn osu_file_extension_check_ignores_case() {
+        assert!(is_osu_file(Path::new("song.osu")));
+        assert!(is_osu_file(Path::new("SONG.OSU")));
+        assert!(is_osu_file(Path::new("song.Osu")));
+        assert!(!is_osu_file(Path::new("song.osb")));
+        assert!(!is_osu_file(Path::new("song")));
+    }
+
+    #[test]
+    fn non_std_map_metadata_parses_without_star_calculation() {
+        let folder =
+            std::env::temp_dir().join(format!("osu-map-manager-mode-test-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let osu_path = folder.join("mania.osu");
+        fs::write(
+            &osu_path,
+            "osu file format v14
+
+[General]
+AudioFilename: audio.mp3
+Mode: 3
+
+[Metadata]
+Title:Mania Map
+Artist:Test
+Creator:Mapper
+Version:Keys
+BeatmapSetID:123
+BeatmapID:789
+
+[Difficulty]
+CircleSize:4
+
+[HitObjects]
+64,192,1000,1,0,0:0:0:0:
+",
+        )
+        .unwrap();
+
+        let map = parse_osu_file_with_timeout(osu_path, Duration::from_secs(1), true).unwrap();
+
+        assert_eq!(map.mode, Some(3));
+        assert!(map.has_mode_field);
+        assert_eq!(map.title, "Mania Map");
 
         let _ = fs::remove_dir_all(folder);
     }

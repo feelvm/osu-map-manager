@@ -5,33 +5,70 @@ use std::{fs, io::Write, path::Path};
 const DEFAULT_COLLECTION_DB_VERSION: i32 = 20250107;
 
 #[derive(Debug, Clone)]
-struct CollectionEntry {
-    name: String,
-    hashes: Vec<String>,
+pub struct CollectionEntry {
+    pub name: String,
+    pub hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-struct CollectionDb {
-    version: i32,
-    collections: Vec<CollectionEntry>,
+pub struct CollectionDb {
+    pub version: i32,
+    pub collections: Vec<CollectionEntry>,
 }
 
-pub fn write_collection_db(
-    path: &Path,
-    collection_name: &str,
-    maps: &[LocalBeatmap],
-) -> Result<()> {
-    let mut db = if path.exists() {
-        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        parse_collection_db(&bytes).with_context(|| format!("parsing {}", path.display()))?
-    } else {
-        CollectionDb {
+impl CollectionDb {
+    pub fn empty() -> Self {
+        Self {
             version: DEFAULT_COLLECTION_DB_VERSION,
             collections: Vec::new(),
         }
+    }
+}
+
+pub fn load_collection_db(path: &Path) -> Result<CollectionDb> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_collection_db(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+pub fn create_collection(path: &Path, collection_name: &str) -> Result<()> {
+    let mut db = if path.exists() {
+        load_collection_db(path)?
+    } else {
+        CollectionDb::empty()
     };
 
-    let hashes = maps.iter().map(|map| map.md5.clone()).collect::<Vec<_>>();
+    upsert_collection_hashes(&mut db, collection_name, Vec::new());
+    write_db(path, &db)
+}
+
+pub fn add_to_collection(
+    path: &Path,
+    collection_name: &str,
+    hashes: &[String],
+) -> Result<()> {
+    let mut db = if path.exists() {
+        load_collection_db(path)?
+    } else {
+        CollectionDb::empty()
+    };
+
+    let mut existing = db
+        .collections
+        .iter()
+        .find(|c| c.name == collection_name)
+        .map(|c| c.hashes.clone())
+        .unwrap_or_default();
+
+    for hash in hashes {
+        if !existing.contains(hash) {
+            existing.push(hash.clone());
+        }
+    }
+    upsert_collection_hashes(&mut db, collection_name, existing);
+    write_db(path, &db)
+}
+
+pub fn upsert_collection_hashes(db: &mut CollectionDb, collection_name: &str, hashes: Vec<String>) {
     if let Some(collection) = db
         .collections
         .iter_mut()
@@ -44,23 +81,6 @@ pub fn write_collection_db(
             hashes,
         });
     }
-
-    let mut bytes = Vec::new();
-    write_i32(&mut bytes, db.version)?;
-    write_i32(&mut bytes, db.collections.len() as i32)?;
-    for collection in &db.collections {
-        write_osu_string(&mut bytes, &collection.name)?;
-        write_i32(&mut bytes, collection.hashes.len() as i32)?;
-        for hash in &collection.hashes {
-            write_osu_string(&mut bytes, hash)?;
-        }
-    }
-
-    if path.exists() {
-        let backup = path.with_extension("db.bak");
-        fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
-    }
-    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn write_manifest(path: &Path, maps: &[LocalBeatmap]) -> Result<()> {
@@ -78,6 +98,32 @@ pub fn write_manifest(path: &Path, maps: &[LocalBeatmap]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub fn delete_collection(db: &mut CollectionDb, collection_name: &str) -> bool {
+    let original_len = db.collections.len();
+    db.collections
+        .retain(|collection| collection.name != collection_name);
+    db.collections.len() != original_len
+}
+
+pub fn write_db(path: &Path, db: &CollectionDb) -> Result<()> {
+    let mut bytes = Vec::new();
+    write_i32(&mut bytes, db.version)?;
+    write_i32(&mut bytes, db.collections.len() as i32)?;
+    for collection in &db.collections {
+        write_osu_string(&mut bytes, &collection.name)?;
+        write_i32(&mut bytes, collection.hashes.len() as i32)?;
+        for hash in &collection.hashes {
+            write_osu_string(&mut bytes, hash)?;
+        }
+    }
+
+    if path.exists() {
+        let backup = path.with_extension("db.bak");
+        fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn restore_collection_backup(path: &Path) -> Result<()> {
@@ -254,5 +300,43 @@ mod tests {
         assert_eq!(parsed.collections[0].hashes, ["aaa"]);
         assert_eq!(parsed.collections[1].name, "replace");
         assert_eq!(parsed.collections[1].hashes, ["old"]);
+    }
+
+    #[test]
+    fn saves_renames_and_deletes_collections() {
+        let path = std::env::temp_dir().join(format!(
+            "osu-map-manager-collection-test-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db.bak"));
+
+        let mut db = CollectionDb::empty();
+        upsert_collection_hashes(&mut db, "first", vec!["aaa".to_owned(), "bbb".to_owned()]);
+        upsert_collection_hashes(&mut db, "second", vec!["ccc".to_owned()]);
+        write_db(&path, &db).unwrap();
+
+        let mut loaded = load_collection_db(&path).unwrap();
+        assert_eq!(loaded.collections.len(), 2);
+        assert_eq!(loaded.collections[0].name, "first");
+        assert_eq!(loaded.collections[0].hashes, ["aaa", "bbb"]);
+
+        assert!(delete_collection(&mut loaded, "first"));
+        upsert_collection_hashes(&mut loaded, "renamed", vec!["bbb".to_owned()]);
+        write_db(&path, &loaded).unwrap();
+
+        let reloaded = load_collection_db(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .collections
+                .iter()
+                .map(|collection| collection.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "renamed"]
+        );
+        assert!(path.with_extension("db.bak").exists());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db.bak"));
     }
 }

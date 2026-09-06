@@ -292,8 +292,9 @@ fn compare_number(value: f32, needle: &str, operator: Operator) -> bool {
 }
 
 fn mode_label(mode: Option<u8>) -> &'static str {
+    // A missing Mode field means osu!std in the .osu format.
     match mode {
-        Some(0) => "osu",
+        None | Some(0) => "osu",
         Some(1) => "taiko",
         Some(2) => "catch ctb fruits",
         Some(3) => "mania",

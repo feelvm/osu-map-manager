@@ -10,7 +10,9 @@ star rating, length, mode, and other fields, then write the selected results int
 ## What You Can Do
 
 - Find maps in your local osu! library with osu!-style filters.
+- Preview map backgrounds and play map audio inside the app through FFmpeg.
 - Build a collection from the matching maps.
+- Inspect and edit existing collections from `collection.db`.
 - Save that collection directly to `collection.db`.
 - Export a TSV list of selected maps for review.
 - Detect maps with missing audio or background files.
@@ -23,6 +25,7 @@ You need:
 - [osu!](https://osu.ppy.sh/home/download) installed on your computer.
 - A local osu! `Songs` folder with beatmaps in it.
 - This app built or downloaded for your system.
+- [FFmpeg](https://ffmpeg.org/download.html) available on `PATH`, set through `FFMPEG_PATH`, or placed beside the app executable.
 - [Rustup](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed for building from source.
 
 If you are running from source, start it with:
@@ -64,6 +67,10 @@ osu!.db
 The `Songs` folder contains the `.osu` files. `osu!.db` can provide extra local metadata such as
 stored star ratings where available.
 
+After a full scan, the app caches the parsed library under `.osu-map-manager`. On the next start it
+loads that cache immediately, and the next scan reuses cached maps while parsing newly added `.osu`
+files.
+
 ## Filtering Maps
 
 Filters are combined together. A map must match every active filter to appear in the result list.
@@ -100,6 +107,10 @@ is not available locally yet.
 When you write `collection.db`, osu! Map Manager creates or updates a collection with your chosen
 name and the selected maps.
 
+You can also load existing collections from `collection.db`, inspect their stored beatmap hashes,
+load one into the current selection, then add or remove scanned maps before saving it back. Editing
+the name of a loaded collection before saving renames that collection.
+
 Before writing:
 
 - Close osu! if it is open.
@@ -113,8 +124,37 @@ After writing, start osu! and check the Collections tab.
 The app can detect installed maps that reference missing required files, such as missing audio or
 background files.
 
-If repair downloads are configured, you can use the repair workflow to redownload affected
-beatmapsets and restore missing files.
+Open the `Repairs and delete` tab to fix them. Each affected beatmapset lists its missing files
+and has its own `Repair this set` button (or use `Repair all`). Repair redownloads the
+beatmapset through the configured backend (`Backend URL`) and restores only the missing files,
+so your local scores and edits are left untouched. The log reports where each download came from
+and which files were restored; rescan afterwards to confirm the issues are gone.
+
+For downloads via the official osu! API, click `Sign in with osu!`. This opens osu! in your
+browser and completes through the backend Worker (which holds the OAuth client secret), then the
+app downloads with your user token. Without sign-in, downloads fall back to the mirror.
+
+Your osu! OAuth app must have its callback URL set to exactly
+`http://127.0.0.1:3000/callback`, otherwise osu! answers the sign-in page with
+401 `invalid_client`.
+
+## Updating Outdated Maps
+
+osu! marks maps with `update to latest version` when the installed `.osu` file no longer matches
+the online version. The `Repairs and delete` tab has an `Update outdated beatmaps` section that
+does the same comparison in bulk:
+
+1. Click `Check for updates`. The app compares every installed difficulty that has an online
+   beatmap id against the current osu!web checksums (the same signal osu! uses). Checking needs
+   only the backend URL, no sign-in.
+2. Review the outdated sets — each lists which difficulties changed and the online version date.
+3. Click `Update all` or update a single set. The app redownloads the beatmapset (official osu!
+   API when signed in, mirror otherwise), overwrites it with the latest files, removes
+   difficulties deleted upstream, verifies the result against the online checksums, then
+   rescans the updated files automatically.
+
+Sets that no longer exist online are reported and skipped. Difficulties without an online
+beatmap id cannot be checked.
 
 ## Exporting a Map List
 
