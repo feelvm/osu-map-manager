@@ -1,250 +1,234 @@
+//! Beginner-friendly collection filters.
+//!
+//! Instead of free-form `field<operator>value` rows, the UI offers one
+//! control per idea: text boxes for words (artist, title, mapper, ...),
+//! min/max sliders for numbers (stars, AR, ...), text boxes for the song
+//! length, and a dropdown for the game mode.
+
 use serde::{Deserialize, Serialize};
 
 use crate::local::LocalBeatmap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Operator {
-    Eq,
-    NotEq,
-    Lt,
-    Gt,
-    Le,
-    Ge,
+/// Full slider bounds for every numeric filter, shared by the UI and matching.
+pub const STARS_RANGE: (f32, f32) = (0.0, 12.0);
+pub const AR_RANGE: (f32, f32) = (0.0, 11.0);
+pub const CS_RANGE: (f32, f32) = (0.0, 10.0);
+pub const OD_RANGE: (f32, f32) = (0.0, 11.0);
+pub const HP_RANGE: (f32, f32) = (0.0, 10.0);
+pub const BPM_RANGE: (f32, f32) = (0.0, 350.0);
+
+/// Closed numeric range picked with min/max sliders. Disabled means "any".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeFilter {
+    pub enabled: bool,
+    pub min: f32,
+    pub max: f32,
 }
 
-impl Operator {
-    pub const ALL: [Self; 6] = [
-        Self::Eq,
-        Self::NotEq,
-        Self::Lt,
-        Self::Gt,
-        Self::Le,
-        Self::Ge,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Eq => "=",
-            Self::NotEq => "!=",
-            Self::Lt => "<",
-            Self::Gt => ">",
-            Self::Le => "<=",
-            Self::Ge => ">=",
+impl RangeFilter {
+    pub const fn new(min: f32, max: f32) -> Self {
+        Self {
+            enabled: false,
+            min,
+            max,
         }
+    }
+
+    pub fn matches(&self, value: Option<f32>) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        value.is_some_and(|value| value >= self.min && value <= self.max)
+    }
+
+    /// osu!web-style tokens (`stars>=6 stars<=8`). Only emitted when enabled.
+    fn tokens(&self, key: &str, full: (f32, f32)) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut tokens = Vec::new();
+        if self.min > full.0 {
+            tokens.push(format!("{key}>={}", trim_number(self.min)));
+        }
+        if self.max < full.1 {
+            tokens.push(format!("{key}<={}", trim_number(self.max)));
+        }
+        if tokens.is_empty() {
+            tokens.push(format!("{key}>={}", trim_number(self.min)));
+        }
+        tokens
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum SearchField {
-    FreeText,
-    Artist,
-    Title,
-    Source,
-    Favourites,
-    FeaturedArtist,
-    Creator,
-    Difficulty,
-    ApproachRate,
-    CircleSize,
-    OverallDifficulty,
-    HpDrain,
-    StarRating,
-    Bpm,
-    Length,
-    Divisor,
-    Circles,
-    Sliders,
-    Keys,
-    Status,
-    Created,
-    Submitted,
-    Updated,
-    Ranked,
-    Tag,
-    Mode,
+fn trim_number(value: f32) -> String {
+    let text = format!("{value:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-impl SearchField {
-    pub const SORTED: [Self; 16] = [
-        Self::ApproachRate,
-        Self::Artist,
-        Self::Bpm,
-        Self::CircleSize,
-        Self::Creator,
-        Self::HpDrain,
-        Self::Length,
-        Self::Mode,
-        Self::OverallDifficulty,
-        Self::Ranked,
-        Self::Created,
-        Self::StarRating,
-        Self::Status,
-        Self::Tag,
-        Self::Title,
-        Self::Updated,
+/// Game mode picked from a dropdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ModeFilter {
+    /// osu!standard (also the default, matching previous behaviour).
+    #[default]
+    Osu,
+    Any,
+    Taiko,
+    Catch,
+    Mania,
+}
+
+impl ModeFilter {
+    pub const ALL: [Self; 5] = [
+        Self::Osu,
+        Self::Any,
+        Self::Taiko,
+        Self::Catch,
+        Self::Mania,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::FreeText => "Text",
-            Self::Artist => "Artist",
-            Self::Title => "Title",
-            Self::Source => "Source",
-            Self::Favourites => "Favourites",
-            Self::FeaturedArtist => "Featured artist",
-            Self::Creator => "Mapper",
-            Self::Difficulty => "Difficulty name",
-            Self::ApproachRate => "AR",
-            Self::CircleSize => "CS",
-            Self::OverallDifficulty => "OD",
-            Self::HpDrain => "HP/DR",
-            Self::StarRating => "Stars",
-            Self::Bpm => "BPM",
-            Self::Length => "Length",
-            Self::Divisor => "Divisor",
-            Self::Circles => "Circles",
-            Self::Sliders => "Sliders",
-            Self::Keys => "Keys",
-            Self::Status => "Status",
-            Self::Created => "Created",
-            Self::Submitted => "Submitted",
-            Self::Updated => "Updated",
-            Self::Ranked => "Ranked date",
-            Self::Tag => "User tag",
-            Self::Mode => "Mode",
+            Self::Osu => "osu! (standard)",
+            Self::Any => "Any mode",
+            Self::Taiko => "taiko",
+            Self::Catch => "catch",
+            Self::Mania => "mania",
         }
     }
 
-    pub fn key(self) -> Option<&'static str> {
+    pub fn token(self) -> Option<&'static str> {
         match self {
-            Self::FreeText => None,
-            Self::Artist => Some("artist"),
-            Self::Title => Some("title"),
-            Self::Source => Some("source"),
-            Self::Favourites => Some("favourites"),
-            Self::FeaturedArtist => Some("featured_artist"),
-            Self::Creator => Some("creator"),
-            Self::Difficulty => Some("difficulty"),
-            Self::ApproachRate => Some("ar"),
-            Self::CircleSize => Some("cs"),
-            Self::OverallDifficulty => Some("od"),
-            Self::HpDrain => Some("hp"),
-            Self::StarRating => Some("stars"),
-            Self::Bpm => Some("bpm"),
-            Self::Length => Some("length"),
-            Self::Divisor => Some("divisor"),
-            Self::Circles => Some("circles"),
-            Self::Sliders => Some("sliders"),
-            Self::Keys => Some("keys"),
-            Self::Status => Some("status"),
-            Self::Created => Some("created"),
-            Self::Submitted => Some("submitted"),
-            Self::Updated => Some("updated"),
-            Self::Ranked => Some("ranked"),
-            Self::Tag => Some("tag"),
-            Self::Mode => Some("mode"),
+            Self::Osu => Some("osu"),
+            Self::Any => None,
+            Self::Taiko => Some("taiko"),
+            Self::Catch => Some("catch"),
+            Self::Mania => Some("mania"),
+        }
+    }
+
+    pub fn matches(self, mode: Option<u8>) -> bool {
+        match self {
+            Self::Any => true,
+            // A missing Mode field means osu!std in the .osu format.
+            Self::Osu => mode.unwrap_or(0) == 0,
+            Self::Taiko => mode == Some(1),
+            Self::Catch => mode == Some(2),
+            Self::Mania => mode == Some(3),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryClause {
-    pub field: SearchField,
-    pub operator: Operator,
-    pub value: String,
-    pub enabled: bool,
-}
-
-impl Default for QueryClause {
-    fn default() -> Self {
-        Self {
-            field: SearchField::Artist,
-            operator: Operator::Eq,
-            value: String::new(),
-            enabled: true,
-        }
-    }
-}
-
+/// All collection filters. Text is matched case-insensitively when non-empty;
+/// the song length bounds are typed in seconds and ignored when blank or
+/// invalid.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BeatmapQuery {
-    pub clauses: Vec<QueryClause>,
+pub struct BeatmapFilters {
+    pub artist: String,
+    pub title: String,
+    pub mapper: String,
+    pub difficulty: String,
+    pub tag: String,
+    pub length_min: String,
+    pub length_max: String,
+    pub stars: RangeFilter,
+    pub ar: RangeFilter,
+    pub cs: RangeFilter,
+    pub od: RangeFilter,
+    pub hp: RangeFilter,
+    pub bpm: RangeFilter,
+    pub mode: ModeFilter,
 }
 
-impl BeatmapQuery {
+impl BeatmapFilters {
+    pub fn with_full_ranges() -> Self {
+        Self {
+            stars: RangeFilter::new(STARS_RANGE.0, STARS_RANGE.1),
+            ar: RangeFilter::new(AR_RANGE.0, AR_RANGE.1),
+            cs: RangeFilter::new(CS_RANGE.0, CS_RANGE.1),
+            od: RangeFilter::new(OD_RANGE.0, OD_RANGE.1),
+            hp: RangeFilter::new(HP_RANGE.0, HP_RANGE.1),
+            bpm: RangeFilter::new(BPM_RANGE.0, BPM_RANGE.1),
+            ..Self::default()
+        }
+    }
+
+    pub fn matches_local(&self, map: &LocalBeatmap) -> bool {
+        contains(&map.artist, &self.artist)
+            && contains(&map.title, &self.title)
+            && contains(&map.creator, &self.mapper)
+            && contains(&map.version, &self.difficulty)
+            && contains(&map.tags, &self.tag)
+            && within_length(map.length_seconds, &self.length_min, &self.length_max)
+            && self.stars.matches(map.stars)
+            && self.ar.matches(map.ar)
+            && self.cs.matches(map.cs)
+            && self.od.matches(map.od)
+            && self.hp.matches(map.hp)
+            && self.bpm.matches(map.bpm)
+            && self.mode.matches(map.mode)
+    }
+
+    /// osu!web-style text for the active filters, shown read-only in the UI.
     pub fn to_osu_search(&self) -> String {
-        self.clauses
-            .iter()
-            .filter(|clause| clause.enabled && !clause.value.trim().is_empty())
-            .map(QueryClause::to_token)
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    pub fn matches_local(&self, map: &LocalBeatmap) -> bool {
-        self.clauses
-            .iter()
-            .filter(|clause| clause.enabled && !clause.value.trim().is_empty())
-            .all(|clause| clause.matches_local(map))
+        let mut tokens = Vec::new();
+        push_text_token(&mut tokens, "artist", &self.artist);
+        push_text_token(&mut tokens, "title", &self.title);
+        push_text_token(&mut tokens, "creator", &self.mapper);
+        push_text_token(&mut tokens, "difficulty", &self.difficulty);
+        push_text_token(&mut tokens, "tag", &self.tag);
+        if let Some(min) = parse_bound(&self.length_min) {
+            tokens.push(format!("length>={}", trim_number(min)));
+        }
+        if let Some(max) = parse_bound(&self.length_max) {
+            tokens.push(format!("length<={}", trim_number(max)));
+        }
+        tokens.extend(self.stars.tokens("stars", STARS_RANGE));
+        tokens.extend(self.ar.tokens("ar", AR_RANGE));
+        tokens.extend(self.cs.tokens("cs", CS_RANGE));
+        tokens.extend(self.od.tokens("od", OD_RANGE));
+        tokens.extend(self.hp.tokens("hp", HP_RANGE));
+        tokens.extend(self.bpm.tokens("bpm", BPM_RANGE));
+        if let Some(mode) = self.mode.token() {
+            tokens.push(format!("mode={mode}"));
+        }
+        tokens.join(" ")
     }
 }
 
-impl QueryClause {
-    pub fn to_token(&self) -> String {
-        let value = quote_if_needed(self.value.trim());
-        match self.field.key() {
-            Some(key) => format!("{}{}{}", key, self.operator.as_str(), value),
-            None => value,
-        }
+fn contains(haystack: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return true;
     }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
 
-    pub fn matches_local(&self, map: &LocalBeatmap) -> bool {
-        let needle = self.value.trim();
-        match self.field {
-            SearchField::FreeText => compare_text(
-                &[
-                    map.artist.as_str(),
-                    map.title.as_str(),
-                    map.source.as_str(),
-                    map.creator.as_str(),
-                    map.version.as_str(),
-                    map.tags.as_str(),
-                ]
-                .join(" "),
-                needle,
-                self.operator,
-            ),
-            SearchField::Artist => compare_text(&map.artist, needle, self.operator),
-            SearchField::Title => compare_text(&map.title, needle, self.operator),
-            SearchField::Source => compare_text(&map.source, needle, self.operator),
-            SearchField::Creator => compare_text(&map.creator, needle, self.operator),
-            SearchField::Difficulty => compare_text(&map.version, needle, self.operator),
-            SearchField::Tag => compare_text(&map.tags, needle, self.operator),
-            SearchField::ApproachRate => compare_optional_number(map.ar, needle, self.operator),
-            SearchField::CircleSize => compare_optional_number(map.cs, needle, self.operator),
-            SearchField::OverallDifficulty => {
-                compare_optional_number(map.od, needle, self.operator)
-            }
-            SearchField::HpDrain => compare_optional_number(map.hp, needle, self.operator),
-            SearchField::StarRating => compare_optional_number(map.stars, needle, self.operator),
-            SearchField::Bpm => compare_optional_number(map.bpm, needle, self.operator),
-            SearchField::Length => {
-                compare_optional_number(map.length_seconds, needle, self.operator)
-            }
-            SearchField::Circles => compare_number(map.circles as f32, needle, self.operator),
-            SearchField::Sliders => compare_number(map.sliders as f32, needle, self.operator),
-            SearchField::Keys => compare_optional_number(map.cs, needle, self.operator),
-            SearchField::Mode => compare_text(mode_label(map.mode), needle, self.operator),
-            SearchField::Favourites
-            | SearchField::FeaturedArtist
-            | SearchField::Divisor
-            | SearchField::Status
-            | SearchField::Created
-            | SearchField::Submitted
-            | SearchField::Updated
-            | SearchField::Ranked => false,
-        }
+fn parse_bound(text: &str) -> Option<f32> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
     }
+    text.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+fn within_length(length_seconds: Option<f32>, min_text: &str, max_text: &str) -> bool {
+    let min = parse_bound(min_text);
+    let max = parse_bound(max_text);
+    if min.is_none() && max.is_none() {
+        return true;
+    }
+    let Some(length) = length_seconds else {
+        return false;
+    };
+    min.is_none_or(|min| length >= min) && max.is_none_or(|max| length <= max)
+}
+
+fn push_text_token(tokens: &mut Vec<String>, key: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    tokens.push(format!("{key}={}", quote_if_needed(value)));
 }
 
 fn quote_if_needed(value: &str) -> String {
@@ -255,85 +239,70 @@ fn quote_if_needed(value: &str) -> String {
     }
 }
 
-fn compare_text(haystack: &str, needle: &str, operator: Operator) -> bool {
-    let haystack = haystack.to_lowercase();
-    let needles = needle
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_lowercase);
-
-    match operator {
-        Operator::Eq => needles.into_iter().any(|needle| haystack.contains(&needle)),
-        Operator::NotEq => needles
-            .into_iter()
-            .all(|needle| !haystack.contains(&needle)),
-        Operator::Lt | Operator::Gt | Operator::Le | Operator::Ge => false,
-    }
-}
-
-fn compare_optional_number(value: Option<f32>, needle: &str, operator: Operator) -> bool {
-    value.is_some_and(|value| compare_number(value, needle, operator))
-}
-
-fn compare_number(value: f32, needle: &str, operator: Operator) -> bool {
-    let Ok(expected) = needle.parse::<f32>() else {
-        return false;
-    };
-
-    match operator {
-        Operator::Eq => (value - expected).abs() < f32::EPSILON,
-        Operator::NotEq => (value - expected).abs() >= f32::EPSILON,
-        Operator::Lt => value < expected,
-        Operator::Gt => value > expected,
-        Operator::Le => value <= expected,
-        Operator::Ge => value >= expected,
-    }
-}
-
-fn mode_label(mode: Option<u8>) -> &'static str {
-    // A missing Mode field means osu!std in the .osu format.
-    match mode {
-        None | Some(0) => "osu",
-        Some(1) => "taiko",
-        Some(2) => "catch ctb fruits",
-        Some(3) => "mania",
-        _ => "unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn filters() -> BeatmapFilters {
+        BeatmapFilters::with_full_ranges()
+    }
+
     #[test]
-    fn builds_pairable_osu_query() {
-        let query = BeatmapQuery {
-            clauses: vec![
-                QueryClause {
-                    field: SearchField::Artist,
-                    operator: Operator::Eq,
-                    value: "Camellia".into(),
-                    enabled: true,
-                },
-                QueryClause {
-                    field: SearchField::StarRating,
-                    operator: Operator::Ge,
-                    value: "5.5".into(),
-                    enabled: true,
-                },
-                QueryClause {
-                    field: SearchField::Status,
-                    operator: Operator::Eq,
-                    value: "ranked,loved".into(),
-                    enabled: true,
-                },
-            ],
-        };
+    fn builds_readable_osu_query() {
+        let mut query = filters();
+        query.artist = "Camellia".into();
+        query.stars.enabled = true;
+        query.stars.min = 5.5;
 
         assert_eq!(
             query.to_osu_search(),
-            "artist=Camellia stars>=5.5 status=ranked,loved"
+            "artist=Camellia stars>=5.5 mode=osu"
         );
+    }
+
+    #[test]
+    fn empty_filters_match_everything_except_mode() {
+        let query = filters();
+        let map = LocalBeatmap {
+            artist: "Camellia".into(),
+            mode: None,
+            ..Default::default()
+        };
+        assert!(query.matches_local(&map));
+
+        let taiko = LocalBeatmap {
+            mode: Some(1),
+            ..Default::default()
+        };
+        assert!(!query.matches_local(&taiko));
+    }
+
+    #[test]
+    fn ranges_and_length_behave() {
+        let mut query = filters();
+        query.mode = ModeFilter::Any;
+        query.stars.enabled = true;
+        query.stars.min = 5.0;
+        query.stars.max = 7.0;
+        query.length_min = "60".into();
+        query.length_max = "not a number".into();
+
+        let inside = LocalBeatmap {
+            stars: Some(6.0),
+            length_seconds: Some(120.0),
+            ..Default::default()
+        };
+        assert!(query.matches_local(&inside));
+
+        let too_easy = LocalBeatmap {
+            stars: Some(4.9),
+            length_seconds: Some(120.0),
+            ..Default::default()
+        };
+        assert!(!query.matches_local(&too_easy));
+
+        // Missing values never match an enabled numeric filter.
+        let unknown = LocalBeatmap::default();
+        assert!(!query.matches_local(&unknown));
     }
 }

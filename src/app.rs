@@ -2,7 +2,7 @@ use crate::{
     collection,
     local::{self, LibraryScan, LocalBeatmap, LocalBeatmapSet, RepairSeverity, ScanEvent},
     osu_oauth::{self, OauthSession},
-    query::{BeatmapQuery, Operator, QueryClause, SearchField},
+    query::{BeatmapFilters, ModeFilter, RangeFilter, AR_RANGE, BPM_RANGE, CS_RANGE, HP_RANGE, OD_RANGE, STARS_RANGE},
     updates::{self, OutdatedSet},
 };
 use anyhow::{Context, Result};
@@ -26,7 +26,9 @@ const SCAN_CACHE_VERSION: u32 = 4;
 const BACKGROUND_CACHE_LIMIT: usize = 24;
 const BACKGROUND_PREVIEW_WIDTH: u16 = 1200;
 const BACKGROUND_PREVIEW_HEIGHT: u16 = 675;
-/// How many neighbors on each side of the selected map get decoded ahead of
+/// Fixed on-screen height of the inspector background box. Every background
+/// (and the missing-background banner) renders at exactly this size.
+const MAP_PREVIEW_HEIGHT: f32 = 270.0;/// How many neighbors on each side of the selected map get decoded ahead of
 /// time so stepping through the list usually hits the cache.
 const BACKGROUND_PREFETCH_RADIUS: usize = 3;
 /// Upper bound on concurrent background decodes so fast scrolling cannot pile
@@ -38,14 +40,15 @@ const UPDATE_CHECK_DELAY: Duration = Duration::from_millis(300);
 
 pub struct MapManagerApp {
     active_tab: AppTab,
-    query: BeatmapQuery,
+    filters: BeatmapFilters,
     songs_dir: String,
-    osu_root: String,
+    /// osu! root derived from `songs_dir` (its parent when pointing at a
+    /// `Songs` folder). Tracks which install the per-library state belongs to.
+    loaded_root: String,
     collection_name: String,
     collections: Vec<collection::CollectionEntry>,
     selected_collection_index: Option<usize>,
     collection_missing_hashes: Vec<String>,
-    repair_backend_url: String,
     oauth_session: Option<OauthSession>,
     oauth_status: String,
     oauth_pending_url: Option<String>,
@@ -59,19 +62,14 @@ pub struct MapManagerApp {
     scan: Option<LibraryScan>,
     is_scanning: bool,
     is_repairing: bool,
-    current_folder: String,
-    current_map: String,
     skip_parse_timeouts: bool,
     skip_parse_errors: bool,
-    only_osu_std: bool,
     delete_taiko: bool,
     delete_catch: bool,
     delete_mania: bool,
-    scanned_folders: usize,
     scanned_maps: usize,
+    scan_total: usize,
     matched_maps: usize,
-    star_ratings_loaded: usize,
-    maps_with_stars: usize,
     star_parse_error: Option<String>,
     repair_progress: String,
     repair_total: usize,
@@ -377,6 +375,7 @@ impl MapManagerApp {
         } else {
             format!("{osu_root}\\Songs")
         };
+        let loaded_root = derive_osu_root(&songs_dir);
         let repair_ignores = load_repair_ignores(&osu_root).unwrap_or_default();
         let oauth_session = osu_oauth::load_oauth_session(&osu_root);
         let oauth_status = if oauth_session.is_some() {
@@ -384,28 +383,13 @@ impl MapManagerApp {
         } else {
             "Not signed in with osu!".to_owned()
         };
-        let query = BeatmapQuery {
-            clauses: vec![
-                QueryClause {
-                    field: SearchField::StarRating,
-                    operator: Operator::Ge,
-                    value: "6".to_owned(),
-                    enabled: true,
-                },
-                QueryClause {
-                    field: SearchField::Bpm,
-                    operator: Operator::Le,
-                    value: "180".to_owned(),
-                    enabled: true,
-                },
-            ],
-        };
+        let filters = BeatmapFilters::with_full_ranges();
         let cached_scan = load_scan_cache(&osu_root).ok().flatten();
         let cached_status = cached_scan.as_ref().map(|scan| {
             let matching_maps = scan
                 .maps
                 .iter()
-                .filter(|map| matches_visible_filters(&query, true, map))
+                .filter(|map| matches_visible_filters(&filters, map))
                 .count();
             format!(
                 "Loaded cached scan: {matching_maps} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
@@ -419,14 +403,13 @@ impl MapManagerApp {
 
         let mut app = Self {
             active_tab: AppTab::ScanCollections,
-            query,
+            filters,
             songs_dir,
-            osu_root,
+            loaded_root,
             collection_name: "osu-map-manager".to_owned(),
             collections: Vec::new(),
             selected_collection_index: None,
             collection_missing_hashes: Vec::new(),
-            repair_backend_url: "https://osu-map-manager.stanislavberman.workers.dev".to_owned(),
             oauth_session,
             oauth_status,
             oauth_pending_url: None,
@@ -440,19 +423,14 @@ impl MapManagerApp {
             scan: cached_scan,
             is_scanning: false,
             is_repairing: false,
-            current_folder: String::new(),
-            current_map: String::new(),
             skip_parse_timeouts: false,
             skip_parse_errors: false,
-            only_osu_std: true,
             delete_taiko: true,
             delete_catch: true,
             delete_mania: true,
-            scanned_folders: 0,
             scanned_maps: 0,
+            scan_total: 0,
             matched_maps: 0,
-            star_ratings_loaded: 0,
-            maps_with_stars: 0,
             star_parse_error: None,
             repair_progress: String::new(),
             repair_total: 0,
@@ -516,7 +494,7 @@ impl MapManagerApp {
                 };
                 match event {
                     ScanEvent::Started {
-                        star_ratings_loaded,
+                        total_osu_files,
                         star_parse_error,
                     } => {
                         self.scan = Some(LibraryScan::default());
@@ -526,47 +504,22 @@ impl MapManagerApp {
                         self.selected_md5s.clear();
                         self.invalidate_scan_caches();
                         self.is_scanning = true;
-                        self.current_folder.clear();
-                        self.current_map.clear();
-                        self.scanned_folders = 0;
                         self.scanned_maps = 0;
+                        self.scan_total = total_osu_files;
                         self.matched_maps = 0;
-                        self.star_ratings_loaded = star_ratings_loaded;
-                        self.maps_with_stars = 0;
                         self.star_parse_error = star_parse_error;
-                        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
-                    }
-                    ScanEvent::Folder { path } => {
-                        if self.scan_cancel.is_none() {
-                            continue;
-                        }
-                        self.scanned_folders += 1;
-                        self.current_folder = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or_default()
-                            .to_owned();
-                        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
-                    }
-                    ScanEvent::Parsing { path } => {
-                        if self.scan_cancel.is_none() {
-                            continue;
-                        }
-                        self.current_map = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or_default()
-                            .to_owned();
+                        self.status = scan_progress_status(
+                            self.scanned_maps,
+                            self.scan_total,
+                            self.matched_maps,
+                        );
                     }
                     ScanEvent::Map { map, issues } => {
                         if self.scan_cancel.is_none() {
                             continue;
                         }
                         self.scanned_maps += 1;
-                        if map.stars.is_some() {
-                            self.maps_with_stars += 1;
-                        }
-                        if matches_visible_filters(&self.query, self.only_osu_std, &map) {
+                        if matches_visible_filters(&self.filters, &map) {
                             self.matched_maps += 1;
                         }
                         let visible_issues = issues
@@ -577,7 +530,11 @@ impl MapManagerApp {
                             scan.problems.extend(visible_issues);
                             scan.maps.push(map);
                         }
-                        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
+                        self.status = scan_progress_status(
+                            self.scanned_maps,
+                            self.scan_total,
+                            self.matched_maps,
+                        );
                     }
                     ScanEvent::Problem { issue } => {
                         if let Some(scan) = &mut self.scan {
@@ -587,13 +544,14 @@ impl MapManagerApp {
                     ScanEvent::Finished { sets } => {
                         self.is_scanning = false;
                         self.scan_cancel = None;
+                        let cache_root = self.osu_root();
                         if let Some(scan) = &mut self.scan {
                             scan.sets = sets;
                             let matching_maps = scan
                                 .maps
                                 .iter()
                                 .filter(|map| {
-                                    matches_visible_filters(&self.query, self.only_osu_std, map)
+                                    matches_visible_filters(&self.filters, map)
                                 })
                                 .count();
                             self.status = format!(
@@ -603,7 +561,7 @@ impl MapManagerApp {
                                 scan.sets.len(),
                                 scan.problems.len()
                             );
-                            if let Err(err) = save_scan_cache(&self.osu_root, scan) {
+                            if let Err(err) = save_scan_cache(&cache_root, scan) {
                                 self.status =
                                     format!("{}; cache save failed: {err:#}", self.status);
                             }
@@ -621,7 +579,7 @@ impl MapManagerApp {
                                 .maps
                                 .iter()
                                 .filter(|map| {
-                                    matches_visible_filters(&self.query, self.only_osu_std, map)
+                                    matches_visible_filters(&self.filters, map)
                                 })
                                 .count();
                             self.status = format!(
@@ -764,7 +722,7 @@ impl MapManagerApp {
                         Ok(session) => {
                             self.oauth_session = Some(session.clone());
                             if let Err(err) =
-                                osu_oauth::save_oauth_session(&self.osu_root, &session)
+                                osu_oauth::save_oauth_session(&self.osu_root(), &session)
                             {
                                 self.oauth_status =
                                     format!("Signed in, but saving the session failed: {err:#}");
@@ -1028,8 +986,12 @@ impl MapManagerApp {
         }
 
         let songs_dir = expand_prefilled_path(&self.songs_dir);
-        let osu_root =
-            (!self.osu_root.trim().is_empty()).then(|| expand_prefilled_path(&self.osu_root));
+        // The Songs folder is the single source of truth: when it points at a
+        // different install, reload the per-library state (as picking a new
+        // osu! root used to do).
+        self.sync_library_state();
+        let root = self.osu_root();
+        let osu_root = (!root.trim().is_empty()).then(|| expand_prefilled_path(&root));
         let cached_scan = self.scan.clone();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1041,7 +1003,11 @@ impl MapManagerApp {
         if self.skip_parse_errors {
             skip_issue_kinds.insert("parse_error".to_owned());
         }
-        self.status = scan_progress_status(self.scanned_maps, self.matched_maps);
+        self.scanned_maps = 0;
+        self.scan_total = 0;
+        self.matched_maps = 0;
+        self.status =
+            scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps);
         std::thread::spawn(move || {
             local::scan_songs_dir_streaming(
                 songs_dir,
@@ -1065,8 +1031,8 @@ impl MapManagerApp {
             self.is_scanning = false;
             self.scan_cancel = None;
             self.status = format!(
-                "Scan stop requested: {} maps read, {} match current filters",
-                self.scanned_maps, self.matched_maps
+                "Scan stop requested: {}/{} maps read, {} match current filters",
+                self.scanned_maps, self.scan_total, self.matched_maps
             );
         }
     }
@@ -1139,11 +1105,42 @@ impl MapManagerApp {
     }
 
     fn collection_db_path(&self) -> PathBuf {
-        if self.osu_root.trim().is_empty() {
+        let root = self.osu_root();
+        if root.trim().is_empty() {
             PathBuf::from("collection.db")
         } else {
-            expand_prefilled_path(&self.osu_root).join("collection.db")
+            expand_prefilled_path(&root).join("collection.db")
         }
+    }
+
+    /// osu! install root derived from the Songs folder (its parent when the
+    /// folder itself is named `Songs`, otherwise the folder itself).
+    fn osu_root(&self) -> String {
+        derive_osu_root(&self.songs_dir)
+    }
+
+    /// Reloads per-library state when the Songs folder now points at a
+    /// different install (sign-in session, repair ignores, cached scan).
+    fn sync_library_state(&mut self) {
+        let root = self.osu_root();
+        if root == self.loaded_root {
+            return;
+        }
+        self.loaded_root = root.clone();
+        self.repair_ignores = load_repair_ignores(&root).unwrap_or_default();
+        self.oauth_session = osu_oauth::load_oauth_session(&root);
+        self.oauth_status = if self.oauth_session.is_some() {
+            "Signed in with osu! (token loaded from disk)".to_owned()
+        } else {
+            "Not signed in with osu!".to_owned()
+        };
+        self.collections.clear();
+        self.selected_collection_index = None;
+        self.collection_missing_hashes.clear();
+        self.scan = load_scan_cache(&root).ok().flatten();
+        self.expanded_map_md5 = None;
+        self.clear_background_preview();
+        self.invalidate_scan_caches();
     }
 
     fn load_collections(&mut self) {
@@ -1348,9 +1345,9 @@ impl MapManagerApp {
             scan.problems
                 .retain(|issue| !deleted.contains(&issue.beatmap));
             scan.sets = build_sets_for_scan(&scan.maps);
-            let only_osu_std = self.only_osu_std;
+            let mode = self.filters.mode;
             self.retain_selected_maps(|map| {
-                !deleted.contains(&map.path) && (!only_osu_std || is_osu_std(map))
+                !deleted.contains(&map.path) && mode.matches(map.mode)
             });
             self.invalidate_scan_caches();
         }
@@ -1411,8 +1408,8 @@ impl MapManagerApp {
     fn spawn_repair_jobs(&mut self, jobs: Vec<RepairJob>) {
         let (tx, rx) = mpsc::channel();
         self.status = format!("Starting repair for {} beatmapset(s)", jobs.len());
-        let backend_url = self.repair_backend_url.trim().to_owned();
-        let osu_root = self.osu_root.clone();
+        let backend_url = osu_oauth::backend_url();
+        let osu_root = self.osu_root();
         let oauth_session = self.oauth_session.clone();
         std::thread::spawn(move || {
             run_repair_jobs(jobs, backend_url, osu_root, oauth_session, tx);
@@ -1431,11 +1428,6 @@ impl MapManagerApp {
             return;
         };
 
-        if self.repair_backend_url.trim().is_empty() {
-            self.status = "Set the backend URL before checking for updates".to_owned();
-            return;
-        }
-
         let (targets, uncheckable) = updates::build_check_targets(&scan.maps);
         if targets.is_empty() {
             self.status = "No beatmapsets with online ids found to check".to_owned();
@@ -1446,7 +1438,7 @@ impl MapManagerApp {
         self.update_check_rx = Some(rx);
         self.update_log.clear();
         self.status = format!("Starting update check for {} beatmapset(s)", targets.len());
-        let backend_url = self.repair_backend_url.trim().to_owned();
+        let backend_url = osu_oauth::backend_url();
         std::thread::spawn(move || {
             run_update_check(targets, uncheckable, backend_url, tx);
         });
@@ -1499,8 +1491,8 @@ impl MapManagerApp {
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
         self.status = format!("Starting update for {} beatmapset(s)", jobs.len());
-        let backend_url = self.repair_backend_url.trim().to_owned();
-        let osu_root = self.osu_root.clone();
+        let backend_url = osu_oauth::backend_url();
+        let osu_root = self.osu_root();
         let oauth_session = self.oauth_session.clone();
         std::thread::spawn(move || {
             run_update_jobs(jobs, backend_url, osu_root, oauth_session, tx);
@@ -1539,7 +1531,7 @@ impl MapManagerApp {
             self.status = "osu! sign-in is already in progress".to_owned();
             return;
         }
-        let backend_url = self.repair_backend_url.trim().to_owned();
+        let backend_url = osu_oauth::backend_url();
         let backend = match osu_oauth::validated_backend_base_url(&backend_url) {
             Ok(backend) => backend,
             Err(err) => {
@@ -1570,7 +1562,7 @@ impl MapManagerApp {
     fn sign_out(&mut self) {
         self.oauth_session = None;
         self.oauth_pending_url = None;
-        osu_oauth::clear_oauth_session(&self.osu_root);
+        osu_oauth::clear_oauth_session(&self.osu_root());
         self.oauth_status = "Not signed in with osu! (downloads use the mirror)".to_owned();
         self.status = self.oauth_status.clone();
     }
@@ -1588,7 +1580,7 @@ impl MapManagerApp {
             }
         }
         if added > 0 {
-            if let Err(err) = save_repair_ignores(&self.osu_root, &self.repair_ignores) {
+            if let Err(err) = save_repair_ignores(&self.osu_root(), &self.repair_ignores) {
                 self.status = format!("Repair ignore save failed: {err:#}");
             }
         }
@@ -1604,8 +1596,7 @@ impl MapManagerApp {
 
     fn filtered_cache_key(&self) -> String {
         let map_count = self.scan.as_ref().map_or(0, |scan| scan.maps.len());
-        let query = serde_json::to_string(&self.query).unwrap_or_default();
-        format!("{map_count}:{}:{query}", self.only_osu_std)
+        serde_json::to_string(&self.filters).unwrap_or_default() + &map_count.to_string()
     }
 
     fn refresh_filtered_maps(&mut self) {
@@ -1618,7 +1609,7 @@ impl MapManagerApp {
         if let Some(scan) = &self.scan {
             self.filtered_map_indexes
                 .extend(scan.maps.iter().enumerate().filter_map(|(index, map)| {
-                    matches_visible_filters(&self.query, self.only_osu_std, map).then_some(index)
+                    matches_visible_filters(&self.filters, map).then_some(index)
                 }));
         }
         self.filtered_cache_key = key;
@@ -1671,15 +1662,7 @@ impl MapManagerApp {
     }
 
     fn map_result_label(&self, map: &LocalBeatmap) -> String {
-        let mut seen_fields = BTreeSet::new();
-        let mut fields = self
-            .query
-            .clauses
-            .iter()
-            .filter(|clause| clause.enabled && !clause.value.trim().is_empty())
-            .filter(|clause| seen_fields.insert(clause.field))
-            .filter_map(|clause| label_value_for_field(map, clause.field))
-            .collect::<Vec<_>>();
+        let mut fields = filter_label_values(&self.filters, map);
 
         if fields.is_empty() {
             if let Some(stars) = map.stars {
@@ -1903,15 +1886,32 @@ impl MapManagerApp {
                 ui.set_min_height((rect.height() - 18.0).max(1.0));
 
                 if let Some(texture) = preview {
+                    // Fixed box, filled edge-to-edge (cover): every background
+                    // shows at exactly the same size no matter its resolution.
                     let source_size = texture.size_vec2();
-                    let scale = (ui.available_width() / source_size.x)
-                        .min(270.0 / source_size.y)
-                        .max(0.01);
-                    let display_size = source_size * scale;
-                    ui.horizontal(|ui| {
-                        ui.add_space(((ui.available_width() - display_size.x) * 0.5).max(0.0));
-                        ui.add(egui::Image::new((texture.id(), display_size)));
-                    });
+                    let box_size =
+                        egui::vec2(ui.available_width().max(1.0), MAP_PREVIEW_HEIGHT);
+                    let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+                    if source_size.x > 0.0 && source_size.y > 0.0 {
+                        let scale = (box_rect.width() / source_size.x)
+                            .max(box_rect.height() / source_size.y);
+                        let shown_rect = egui::Rect::from_center_size(
+                            box_rect.center(),
+                            source_size * scale,
+                        );
+                        let previous_clip = ui.clip_rect();
+                        ui.set_clip_rect(box_rect.intersect(previous_clip));
+                        ui.painter().image(
+                            texture.id(),
+                            shown_rect,
+                            egui::Rect::from_min_max(
+                                egui::Pos2::ZERO,
+                                egui::Pos2::new(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        ui.set_clip_rect(previous_clip);
+                    }
                 } else {
                     let message = preview_error.unwrap_or_else(|| {
                         if background_path.is_some() {
@@ -1920,17 +1920,23 @@ impl MapManagerApp {
                             "This map does not define a background".to_owned()
                         }
                     });
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(0x1b, 0x1c, 0x1f))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
-                        ))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.set_min_height(92.0);
-                            ui.centered_and_justified(|ui| muted_label(ui, message));
-                        });
+                    // Same box as a real background, so the list never jumps.
+                    let box_size =
+                        egui::vec2(ui.available_width().max(1.0), MAP_PREVIEW_HEIGHT);
+                    let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        box_rect,
+                        egui::Rounding::ZERO,
+                        egui::Color32::from_rgb(0x1b, 0x1c, 0x1f),
+                    );
+                    ui.painter().rect_stroke(
+                        box_rect,
+                        egui::Rounding::ZERO,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3b, 0x40)),
+                    );
+                    ui.allocate_ui_at_rect(box_rect, |ui| {
+                        ui.centered_and_justified(|ui| muted_label(ui, message));
+                    });
                 }
 
                 ui.add_space(4.0);
@@ -2583,7 +2589,7 @@ impl eframe::App for MapManagerApp {
                         ui.separator();
                     }
                     let status = if self.is_scanning {
-                        scan_progress_status(self.scanned_maps, self.matched_maps)
+                        scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps)
                     } else {
                         self.status.clone()
                     };
@@ -2608,49 +2614,6 @@ impl eframe::App for MapManagerApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Local library");
-                    ui.label(egui::RichText::new("osu! root").strong());
-                    ui.horizontal(|ui| {
-                        let input_width = (ui.available_width() - 58.0).max(80.0);
-                        ui.add_sized(
-                            [input_width, 28.0],
-                            egui::TextEdit::singleline(&mut self.osu_root)
-                                .vertical_align(egui::Align::Center),
-                        );
-                        if ui.button("Pick").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.osu_root = path.display().to_string();
-                                self.songs_dir = path.join("Songs").display().to_string();
-                                self.repair_ignores =
-                                    load_repair_ignores(&self.osu_root).unwrap_or_default();
-                                self.oauth_session =
-                                    osu_oauth::load_oauth_session(&self.osu_root);
-                                self.oauth_status = if self.oauth_session.is_some() {
-                                    "Signed in with osu! (token loaded from disk)".to_owned()
-                                } else {
-                                    "Not signed in with osu!".to_owned()
-                                };
-                                self.collections.clear();
-                                self.selected_collection_index = None;
-                                self.collection_missing_hashes.clear();
-                                self.scan = load_scan_cache(&self.osu_root).ok().flatten();
-                                self.expanded_map_md5 = None;
-                                self.clear_background_preview();
-                                self.invalidate_scan_caches();
-                                self.status = self.scan.as_ref().map_or_else(
-                                    || "Ready".to_owned(),
-                                    |scan| {
-                                        format!(
-                                            "Loaded cached scan: {} scanned maps, {} sets, {} repair issue(s)",
-                                            scan.maps.len(),
-                                            scan.sets.len(),
-                                            scan.problems.len()
-                                        )
-                                    },
-                                );
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
                     ui.label(egui::RichText::new("Songs").strong());
                     ui.horizontal(|ui| {
                         let input_width = (ui.available_width() - 58.0).max(80.0);
@@ -2669,59 +2632,90 @@ impl eframe::App for MapManagerApp {
                     });
 
                     ui.separator();
-                    ui.heading("Local filters");
+                    ui.heading("Filters");
                     muted_label(
                         ui,
-                        "Rows are combined with AND against scanned maps in your Songs directory.",
+                        "Mix and match — a map must pass every active filter to show up.",
                     );
                     ui.add_space(10.0);
 
-                    for clause in &mut self.query.clauses {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut clause.enabled, "");
-                            egui::ComboBox::from_id_source(("field", clause as *const _ as usize))
-                                .selected_text(clause.field.label())
-                                .width(132.0)
-                                .show_ui(ui, |ui| {
-                                    for field in SearchField::SORTED {
-                                        ui.selectable_value(&mut clause.field, field, field.label());
-                                    }
-                                });
-                            egui::ComboBox::from_id_source(("op", clause as *const _ as usize))
-                                .selected_text(clause.operator.as_str())
-                                .width(54.0)
-                                .show_ui(ui, |ui| {
-                                    for operator in Operator::ALL {
-                                        ui.selectable_value(
-                                            &mut clause.operator,
-                                            operator,
-                                            operator.as_str(),
-                                        );
-                                    }
-                                });
-                            let value_width = ui.available_width().max(64.0);
-                            ui.add_sized(
-                                [value_width, 28.0],
-                                egui::TextEdit::singleline(&mut clause.value)
-                                    .vertical_align(egui::Align::Center),
-                            );
-                        });
-                    }
+                    ui.label(egui::RichText::new("Words").strong());
+                    muted_label(ui, "Leave a box empty to ignore it.");
+                    filter_text_row(ui, "Artist", &mut self.filters.artist);
+                    filter_text_row(ui, "Title", &mut self.filters.title);
+                    filter_text_row(ui, "Mapper", &mut self.filters.mapper);
+                    filter_text_row(ui, "Difficulty name", &mut self.filters.difficulty);
+                    filter_text_row(ui, "User tag", &mut self.filters.tag);
 
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Difficulty").strong());
+                    muted_label(ui, "Tick a box, then drag its sliders.");
+                    filter_range_row(ui, "Stars", &mut self.filters.stars, STARS_RANGE, 0.1, 1);
+                    filter_range_row(
+                        ui,
+                        "AR (approach rate)",
+                        &mut self.filters.ar,
+                        AR_RANGE,
+                        0.1,
+                        1,
+                    );
+                    filter_range_row(
+                        ui,
+                        "CS (circle size)",
+                        &mut self.filters.cs,
+                        CS_RANGE,
+                        0.1,
+                        1,
+                    );
+                    filter_range_row(
+                        ui,
+                        "OD (accuracy)",
+                        &mut self.filters.od,
+                        OD_RANGE,
+                        0.1,
+                        1,
+                    );
+                    filter_range_row(ui, "HP (health)", &mut self.filters.hp, HP_RANGE, 0.1, 1);
+                    filter_range_row(
+                        ui,
+                        "BPM (tempo)",
+                        &mut self.filters.bpm,
+                        BPM_RANGE,
+                        1.0,
+                        0,
+                    );
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Song").strong());
+                    ui.label(egui::RichText::new("Length (seconds)").strong());
                     ui.horizontal(|ui| {
-                        if ui.button("+ Add filter").clicked() {
-                            self.query.clauses.push(QueryClause::default());
-                        }
-                        if ui.button("Remove disabled").clicked() {
-                            self.query.clauses.retain(|clause| clause.enabled);
-                        }
+                        let box_width = ((ui.available_width() - 28.0) / 2.0).max(60.0);
+                        ui.add_sized(
+                            [box_width, 28.0],
+                            egui::TextEdit::singleline(&mut self.filters.length_min)
+                                .hint_text("Min")
+                                .vertical_align(egui::Align::Center),
+                        );
+                        ui.label("to");
+                        ui.add_sized(
+                            [box_width, 28.0],
+                            egui::TextEdit::singleline(&mut self.filters.length_max)
+                                .hint_text("Max")
+                                .vertical_align(egui::Align::Center),
+                        );
                     });
-
-                    ui.separator();
-                    ui.checkbox(&mut self.only_osu_std, "Only osu!std maps");
-                    if self.only_osu_std {
-                        self.retain_selected_maps(is_osu_std);
+                    ui.label(egui::RichText::new("Mode").strong());
+                    egui::ComboBox::from_id_source("mode_filter")
+                        .selected_text(self.filters.mode.label())
+                        .width(ui.available_width().max(64.0))
+                        .show_ui(ui, |ui| {
+                            for mode in ModeFilter::ALL {
+                                ui.selectable_value(&mut self.filters.mode, mode, mode.label());
+                            }
+                        });
+                    if self.filters.mode != ModeFilter::Any {
+                        let mode = self.filters.mode;
+                        self.retain_selected_maps(|map| mode.matches(map.mode));
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("Scan issue handling").strong());
@@ -2729,10 +2723,10 @@ impl eframe::App for MapManagerApp {
                     ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
                     ui.separator();
                     ui.label(egui::RichText::new("Equivalent query text").strong());
-                    let mut query_text = self.query.to_osu_search();
+                    let mut query_text = self.filters.to_osu_search();
                     ui.add_sized(
                         [ui.available_width(), 76.0],
-                        egui::TextEdit::multiline(&mut query_text),
+                        egui::TextEdit::multiline(&mut query_text).interactive(false),
                     );
                     muted_label(
                         ui,
@@ -2830,30 +2824,8 @@ impl eframe::App for MapManagerApp {
                                 ui.spacing_mut().item_spacing = card_item_spacing;
                                 fill_tile_width(ui);
                                 ui.add(egui::Spinner::new());
-                                wrapped_label(
-                                    ui,
-                                    format!(
-                                        "Reading folder {} | {} maps scanned | {} matches",
-                                        self.scanned_folders,
-                                        self.scanned_maps,
-                                        self.matched_maps
-                                    ),
-                                );
-                                wrapped_label(
-                                    ui,
-                                    format!(
-                                        "Star ratings: {} db entries, {} matched scanned maps",
-                                        self.star_ratings_loaded, self.maps_with_stars
-                                    ),
-                                );
                                 if let Some(err) = &self.star_parse_error {
                                     scan_status_label(ui, "osu!.db", err);
-                                }
-                                if !self.current_folder.is_empty() {
-                                    scan_status_label(ui, "Current", &self.current_folder);
-                                }
-                                if !self.current_map.is_empty() {
-                                    scan_status_label(ui, "Parsing", &self.current_map);
                                 }
                             });
                         }
@@ -3280,18 +3252,6 @@ impl eframe::App for MapManagerApp {
                                             ui,
                                             "Repair redownloads the beatmapset and restores only the missing files.",
                                         );
-                                        ui.horizontal(|ui| {
-                                            ui.label("Backend URL");
-                                            let input_width =
-                                                (ui.available_width() - 8.0).max(120.0);
-                                            ui.add_sized(
-                                                [input_width, 24.0],
-                                                egui::TextEdit::singleline(
-                                                    &mut self.repair_backend_url,
-                                                )
-                                                .hint_text("https://<worker>.workers.dev"),
-                                            );
-                                        });
                                         ui.horizontal_wrapped(|ui| {
                                             if self.oauth_session.is_some() {
                                                 if ui.button("Sign out of osu!").clicked() {
@@ -4049,33 +4009,43 @@ struct RepairJob {
     ignore_after_success: Vec<IgnoredRepairIssue>,
 }
 
-fn label_value_for_field(map: &LocalBeatmap, field: SearchField) -> Option<String> {
-    match field {
-        SearchField::StarRating => map.stars.map(|value| format!("*{}", format_number(value))),
-        SearchField::ApproachRate => map.ar.map(|value| format!("AR {}", format_number(value))),
-        SearchField::CircleSize => map.cs.map(|value| format!("CS {}", format_number(value))),
-        SearchField::OverallDifficulty => {
-            map.od.map(|value| format!("OD {}", format_number(value)))
-        }
-        SearchField::HpDrain => map.hp.map(|value| format!("HP {}", format_number(value))),
-        SearchField::Bpm => map.bpm.map(|value| format!("{} BPM", format_number(value))),
-        SearchField::Length => map
-            .length_seconds
-            .map(|value| format!("{} length", format_duration(value))),
-        SearchField::Circles => Some(format!("{} circles", map.circles)),
-        SearchField::Sliders => Some(format!("{} sliders", map.sliders)),
-        SearchField::Keys => map.cs.map(|value| format!("{}K", format_number(value))),
-        SearchField::Mode => map.mode.map(|value| format!("mode {}", value)),
-        _ => None,
+/// Human-readable values of the enabled numeric filters, shown next to each
+/// result so beginners see why a map matched.
+fn filter_label_values(filters: &BeatmapFilters, map: &LocalBeatmap) -> Vec<String> {
+    let mut fields = Vec::new();
+    if filters.stars.enabled {
+        fields.extend(map.stars.map(|value| format!("*{}", format_number(value))));
     }
+    if filters.ar.enabled {
+        fields.extend(map.ar.map(|value| format!("AR {}", format_number(value))));
+    }
+    if filters.cs.enabled {
+        fields.extend(map.cs.map(|value| format!("CS {}", format_number(value))));
+    }
+    if filters.od.enabled {
+        fields.extend(map.od.map(|value| format!("OD {}", format_number(value))));
+    }
+    if filters.hp.enabled {
+        fields.extend(map.hp.map(|value| format!("HP {}", format_number(value))));
+    }
+    if filters.bpm.enabled {
+        fields.extend(map.bpm.map(|value| format!("{} BPM", format_number(value))));
+    }
+    if !filters.length_min.trim().is_empty() || !filters.length_max.trim().is_empty() {
+        fields.extend(
+            map.length_seconds
+                .map(|value| format!("{} length", format_duration(value))),
+        );
+    }
+    fields
 }
 
-fn matches_visible_filters(query: &BeatmapQuery, only_osu_std: bool, map: &LocalBeatmap) -> bool {
-    (!only_osu_std || is_osu_std(map)) && query.matches_local(map)
+fn matches_visible_filters(filters: &BeatmapFilters, map: &LocalBeatmap) -> bool {
+    filters.matches_local(map)
 }
 
-fn scan_progress_status(scanned_maps: usize, matched_maps: usize) -> String {
-    format!("Maps read: {scanned_maps:>6} | Current filters: {matched_maps:>6}")
+fn scan_progress_status(scanned_maps: usize, total_maps: usize, matched_maps: usize) -> String {
+    format!("Maps read: {scanned_maps}/{total_maps} | Current filters: {matched_maps:>6}")
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -4196,6 +4166,57 @@ fn wrapped_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
     ui.add(egui::Label::new(text).wrap(true));
 }
 
+/// Labelled text box for a word filter. Blank means "anything".
+fn filter_text_row(ui: &mut egui::Ui, label: &str, text: &mut String) {
+    ui.label(egui::RichText::new(label).strong());
+    ui.add_sized(
+        [ui.available_width().max(64.0), 28.0],
+        egui::TextEdit::singleline(text).vertical_align(egui::Align::Center),
+    );
+}
+
+/// Checkbox plus min/max sliders for a numeric filter. `decimals` controls
+/// how the picked range is shown (1 for stars/AR/..., 0 for BPM).
+fn filter_range_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    filter: &mut RangeFilter,
+    bounds: (f32, f32),
+    step: f64,
+    decimals: usize,
+) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut filter.enabled, "");
+        ui.label(egui::RichText::new(label).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format!(
+                "{:.*} – {:.*}",
+                decimals, filter.min, decimals, filter.max
+            ));
+        });
+    });
+    let previous = (filter.min, filter.max);
+    ui.add_enabled(
+        filter.enabled,
+        egui::Slider::new(&mut filter.min, bounds.0..=bounds.1)
+            .step_by(step)
+            .text("Min"),
+    );
+    ui.add_enabled(
+        filter.enabled,
+        egui::Slider::new(&mut filter.max, bounds.0..=bounds.1)
+            .step_by(step)
+            .text("Max"),
+    );
+    // Keep min <= max, moving the bound the user just dragged.
+    if filter.min != previous.0 && filter.min > filter.max {
+        filter.max = filter.min;
+    }
+    if filter.max != previous.1 && filter.max < filter.min {
+        filter.min = filter.max;
+    }
+}
+
 fn fix_ui_width(ui: &mut egui::Ui, width: f32) {
     let width = width.max(1.0);
     ui.set_width(width);
@@ -4270,10 +4291,6 @@ fn add_number_text_chunk(
     } else {
         ui.label(text);
     }
-}
-
-fn is_osu_std(map: &LocalBeatmap) -> bool {
-    map.mode.unwrap_or(0) == 0
 }
 
 fn build_sets_for_scan(maps: &[LocalBeatmap]) -> Vec<LocalBeatmapSet> {
@@ -4835,6 +4852,25 @@ fn app_data_path(osu_root: &str) -> PathBuf {
     root.join(".osu-map-manager")
 }
 
+/// Derives the osu! install root from a Songs folder path: its parent when
+/// the folder itself is named `Songs` (case-insensitive), otherwise the
+/// folder itself. Returns `""` when no Songs folder is set.
+fn derive_osu_root(songs_dir: &str) -> String {
+    if songs_dir.trim().is_empty() {
+        return String::new();
+    }
+    let songs = expand_prefilled_path(songs_dir);
+    let is_songs_folder = songs
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("songs"));
+    if is_songs_folder {
+        let parent = songs.parent().map(PathBuf::from).unwrap_or(songs);
+        return display_prefilled_path(&parent);
+    }
+    display_prefilled_path(&songs)
+}
+
 fn default_osu_root() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
@@ -4904,8 +4940,25 @@ mod tests {
     }
 
     #[test]
-    fn repair_restores_only_missing_files_without_clobbering() {
-        let root = unique_temp_dir("osu-repair-restore");
+    fn osu_root_derives_from_songs_folder() {
+        assert_eq!(derive_osu_root(""), "");
+        assert_eq!(
+            derive_osu_root("C:\\Games\\osu!\\Songs"),
+            "C:\\Games\\osu!".to_owned()
+        );
+        assert_eq!(
+            derive_osu_root("C:\\Games\\osu!\\songs"),
+            "C:\\Games\\osu!".to_owned()
+        );
+        // A folder that is not named `Songs` is its own root.
+        assert_eq!(
+            derive_osu_root("C:\\Games\\osu!"),
+            "C:\\Games\\osu!".to_owned()
+        );
+    }
+
+    #[test]
+    fn repair_restores_only_missing_files_without_clobbering() {        let root = unique_temp_dir("osu-repair-restore");
         let osz = root.join("123.osz");
         write_test_osz(
             &osz,

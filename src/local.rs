@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocalBeatmap {
     pub path: PathBuf,
     pub folder: PathBuf,
@@ -68,14 +68,8 @@ pub struct LibraryScan {
 #[derive(Debug)]
 pub enum ScanEvent {
     Started {
-        star_ratings_loaded: usize,
+        total_osu_files: usize,
         star_parse_error: Option<String>,
-    },
-    Folder {
-        path: PathBuf,
-    },
-    Parsing {
-        path: PathBuf,
     },
     Map {
         map: LocalBeatmap,
@@ -200,8 +194,10 @@ fn scan_songs_dir_streaming_inner(
             Some("No osu! root selected; osu!.db unavailable".to_owned()),
         ),
     };
+    // Count upfront so progress can be shown as `read/total`.
+    let total_osu_files = count_osu_files(songs_dir);
     let _ = tx.send(ScanEvent::Started {
-        star_ratings_loaded: db_index.as_ref().map_or(0, OsuDbIndex::len),
+        total_osu_files,
         star_parse_error,
     });
     let mut maps = Vec::new();
@@ -244,9 +240,6 @@ fn scan_songs_dir_streaming_inner(
         }
 
         let folder = entry.path();
-        let _ = tx.send(ScanEvent::Folder {
-            path: folder.clone(),
-        });
 
         for osu in fs::read_dir(folder)? {
             if cancel.load(Ordering::Relaxed) {
@@ -262,7 +255,6 @@ fn scan_songs_dir_streaming_inner(
                 continue;
             }
 
-            let _ = tx.send(ScanEvent::Parsing { path: path.clone() });
             if let Some(map) = cached_maps.get(&path) {
                 let issues = cached_problems.get(&path).cloned().unwrap_or_default();
                 maps.push(map.clone());
@@ -630,6 +622,26 @@ pub fn is_osu_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("osu"))
+}
+
+/// Counts beatmap files under `songs_dir` (one level of set folders) so scan
+/// progress can be reported as `read/total` without parsing anything.
+fn count_osu_files(songs_dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(songs_dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            && let Ok(files) = fs::read_dir(entry.path())
+        {
+            total += files
+                .flatten()
+                .filter(|file| is_osu_file(&file.path()))
+                .count();
+        }
+    }
+    total
 }
 
 fn parse_f32(value: Option<&String>) -> Option<f32> {

@@ -31,10 +31,6 @@ impl OsuDbIndex {
             .get(md5)
             .or_else(|| self.by_filename.get(&osu_filename.to_ascii_lowercase()))
     }
-
-    pub fn len(&self) -> usize {
-        self.by_md5.len().max(self.by_filename.len())
-    }
 }
 
 fn parse_osu_db(bytes: &[u8]) -> Result<OsuDbIndex> {

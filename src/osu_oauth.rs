@@ -22,6 +22,9 @@ use std::{
 };
 
 pub const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:3000/callback";
+/// Built-in backend Worker URL. Kept out of the UI so it is not exposed or
+/// edited by users. Override with `OSU_MAP_MANAGER_BACKEND_URL` for local dev.
+pub const BACKEND_URL: &str = "https://osu-map-manager.stanislavberman.workers.dev";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 const REFRESH_MARGIN_SECS: u64 = 120;
 
@@ -76,6 +79,16 @@ impl TokenResponse {
 
 pub fn backend_base_url(backend_url: &str) -> String {
     backend_url.trim().trim_end_matches('/').to_owned()
+}
+
+/// Returns the effective backend URL: `OSU_MAP_MANAGER_BACKEND_URL` env
+/// override when set, otherwise the built-in [`BACKEND_URL`].
+pub fn backend_url() -> String {
+    let from_env = std::env::var("OSU_MAP_MANAGER_BACKEND_URL")
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .ok()
+        .filter(|value| !value.is_empty());
+    from_env.unwrap_or_else(|| BACKEND_URL.to_owned())
 }
 
 pub fn authorize_url(backend_url: &str, state: &str) -> String {

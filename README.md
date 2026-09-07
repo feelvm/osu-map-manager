@@ -37,7 +37,7 @@ cargo run
 ## Basic Workflow
 
 1. Open osu! Map Manager.
-2. Select your osu! folder, or select the `Songs` folder directly.
+2. Enter your osu! `Songs` folder.
 3. Click scan to read your installed beatmaps.
 4. Add one or more filters.
 5. Review the matching maps.
@@ -47,17 +47,16 @@ cargo run
 
 The app backs up your existing `collection.db` before replacing it.
 
-## Choosing the osu! Folder
+## Choosing the Songs Folder
 
-The app works best when you select the main osu! folder, not only `Songs`.
-
-For example:
+Enter your osu! `Songs` folder, for example:
 
 ```text
-C:\Users\%USERPROFILE%\AppData\Local\osu!
+C:\Users\%USERPROFILE%\AppData\Local\osu!\Songs
 ```
 
-That lets the app read both:
+The app derives the osu! install root from it automatically, so it can also read
+`osu!.db` and `collection.db` next to `Songs` when they exist:
 
 ```text
 Songs\
@@ -75,28 +74,12 @@ files.
 
 Filters are combined together. A map must match every active filter to appear in the result list.
 
-Useful filters include:
+- Words: type an artist, title, mapper, difficulty name, or user tag. Empty means anything.
+- Difficulty: tick Stars, AR, CS, OD, HP, or BPM and drag the min/max sliders.
+- Song: type a length range in seconds and pick a game mode from the dropdown.
 
-- artist
-- title
-- mapper
-- difficulty name
-- source
-- tag
-- stars
-- AR, CS, OD, HP
-- BPM
-- length
-- circles, sliders, keys
-- mode
-
-Example searches:
-
-```text
-artist=Camellia stars>=5.5
-creator=Natteke length<120
-title=night ar>=9 mode=osu
-```
+The panel also shows the equivalent osu! search text, for example
+`artist=Camellia stars>=5.5 mode=osu`.
 
 Some filters shown in the app depend on metadata that may not exist in local `.osu` files. If a
 filter such as ranked status or favourite count does not behave as expected, the map data likely
@@ -126,7 +109,7 @@ background files.
 
 Open the `Repairs and delete` tab to fix them. Each affected beatmapset lists its missing files
 and has its own `Repair this set` button (or use `Repair all`). Repair redownloads the
-beatmapset through the configured backend (`Backend URL`) and restores only the missing files,
+beatmapset through the built-in backend and restores only the missing files,
 so your local scores and edits are left untouched. The log reports where each download came from
 and which files were restored; rescan afterwards to confirm the issues are gone.
 
@@ -145,8 +128,8 @@ the online version. The `Repairs and delete` tab has an `Update outdated beatmap
 does the same comparison in bulk:
 
 1. Click `Check for updates`. The app compares every installed difficulty that has an online
-   beatmap id against the current osu!web checksums (the same signal osu! uses). Checking needs
-   only the backend URL, no sign-in.
+   beatmap id against the current osu!web checksums (the same signal osu! uses). Checking works
+   without sign-in.
 2. Review the outdated sets — each lists which difficulties changed and the online version date.
 3. Click `Update all` or update a single set. The app redownloads the beatmapset (official osu!
    API when signed in, mirror otherwise), overwrites it with the latest files, removes
