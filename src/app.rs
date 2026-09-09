@@ -123,9 +123,27 @@ enum DeleteIntent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
-    ScanCollections,
+    Library,
     Collections,
-    RepairsDelete,
+    Maintenance,
+}
+
+impl AppTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Library => "Library",
+            Self::Collections => "Collections",
+            Self::Maintenance => "Maintenance",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::Library => "Scan, filter and pick maps",
+            Self::Collections => "Build and save collections",
+            Self::Maintenance => "Repair, update and clean up",
+        }
+    }
 }
 
 struct AudioPlayer {
@@ -402,7 +420,7 @@ impl MapManagerApp {
         let (background_load_tx, background_load_rx) = mpsc::channel();
 
         let mut app = Self {
-            active_tab: AppTab::ScanCollections,
+            active_tab: AppTab::Library,
             filters,
             songs_dir,
             loaded_root,
@@ -1678,61 +1696,59 @@ impl MapManagerApp {
         }
     }
 
+    /// Results workspace: map list next to the inspector, laid out in normal
+    /// egui flow (no manual rects), so nothing can slide above or below its
+    /// frame. Both panes scroll internally within the same fixed height.
     fn render_map_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_height: f32) {
-        let workspace_rect = egui::Rect::from_min_size(
-            ui.cursor().min,
-            egui::vec2(ui.available_width().max(1.0), max_height.max(1.0)),
-        );
-        let gap = 10.0;
-        let list_width = (workspace_rect.width() * 0.42).clamp(300.0, 430.0);
-        let inspector_left = workspace_rect.left() + list_width + gap;
-        let list_rect = egui::Rect::from_min_size(
-            workspace_rect.min,
-            egui::vec2(list_width, workspace_rect.height()),
-        );
-        let inspector_rect = egui::Rect::from_min_max(
-            egui::pos2(inspector_left, workspace_rect.top()),
-            workspace_rect.right_bottom(),
-        );
+        let height = max_height.max(120.0);
+        let gap = ui.spacing().item_spacing.x;
+        let total_width = ui.available_width().max(1.0);
+        let list_width = (total_width * 0.42).clamp(300.0, 430.0);
+        let inspector_width = (total_width - list_width - gap).max(220.0);
 
-        let mut list_ui = ui.child_ui_with_id_source(
-            list_rect,
-            egui::Layout::top_down(egui::Align::Min),
-            "map_list_pane",
-        );
-        list_ui.set_clip_rect(list_rect);
-        list_ui.set_width(list_width);
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(0x20, 0x21, 0x24))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
-            ))
-            .show(&mut list_ui, |ui| {
-                self.render_map_browser(ui, max_height - 2.0);
-            });
-
-        let inspected_map = self.expanded_map_md5.as_ref().and_then(|md5| {
-            self.scan
-                .as_ref()
-                .and_then(|scan| scan.maps.iter().find(|map| &map.md5 == md5))
-                .cloned()
-        });
-        if let Some(map) = inspected_map {
-            self.render_map_inspector(ui, ctx, inspector_rect, &map);
-        } else {
-            ui.allocate_ui_at_rect(inspector_rect, |ui| {
-                inspector_frame(ctx.style().as_ref()).show(ui, |ui| {
-                    fill_tile_width(ui);
-                    ui.set_min_height((inspector_rect.height() - 18.0).max(1.0));
-                    ui.centered_and_justified(|ui| {
-                        muted_label(ui, "Select a map from the list to inspect it.");
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(list_width, height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(0x20, 0x21, 0x24))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(0x3a, 0x3b, 0x40),
+                        ))
+                        .show(ui, |ui| {
+                            ui.set_min_height(height);
+                            self.render_map_browser(ui, height - 4.0);
+                        });
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(inspector_width, height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let inspected_map = self.expanded_map_md5.as_ref().and_then(|md5| {
+                        self.scan
+                            .as_ref()
+                            .and_then(|scan| {
+                                scan.maps.iter().find(|map| &map.md5 == md5)
+                            })
+                            .cloned()
                     });
-                });
-            });
-        }
-
-        ui.allocate_rect(workspace_rect, egui::Sense::hover());
+                    if let Some(map) = inspected_map {
+                        self.render_map_inspector(ui, ctx, height, &map);
+                    } else {
+                        inspector_frame(ctx.style().as_ref()).show(ui, |ui| {
+                            fill_tile_width(ui);
+                            ui.set_min_height(height - 4.0);
+                            ui.centered_and_justified(|ui| {
+                                muted_label(ui, "Select a map from the list to inspect it.");
+                            });
+                        });
+                    }
+                },
+            );
+        });
     }
 
     fn render_map_browser(&mut self, ui: &mut egui::Ui, max_height: f32) {
@@ -1804,11 +1820,19 @@ impl MapManagerApp {
                         egui::pos2(header_rect.left(), header_rect.top()),
                         egui::vec2(checkbox_column_width, HEADER_HEIGHT),
                     );
+                    // Stable per-map id scope: virtualized rows enter/leave the
+                    // clip rect while scrolling, so positional auto-ids would
+                    // shift between frames and clash.
                     let selection_changed = ui
-                        .allocate_ui_at_rect(checkbox_area, |ui| {
-                            ui.centered_and_justified(|ui| {
-                                ui.checkbox(&mut selected_value, "")
-                            }).inner.changed()
+                        .push_id(("map_select", &map.md5), |ui| {
+                            ui.allocate_ui_at_rect(checkbox_area, |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    ui.checkbox(&mut selected_value, "")
+                                })
+                                .inner
+                                .changed()
+                            })
+                            .inner
                         })
                         .inner;
                     if selection_changed {
@@ -1865,7 +1889,7 @@ impl MapManagerApp {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        rect: egui::Rect,
+        max_height: f32,
         map: &LocalBeatmap,
     ) {
         let background_path = map
@@ -1880,12 +1904,17 @@ impl MapManagerApp {
         let preview = self.background_preview.clone();
         let preview_error = self.background_preview_error.clone();
 
-        ui.allocate_ui_at_rect(rect, |ui| {
-            inspector_frame(ctx.style().as_ref()).show(ui, |ui| {
-                fill_tile_width(ui);
-                ui.set_min_height((rect.height() - 18.0).max(1.0));
-
-                if let Some(texture) = preview {
+        inspector_frame(ctx.style().as_ref()).show(ui, |ui| {
+            fill_tile_width(ui);
+            // Scrolls internally within the allotted height so tall details
+            // never slide under the bottom status bar.
+            egui::ScrollArea::vertical()
+                .id_source(("inspector_scroll", &map.md5))
+                .max_height(max_height.max(1.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+            fill_tile_width(ui);
+            if let Some(texture) = preview {
                     // Fixed box, filled edge-to-edge (cover): every background
                     // shows at exactly the same size no matter its resolution.
                     let source_size = texture.size_vec2();
@@ -2061,17 +2090,14 @@ impl MapManagerApp {
                         );
                         ui.end_row();
                     });
-                if !map.source.trim().is_empty() {
-                    scan_status_label(ui, "Source", &map.source);
-                }
-                scan_status_label(ui, "File", &map.path.display().to_string());
+                });
             });
-        });
     }
 
     fn render_collections_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut load_selected = false;
-        let mut create_collection = false;
+        let mut save_selection = false;
+        let mut new_collection = false;
         let mut add_to_collection = false;
         let mut selected_collection_name: Option<String> = None;
 
@@ -2083,64 +2109,39 @@ impl MapManagerApp {
                 fix_ui_width(ui, content_width);
                 section_frame(ctx.style().as_ref()).show(ui, |ui| {
                     fill_tile_width(ui);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.heading("Collections");
-                        muted_label(
-                            ui,
-                            format!("{} map(s) selected from the scan", self.selected_maps.len()),
-                        );
-                    });
-
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(
-                                self.selected_collection_index.is_some(),
-                                egui::Button::new("Load selected"),
-                            )
-                            .clicked()
-                        {
-                            load_selected = true;
-                        }
-                        if ui.button("Restore backup").clicked() {
-                            self.delete_confirmation = Some(DeleteIntent::RestoreBackup);
-                        }
-                    });
-
-                    ui.separator();
-                    ui.label(egui::RichText::new("Create collection").strong());
                     ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [ui.available_width().min(300.0) - 60.0, 28.0],
-                            egui::TextEdit::singleline(&mut self.collection_name)
-                                .vertical_align(egui::Align::Center),
-                        );
-                        if ui
-                            .add_enabled(
-                                !self.collection_name.trim().is_empty(),
-                                egui::Button::new("Create"),
-                            )
-                            .clicked()
-                        {
-                            create_collection = true;
-                        }
+                        ui.heading("Collections");
+                        ui.label(format!(
+                            "{} selected",
+                            self.selected_maps.len()
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Reload from disk").clicked() {
+                                self.load_collections();
+                            }
+                        });
                     });
+                    muted_label(
+                        ui,
+                        "Pick maps in Library, then save them here. Close osu! before writing.",
+                    );
+                    ui.add_space(4.0);
 
-                    ui.separator();
-                    ui.label(egui::RichText::new("Add to / delete").strong());
+                    // Single collection picker — the only one on this page.
+                    ui.label(egui::RichText::new("Collection").strong());
                     ui.horizontal(|ui| {
                         let selected_name = self
                             .selected_collection_index
                             .and_then(|i| self.collections.get(i))
                             .map(|c| c.name.as_str())
                             .unwrap_or("Choose collection");
-                        egui::ComboBox::from_id_source("collections_manage")
+                        egui::ComboBox::from_id_source("collections_picker")
                             .selected_text(selected_name)
-                            .width(ui.available_width().min(300.0) - 130.0)
+                            .width((ui.available_width() - 220.0).max(160.0))
                             .show_ui(ui, |ui| {
-                                for (i, collection) in
-                                    self.collections.iter().enumerate()
-                                {
-                                    let label = format!("{} ({} map{})",
+                                for (i, collection) in self.collections.iter().enumerate() {
+                                    let label = format!(
+                                        "{} ({} map{})",
                                         collection.name,
                                         collection.hashes.len(),
                                         if collection.hashes.len() == 1 { "" } else { "s" }
@@ -2155,8 +2156,51 @@ impl MapManagerApp {
                         if ui
                             .add_enabled(
                                 self.selected_collection_index.is_some(),
-                                egui::Button::new("Add to"),
+                                egui::Button::new("Load into selection"),
                             )
+                            .clicked()
+                        {
+                            load_selected = true;
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.separator();
+                    // Save workflow: one name field, two clear actions.
+                    ui.label(egui::RichText::new("Save selection").strong());
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [ui.available_width().min(300.0) - 210.0, 28.0],
+                            egui::TextEdit::singleline(&mut self.collection_name)
+                                .hint_text("Collection name")
+                                .vertical_align(egui::Align::Center),
+                        );
+                        if ui
+                            .add_enabled(
+                                !self.collection_name.trim().is_empty(),
+                                egui::Button::new("Save"),
+                            )
+                            .on_hover_text("Overwrite the named collection with the current selection")
+                            .clicked()
+                        {
+                            save_selection = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.collection_name.trim().is_empty(),
+                                egui::Button::new("New"),
+                            )
+                            .on_hover_text("Create an empty collection with this name")
+                            .clicked()
+                        {
+                            new_collection = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_collection_index.is_some(),
+                                egui::Button::new("Add to selected"),
+                            )
+                            .on_hover_text("Append the current selection to the picked collection")
                             .clicked()
                         {
                             selected_collection_name = self
@@ -2165,10 +2209,20 @@ impl MapManagerApp {
                                 .map(|c| c.name.clone());
                             add_to_collection = true;
                         }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Export TSV").on_hover_text("Write selected maps to selected_maps.tsv").clicked() {
+                            self.export_manifest();
+                        }
+                        if ui.button("Restore backup").on_hover_text("Restore collection.db from collection.db.bak").clicked() {
+                            self.delete_confirmation = Some(DeleteIntent::RestoreBackup);
+                        }
                         if ui
                             .add_enabled(
                                 self.selected_collection_index.is_some(),
-                                egui::Button::new("Delete"),
+                                egui::Button::new("Delete collection"),
                             )
                             .clicked()
                         {
@@ -2180,43 +2234,12 @@ impl MapManagerApp {
                     });
 
                     ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Write TSV manifest").clicked() {
-                            self.export_manifest();
-                        }
-                    });
-
-                    ui.separator();
+                    ui.label(egui::RichText::new("Contents").strong());
                     if self.collections.is_empty() {
-                        muted_label(ui, "No collections loaded.");
+                        muted_label(ui, "No collections loaded. Pick maps in Library, name the collection above, and press Save.");
+                    } else if self.selected_collection_index.is_none() {
+                        muted_label(ui, "Choose a collection above to review its maps.");
                     } else {
-                        let selected_name = self
-                            .selected_collection_index
-                            .and_then(|index| self.collections.get(index))
-                            .map(|collection| collection.name.as_str())
-                            .unwrap_or("Choose collection");
-                        egui::ComboBox::from_id_source("collections_page_picker")
-                            .selected_text(selected_name)
-                            .width(ui.available_width().min(520.0))
-                            .show_ui(ui, |ui| {
-                                let previous = self.selected_collection_index;
-                                for (index, collection) in self.collections.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_collection_index,
-                                        Some(index),
-                                        format!(
-                                            "{} ({} map{})",
-                                            collection.name,
-                                            collection.hashes.len(),
-                                            if collection.hashes.len() == 1 { "" } else { "s" }
-                                        ),
-                                    );
-                                }
-                                if self.selected_collection_index != previous {
-                                    load_selected = true;
-                                }
-                            });
-
                         if let Some(collection) = self
                             .selected_collection_index
                             .and_then(|index| self.collections.get(index))
@@ -2318,7 +2341,10 @@ impl MapManagerApp {
         if load_selected {
             self.load_selected_collection_into_selection();
         }
-        if create_collection {
+        if save_selection {
+            self.save_selection_to_collection();
+        }
+        if new_collection {
             self.create_collection(&self.collection_name.clone());
         }
         if add_to_collection {
@@ -2560,181 +2586,255 @@ impl eframe::App for MapManagerApp {
                 ui.horizontal(|ui| {
                     ui.heading("osu! Map Manager");
                     ui.separator();
-                    let audio_state = self.audio_player.as_ref().map(|player| {
-                        (
-                            player.sink.is_paused(),
-                            player
+                    for tab in [AppTab::Library, AppTab::Collections, AppTab::Maintenance] {
+                        let selected = self.active_tab == tab;
+                        if ui.selectable_label(selected, tab.label()).clicked() {
+                            self.active_tab = tab;
+                        }
+                    }
+                    ui.separator();
+                    muted_label(ui, self.active_tab.subtitle());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(player) = self.audio_player.as_ref() {
+                            let paused = player.sink.is_paused();
+                            let filename = player
                                 .path
                                 .file_name()
                                 .and_then(|name| name.to_str())
                                 .unwrap_or("map audio")
-                                .to_owned(),
-                        )
+                                .to_owned();
+                            if ui.small_button("■").on_hover_text("Stop audio").clicked() {
+                                self.stop_audio_playback();
+                            }
+                            if ui
+                                .small_button(if paused { "▶" } else { "⏸" })
+                                .on_hover_text(if paused {
+                                    "Resume audio"
+                                } else {
+                                    "Pause audio"
+                                })
+                                .clicked()
+                            {
+                                self.toggle_audio_pause();
+                            }
+                            ui.label(egui::RichText::new(format!("♪ {filename}")).small())
+                                .on_hover_text(filename);
+                        } else if self.oauth_session.is_some() {
+                            ui.label(
+                                egui::RichText::new("● signed in").small().color(
+                                    egui::Color32::from_rgb(0x7f, 0xa6, 0x86),
+                                ),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("○ not signed in").small().color(
+                                    egui::Color32::from_rgb(0xb3, 0xad, 0xa5),
+                                ),
+                            );
+                        }
                     });
-                    if let Some((paused, filename)) = audio_state {
-                        ui.add_sized(
-                            [150.0, 20.0],
-                            egui::Label::new(format!("Audio: {filename}")).truncate(true),
-                        )
-                        .on_hover_text(filename);
-                        if ui
-                            .small_button(if paused { "Resume" } else { "Pause" })
-                            .clicked()
-                        {
-                            self.toggle_audio_pause();
-                        }
-                        if ui.small_button("Stop").clicked() {
-                            self.stop_audio_playback();
-                        }
-                        ui.separator();
-                    }
-                    let status = if self.is_scanning {
-                        scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps)
-                    } else {
-                        self.status.clone()
-                    };
-                    let status_text = if self.is_scanning {
-                        egui::RichText::new(status.clone()).monospace()
-                    } else {
-                        egui::RichText::new(status.clone())
-                    };
-                    ui.add_sized(
-                        [ui.available_width(), 20.0],
-                        egui::Label::new(status_text).truncate(true),
-                    )
-                    .on_hover_text(status);
                 });
             });
 
-        if self.active_tab == AppTab::ScanCollections {
-            egui::SidePanel::left("filters")
+        egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(340.0)
+            .exact_width(320.0)
             .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Local library");
-                    ui.label(egui::RichText::new("Songs").strong());
+                egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
+                    AppTab::Library => {
+                    ui.heading("Library");
+                    muted_label(ui, "Point at Songs, scan, then filter.");
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Songs folder").strong());
+                    ui.add_sized(
+                        [ui.available_width().max(80.0), 28.0],
+                        egui::TextEdit::singleline(&mut self.songs_dir)
+                            .hint_text(r"C:\...\osu!\Songs")
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        let input_width = (ui.available_width() - 58.0).max(80.0);
-                        ui.add_sized(
-                            [input_width, 28.0],
-                            egui::TextEdit::singleline(&mut self.songs_dir)
-                                .vertical_align(egui::Align::Center),
-                        );
                         if self.is_scanning {
-                            if ui.button("Stop").clicked() {
+                            if ui.button("⏹ Stop scan").clicked() {
                                 self.stop_scan();
                             }
-                        } else if ui.button("Scan").clicked() {
+                            ui.add(egui::Spinner::new());
+                        } else if ui.button("⟳ Scan library").clicked() {
                             self.start_scan();
                         }
                     });
+                    if self.is_scanning {
+                        muted_label(
+                            ui,
+                            scan_progress_status(
+                                self.scanned_maps,
+                                self.scan_total,
+                                self.matched_maps,
+                            ),
+                        );
+                    }
 
+                    ui.add_space(8.0);
                     ui.separator();
-                    ui.heading("Filters");
-                    muted_label(
-                        ui,
-                        "Mix and match — a map must pass every active filter to show up.",
-                    );
-                    ui.add_space(10.0);
-
-                    ui.label(egui::RichText::new("Words").strong());
-                    muted_label(ui, "Leave a box empty to ignore it.");
-                    filter_text_row(ui, "Artist", &mut self.filters.artist);
-                    filter_text_row(ui, "Title", &mut self.filters.title);
-                    filter_text_row(ui, "Mapper", &mut self.filters.mapper);
-                    filter_text_row(ui, "Difficulty name", &mut self.filters.difficulty);
-                    filter_text_row(ui, "User tag", &mut self.filters.tag);
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Difficulty").strong());
-                    muted_label(ui, "Tick a box, then drag its sliders.");
-                    filter_range_row(ui, "Stars", &mut self.filters.stars, STARS_RANGE, 0.1, 1);
-                    filter_range_row(
-                        ui,
-                        "AR (approach rate)",
-                        &mut self.filters.ar,
-                        AR_RANGE,
-                        0.1,
-                        1,
-                    );
-                    filter_range_row(
-                        ui,
-                        "CS (circle size)",
-                        &mut self.filters.cs,
-                        CS_RANGE,
-                        0.1,
-                        1,
-                    );
-                    filter_range_row(
-                        ui,
-                        "OD (accuracy)",
-                        &mut self.filters.od,
-                        OD_RANGE,
-                        0.1,
-                        1,
-                    );
-                    filter_range_row(ui, "HP (health)", &mut self.filters.hp, HP_RANGE, 0.1, 1);
-                    filter_range_row(
-                        ui,
-                        "BPM (tempo)",
-                        &mut self.filters.bpm,
-                        BPM_RANGE,
-                        1.0,
-                        0,
-                    );
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Song").strong());
-                    ui.label(egui::RichText::new("Length (seconds)").strong());
                     ui.horizontal(|ui| {
-                        let box_width = ((ui.available_width() - 28.0) / 2.0).max(60.0);
-                        ui.add_sized(
-                            [box_width, 28.0],
-                            egui::TextEdit::singleline(&mut self.filters.length_min)
-                                .hint_text("Min")
-                                .vertical_align(egui::Align::Center),
-                        );
-                        ui.label("to");
-                        ui.add_sized(
-                            [box_width, 28.0],
-                            egui::TextEdit::singleline(&mut self.filters.length_max)
-                                .hint_text("Max")
-                                .vertical_align(egui::Align::Center),
-                        );
-                    });
-                    ui.label(egui::RichText::new("Mode").strong());
-                    egui::ComboBox::from_id_source("mode_filter")
-                        .selected_text(self.filters.mode.label())
-                        .width(ui.available_width().max(64.0))
-                        .show_ui(ui, |ui| {
-                            for mode in ModeFilter::ALL {
-                                ui.selectable_value(&mut self.filters.mode, mode, mode.label());
+                        ui.heading("Filters");
+                        let active = self.filters.active_count();
+                        if active > 0 {
+                            ui.label(egui::RichText::new(format!("{active} active")).small().strong());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Clear").clicked() {
+                                self.filters.clear_all();
                             }
+                        });
+                    });
+                    muted_label(ui, "A map must pass every active filter.");
+                    ui.add_space(6.0);
+
+                    egui::CollapsingHeader::new("⭐ Difficulty")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            muted_label(ui, "Enable, then drag the range.");
+                            filter_range_row(ui, "Stars", &mut self.filters.stars, STARS_RANGE, 0.1, 1);
+                            filter_range_row(ui, "AR", &mut self.filters.ar, AR_RANGE, 0.1, 1);
+                            filter_range_row(ui, "CS", &mut self.filters.cs, CS_RANGE, 0.1, 1);
+                            filter_range_row(ui, "OD", &mut self.filters.od, OD_RANGE, 0.1, 1);
+                            filter_range_row(ui, "HP", &mut self.filters.hp, HP_RANGE, 0.1, 1);
+                            filter_range_row(ui, "BPM", &mut self.filters.bpm, BPM_RANGE, 1.0, 0);
+                        });
+                    egui::CollapsingHeader::new("🔍 Search words")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            filter_text_row(ui, "Artist", &mut self.filters.artist);
+                            filter_text_row(ui, "Title", &mut self.filters.title);
+                            filter_text_row(ui, "Mapper", &mut self.filters.mapper);
+                            filter_text_row(ui, "Difficulty", &mut self.filters.difficulty);
+                            filter_text_row(ui, "Tag", &mut self.filters.tag);
+                            muted_label(ui, "Empty means anything.");
+                        });
+                    egui::CollapsingHeader::new("🎵 Song")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Length (seconds)").strong());
+                            ui.horizontal(|ui| {
+                                let box_width = ((ui.available_width() - 28.0) / 2.0).max(60.0);
+                                ui.add_sized(
+                                    [box_width, 28.0],
+                                    egui::TextEdit::singleline(&mut self.filters.length_min)
+                                        .hint_text("Min")
+                                        .vertical_align(egui::Align::Center),
+                                );
+                                ui.label("–");
+                                ui.add_sized(
+                                    [box_width, 28.0],
+                                    egui::TextEdit::singleline(&mut self.filters.length_max)
+                                        .hint_text("Max")
+                                        .vertical_align(egui::Align::Center),
+                                );
+                            });
+                            if !self.filters.length_valid() {
+                                ui.label(
+                                    egui::RichText::new("Enter numbers, e.g. 60 and 180.")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(0xc4, 0xa2, 0x6a)),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Mode").strong());
+                            egui::ComboBox::from_id_source("mode_filter")
+                                .selected_text(self.filters.mode.label())
+                                .width(ui.available_width().max(64.0))
+                                .show_ui(ui, |ui| {
+                                    for mode in ModeFilter::ALL {
+                                        ui.selectable_value(&mut self.filters.mode, mode, mode.label());
+                                    }
+                                });
+                        });
+                    egui::CollapsingHeader::new("⚙ Advanced")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.checkbox(&mut self.skip_parse_timeouts, "Skip map parse timeouts");
+                            ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("osu! search text").strong());
+                            let mut query_text = self.filters.to_osu_search();
+                            ui.add_sized(
+                                [ui.available_width(), 56.0],
+                                egui::TextEdit::multiline(&mut query_text)
+                                    .interactive(false)
+                                    .hint_text("No filters — matches everything"),
+                            );
                         });
                     if self.filters.mode != ModeFilter::Any {
                         let mode = self.filters.mode;
                         self.retain_selected_maps(|map| mode.matches(map.mode));
                     }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Scan issue handling").strong());
-                    ui.checkbox(&mut self.skip_parse_timeouts, "Skip map parse timeouts");
-                    ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
-                    ui.separator();
-                    ui.label(egui::RichText::new("Equivalent query text").strong());
-                    let mut query_text = self.filters.to_osu_search();
-                    ui.add_sized(
-                        [ui.available_width(), 76.0],
-                        egui::TextEdit::multiline(&mut query_text).interactive(false),
-                    );
-                    muted_label(
-                        ui,
-                        "Some osu!web-only fields require database/API metadata and will not match local .osu files yet.",
-                    );
+                    }
+                    AppTab::Collections => {
+                        ui.heading("Collections");
+                        muted_label(ui, "1. Pick maps in Library → 2. Review here → 3. Save.");
+                        ui.separator();
+                        ui.label(egui::RichText::new("Current selection").strong());
+                        ui.label(format!(
+                            "{} map(s) · {} hash(es)",
+                            self.selected_maps.len(),
+                            self.selected_md5s.len()
+                        ));
+                        if !self.collection_missing_hashes.is_empty() {
+                            muted_label(
+                                ui,
+                                format!(
+                                    "{} hash(es) not in the current scan — kept while selected.",
+                                    self.collection_missing_hashes.len()
+                                ),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("How saving works").strong());
+                        muted_label(
+                            ui,
+                            "• “Save” overwrites the named collection with the selection.\n• “Add to” appends the selection.\n• Close osu! before writing collection.db.",
+                        );
+                    }
+                    AppTab::Maintenance => {
+                        ui.heading("Maintenance");
+                        muted_label(ui, "Keep your library healthy.");
+                        ui.separator();
+                        ui.label(egui::RichText::new("osu! account").strong());
+                        scan_status_label(ui, "Status", &self.oauth_status.clone());
+                        muted_label(
+                            ui,
+                            "Sign in (main panel) to repair via the official API; otherwise the mirror is used.",
+                        );
+                        ui.separator();
+                        if let Some(scan) = &self.scan {
+                            let missing = scan
+                                .problems
+                                .iter()
+                                .filter(|issue| {
+                                    issue.severity
+                                        == crate::local::RepairSeverity::MissingRequiredFile
+                                })
+                                .count();
+                            ui.label(egui::RichText::new("Library health").strong());
+                            ui.label(format!(
+                                "{} maps · {} sets · {} issue(s)",
+                                scan.maps.len(),
+                                scan.sets.len(),
+                                scan.problems.len()
+                            ));
+                            ui.label(format!(
+                                "{} missing-file · {} outdated",
+                                missing,
+                                self.outdated_sets.len()
+                            ));
+                        } else {
+                            muted_label(ui, "Scan your library to see health stats.");
+                        }
+                    }
                 });
             });
-        }
 
         self.refresh_filtered_maps();
         self.refresh_repair_jobs();
@@ -2750,222 +2850,111 @@ impl eframe::App for MapManagerApp {
         let mut load_collections_requested = false;
         let mut load_collection_selection_requested = false;
         let mut save_collection_requested = false;
-        let mut create_collection_requested = false;
-        let mut add_to_collection_requested = false;
-        let mut selected_collection_name: Option<String> = None;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ctx.style().as_ref()))
             .show(ctx, |ui| {
+                // Tabs now live in the top bar; the center shows one clear section header.
                 ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.active_tab,
-                        AppTab::ScanCollections,
-                        "Map scan",
-                    );
-                    ui.selectable_value(
-                        &mut self.active_tab,
-                        AppTab::Collections,
-                        "Collections",
-                    );
-                    ui.selectable_value(
-                        &mut self.active_tab,
-                        AppTab::RepairsDelete,
-                        "Repairs and delete",
-                    );
+                    ui.heading(self.active_tab.label());
+                    muted_label(ui, self.active_tab.subtitle());
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 match self.active_tab {
-                    AppTab::ScanCollections => {
-                let rect = ui.available_rect_before_wrap();
-                let gap = 8.0;
-                let actions_width = 0.0;
-                let library_width = if actions_width > 1.0 {
-                    (rect.width() - actions_width - gap).max(1.0)
-                } else {
-                    rect.width().max(1.0)
-                };
-                let actions_left = rect.left() + library_width + gap;
-                let library_rect = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(library_width, rect.height()),
-                );
-                let actions_rect = egui::Rect::from_min_size(
-                    egui::pos2(actions_left, rect.top()),
-                    egui::vec2(actions_width, rect.height()),
-                );
-
-                let mut library_ui = ui.child_ui_with_id_source(
-                    library_rect,
-                    egui::Layout::top_down(egui::Align::Min),
-                    "library_fixed",
-                );
-                let library_clip_rect = egui::Rect::from_min_max(
-                    library_rect.min,
-                    egui::pos2(library_rect.max.x + (gap * 0.5), library_rect.max.y),
-                );
-                library_ui.set_clip_rect(library_clip_rect);
-                library_ui.set_width(library_width);
-                library_ui.set_max_width(library_width);
-                let middle_width = library_ui.available_width();
-                egui::ScrollArea::vertical()
-                    .id_source("library_pane")
-                    .auto_shrink([false, false])
-                    .show(&mut library_ui, |ui| {
-                        let content_width = middle_width.max(1.0);
+                    AppTab::Library => {
+                        // The results card fills the central panel directly (no
+                        // outer scroll), so the inner list/inspector scrollers
+                        // stay aligned with their frames and heights stay bounded.
                         let card_item_spacing = ui.spacing().item_spacing;
-                        let card_gap = gap;
-                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let card_gap = 8.0;
 
                         if self.is_scanning {
-                            fix_ui_width(ui, content_width);
                             section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = card_item_spacing;
                                 fill_tile_width(ui);
-                                ui.add(egui::Spinner::new());
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Spinner::new());
+                                    muted_label(ui, "Scanning library…");
+                                });
                                 if let Some(err) = &self.star_parse_error {
                                     scan_status_label(ui, "osu!.db", err);
                                 }
                             });
+                            ui.add_space(card_gap);
                         }
 
-                        if self.scan.is_some() {
+                        if self.scan.is_none() {
+                            section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = card_item_spacing;
+                                fill_tile_width(ui);
+                                ui.heading("No scan yet");
+                                muted_label(
+                                    ui,
+                                    "Enter your Songs folder in the sidebar, then press Scan library.",
+                                );
+                            });
+                        } else {
                             let (scanned_maps, scanned_sets, repair_issues) =
                                 self.scan.as_ref().map_or((0, 0, 0), |scan| {
                                     (scan.maps.len(), scan.sets.len(), scan.problems.len())
                             });
-                            if self.is_scanning {
-                                ui.add_space(card_gap);
-                            }
-                            fix_ui_width(ui, content_width);
-                            let results_card_height = ui.available_height().max(0.0);
-                            let results_card_inner_height = (results_card_height - 24.0).max(0.0);
                             section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = card_item_spacing;
                                 fill_tile_width(ui);
-                                ui.set_min_height(results_card_inner_height);
-                                let results_content_top = ui.cursor().top();
-                                ui.columns(3, |columns| {
-                                    columns[0].heading("Map scan");
-                                    columns[1].with_layout(
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        |ui| {
-                                            ui.horizontal(|ui| {
-                                                if ui.button("Select all filtered").clicked() {
-                                                    let maps = self
-                                                        .scan
-                                                        .as_ref()
-                                                        .map(|scan| {
-                                                            self.filtered_map_indexes
-                                                                .iter()
-                                                                .filter_map(|&index| {
-                                                                    scan.maps.get(index).cloned()
-                                                                })
-                                                                .collect::<Vec<_>>()
-                                                        })
-                                                        .unwrap_or_default();
-                                                    for map in &maps {
-                                                        self.select_map(map);
-                                                    }
-                                                }
-                                                if ui.button("Clear selection").clicked() {
-                                                    self.clear_selection();
-                                                }
-                                            });
-                                        },
-                                    );
-                                });
                                 ui.horizontal(|ui| {
-                                    ui.label("Collection");
-                                    ui.add_sized(
-                                        [140.0, 24.0],
-                                        egui::TextEdit::singleline(&mut self.collection_name)
-                                            .vertical_align(egui::Align::Center),
-                                    );
-                                    if ui
-                                        .add_enabled(
-                                            !self.collection_name.trim().is_empty(),
-                                            egui::Button::new("Create"),
-                                        )
-                                        .clicked()
-                                    {
-                                        create_collection_requested = true;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    let add_to_req = &mut add_to_collection_requested;
-                                    let sel_name = &mut selected_collection_name;
-                                    let selected_text = self
-                                        .selected_collection_index
-                                        .and_then(|i| self.collections.get(i))
-                                        .map(|c| c.name.as_str())
-                                        .unwrap_or("Choose collection");
-                                    egui::ComboBox::from_id_source("scan_add_to_collection")
-                                        .selected_text(selected_text)
-                                        .width(140.0)
-                                        .show_ui(ui, |ui| {
-                                            for (i, c) in self.collections.iter().enumerate() {
-                                                ui.selectable_value(
-                                                    &mut self.selected_collection_index,
-                                                    Some(i),
-                                                    format!("{} ({} map{})", c.name, c.hashes.len(),
-                                                        if c.hashes.len() == 1 { "" } else { "s" }),
-                                                );
-                                            }
-                                        });
-                                    if ui
-                                        .add_enabled(
-                                            self.selected_collection_index.is_some(),
-                                            egui::Button::new("Add to"),
-                                        )
-                                        .clicked()
-                                    {
-                                        *sel_name = self
-                                            .selected_collection_index
-                                            .and_then(|i| self.collections.get(i))
-                                            .map(|c| c.name.clone());
-                                        *add_to_req = true;
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.selected_collection_index.is_some(),
-                                            egui::Button::new("Delete"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.delete_confirmation = self
-                                            .selected_collection_index
-                                            .and_then(|i| self.collections.get(i))
-                                            .map(|c| DeleteIntent::Collection(c.name.clone()));
-                                    }
-                                });
-                                ui.horizontal_wrapped(|ui| {
+                                    ui.heading("Results");
                                     ui.label(format!(
-                                        "{} matching maps · {} selected",
+                                        "{} matching · {} selected",
                                         self.filtered_map_indexes.len(),
                                         self.selected_maps.len()
                                     ));
-                                    muted_label(
-                                        ui,
-                                        format!(
-                                            "{} scanned · {} sets · {} repair issues",
-                                            scanned_maps, scanned_sets, repair_issues
-                                        ),
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("Clear selection").clicked() {
+                                                self.clear_selection();
+                                            }
+                                            if ui.button("Select all").clicked() {
+                                                let maps = self
+                                                    .scan
+                                                    .as_ref()
+                                                    .map(|scan| {
+                                                        self.filtered_map_indexes
+                                                            .iter()
+                                                            .filter_map(|&index| {
+                                                                scan.maps.get(index).cloned()
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                    })
+                                                    .unwrap_or_default();
+                                                for map in &maps {
+                                                    self.select_map(map);
+                                                }
+                                            }
+                                        },
                                     );
                                 });
-                                let used_height =
-                                    (ui.cursor().top() - results_content_top).max(0.0);
-                                let list_height =
-                                    (results_card_inner_height - used_height).max(120.0);
-                                let list_width = ui.available_width().max(1.0);
-                                ui.scope(|ui| {
-                                    fix_ui_width(ui, list_width);
-                                    self.render_map_workspace(ui, ctx, list_height);
-                                });
+                                muted_label(
+                                    ui,
+                                    format!(
+                                        "{} scanned · {} sets · {} issue(s) — manage collections in the Collections tab",
+                                        scanned_maps, scanned_sets, repair_issues
+                                    ),
+                                );
+                                // Bounded: the central panel is not inside a scroll
+                                // area, so this is the real remaining viewport height.
+                                let list_height = ui.available_height().max(120.0);
+                                self.render_map_workspace(ui, ctx, list_height);
                             });
                         }
-                    });
+                        // Legacy side panel below: permanently hidden (zero width).
+                        // Dead code kept compiling for reference; the Collections
+                        // tab now owns all collection management. TODO: delete it
+                        // together with its request flags.
+                        let gap: f32 = 8.0;
+                        let actions_width: f32 = 0.0;
+                        let actions_rect = egui::Rect::NOTHING;
                 if actions_width > 1.0 {
                     let mut actions_ui = ui.child_ui_with_id_source(
                         actions_rect,
@@ -3216,7 +3205,7 @@ impl eframe::App for MapManagerApp {
                     AppTab::Collections => {
                         self.render_collections_page(ui, ctx);
                     }
-                    AppTab::RepairsDelete => {
+                    AppTab::Maintenance => {
                         let content_width = ui.available_width().max(1.0);
                         egui::ScrollArea::vertical()
                             .id_source("repairs_delete_pane")
@@ -3239,18 +3228,18 @@ impl eframe::App for MapManagerApp {
                                     section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                         ui.spacing_mut().item_spacing = card_item_spacing;
                                         fill_tile_width(ui);
-                                        ui.heading("Repair corrupted beatmaps");
+                                        ui.heading("🔧 Repair missing files");
                                         muted_label(
                                             ui,
                                             format!(
-                                                "{} missing-file issue(s), {} downloadable beatmapset(s)",
+                                                "{} issue(s) · {} set(s) ready to repair",
                                                 missing_file_issues,
                                                 jobs.len()
                                             ),
                                         );
                                         muted_label(
                                             ui,
-                                            "Repair redownloads the beatmapset and restores only the missing files.",
+                                            "Redownloads the set and restores only the missing files — scores and edits are kept.",
                                         );
                                         ui.horizontal_wrapped(|ui| {
                                             if self.oauth_session.is_some() {
@@ -3391,53 +3380,6 @@ impl eframe::App for MapManagerApp {
                                                         });
                                                     }
                                                 });
-                                ui.horizontal(|ui| {
-                                    let add_to_req = &mut add_to_collection_requested;
-                                    let sel_name = &mut selected_collection_name;
-                                    let selected_text = self
-                                        .selected_collection_index
-                                        .and_then(|i| self.collections.get(i))
-                                        .map(|c| c.name.as_str())
-                                        .unwrap_or("Choose collection");
-                                    egui::ComboBox::from_id_source("scan_add_to_collection")
-                                        .selected_text(selected_text)
-                                        .width(140.0)
-                                        .show_ui(ui, |ui| {
-                                            for (i, c) in self.collections.iter().enumerate() {
-                                                ui.selectable_value(
-                                                    &mut self.selected_collection_index,
-                                                    Some(i),
-                                                    format!("{} ({} map{})", c.name, c.hashes.len(),
-                                                        if c.hashes.len() == 1 { "" } else { "s" }),
-                                                );
-                                            }
-                                        });
-                                    if ui
-                                        .add_enabled(
-                                            self.selected_collection_index.is_some(),
-                                            egui::Button::new("Add to"),
-                                        )
-                                        .clicked()
-                                    {
-                                        *sel_name = self
-                                            .selected_collection_index
-                                            .and_then(|i| self.collections.get(i))
-                                            .map(|c| c.name.clone());
-                                        *add_to_req = true;
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.selected_collection_index.is_some(),
-                                            egui::Button::new("Delete"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.delete_confirmation = self
-                                            .selected_collection_index
-                                            .and_then(|i| self.collections.get(i))
-                                            .map(|c| DeleteIntent::Collection(c.name.clone()));
-                                    }
-                                });
                                         } else if !scan.problems.is_empty() {
                                             ui.add_space(6.0);
                                             egui::ScrollArea::vertical()
@@ -3468,10 +3410,10 @@ impl eframe::App for MapManagerApp {
                                     section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                         ui.spacing_mut().item_spacing = card_item_spacing;
                                         fill_tile_width(ui);
-                                        ui.heading("Update outdated beatmaps");
+                                        ui.heading("⬆ Update outdated maps");
                                         muted_label(
                                             ui,
-                                            "Compares your installed difficulties against osu!web checksums (the same signal behind osu!'s \"update to latest version\") and refreshes outdated sets in place. Checking needs only the backend URL; downloads use the osu! sign-in when available and the mirror otherwise.",
+                                            "Compares installed maps against osu!web and refreshes outdated sets in place. Checking works without sign-in; downloads prefer the official API when signed in.",
                                         );
                                         ui.horizontal(|ui| {
                                             if ui
@@ -3650,7 +3592,7 @@ impl eframe::App for MapManagerApp {
                                     section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                         ui.spacing_mut().item_spacing = card_item_spacing;
                                         fill_tile_width(ui);
-                                        ui.heading("Delete non-std maps");
+                                        ui.heading("🗑 Clean up non-std modes");
                                         muted_label(
                                             ui,
                                             format!(
@@ -3713,13 +3655,40 @@ impl eframe::App for MapManagerApp {
                                     section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                         ui.spacing_mut().item_spacing = card_item_spacing;
                                         fill_tile_width(ui);
-                                        ui.heading("Repairs and delete");
-                                        muted_label(ui, "No scan loaded.");
+                                        ui.heading("Maintenance");
+                                        muted_label(ui, "Scan your library first — repairs, updates and cleanup appear here.");
                                     });
                                 }
                             });
                     }
                 }
+            });
+
+        // Bottom status bar — single place for progress + last message.
+        egui::TopBottomPanel::bottom("status")
+            .frame(panel_frame(ctx.style().as_ref()))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if self.is_scanning || self.is_repairing || self.is_checking_updates || self.is_updating {
+                        ui.add(egui::Spinner::new());
+                    }
+                    let status = if self.is_scanning {
+                        scan_progress_status(self.scanned_maps, self.scan_total, self.matched_maps)
+                    } else if self.is_repairing && !self.repair_progress.is_empty() {
+                        self.repair_progress.clone()
+                    } else if self.is_checking_updates && !self.update_check_status.is_empty() {
+                        self.update_check_status.clone()
+                    } else if self.is_updating && !self.update_progress.is_empty() {
+                        self.update_progress.clone()
+                    } else {
+                        self.status.clone()
+                    };
+                    ui.add_sized(
+                        [ui.available_width(), 18.0],
+                        egui::Label::new(status.clone()).truncate(true),
+                    )
+                    .on_hover_text(status);
+                });
             });
 
         if repair_requested {
@@ -3768,14 +3737,6 @@ impl eframe::App for MapManagerApp {
         }
         if save_collection_requested {
             self.save_selection_to_collection();
-        }
-        if create_collection_requested {
-            self.create_collection(&self.collection_name.clone());
-        }
-        if add_to_collection_requested {
-            if let Some(name) = selected_collection_name.as_deref() {
-                self.add_selected_to_collection(name);
-            }
         }
 
         self.maybe_show_delete_confirmation(ctx);
@@ -4050,19 +4011,20 @@ fn scan_progress_status(scanned_maps: usize, total_maps: usize, matched_maps: us
 
 fn apply_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    let bg = egui::Color32::from_rgb(0x15, 0x16, 0x18);
-    let panel = egui::Color32::from_rgb(0x1e, 0x1f, 0x22);
-    let surface = egui::Color32::from_rgb(0x26, 0x27, 0x2b);
-    let surface_hover = egui::Color32::from_rgb(0x30, 0x31, 0x35);
-    let border = egui::Color32::from_rgb(0x3b, 0x3c, 0x41);
-    let text = egui::Color32::from_rgb(0xe3, 0xdf, 0xd7);
-    let muted = egui::Color32::from_rgb(0xb3, 0xad, 0xa5);
-    let accent = egui::Color32::from_rgb(0x9a, 0x8f, 0x78);
-    let accent_soft = egui::Color32::from_rgb(0x3a, 0x35, 0x2b);
+    let bg = egui::Color32::from_rgb(0x13, 0x14, 0x17);
+    let panel = egui::Color32::from_rgb(0x1c, 0x1d, 0x21);
+    let surface = egui::Color32::from_rgb(0x24, 0x25, 0x2a);
+    let surface_hover = egui::Color32::from_rgb(0x2e, 0x2f, 0x35);
+    let border = egui::Color32::from_rgb(0x38, 0x39, 0x40);
+    let text = egui::Color32::from_rgb(0xea, 0xe6, 0xde);
+    let muted = egui::Color32::from_rgb(0xb8, 0xb2, 0xa9);
+    // osu!-pink-tinted accent: warm, pleasant, still professional on dark.
+    let accent = egui::Color32::from_rgb(0xd8, 0x9a, 0xb0);
+    let accent_soft = egui::Color32::from_rgb(0x3a, 0x2b, 0x33);
 
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.interact_size = egui::vec2(80.0, 28.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size = egui::vec2(88.0, 30.0);
     style.visuals = egui::Visuals::dark();
     style.visuals.override_text_color = Some(text);
     style.visuals.panel_fill = bg;

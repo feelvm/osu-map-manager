@@ -168,6 +168,53 @@ impl BeatmapFilters {
             && self.mode.matches(map.mode)
     }
 
+    /// Number of active filters, for the sidebar badge.
+    pub fn active_count(&self) -> usize {
+        let mut count = 0;
+        for text in [&self.artist, &self.title, &self.mapper, &self.difficulty, &self.tag] {
+            if !text.trim().is_empty() {
+                count += 1;
+            }
+        }
+        for range in [&self.stars, &self.ar, &self.cs, &self.od, &self.hp, &self.bpm] {
+            if range.enabled {
+                count += 1;
+            }
+        }
+        if parse_bound(&self.length_min).is_some() || parse_bound(&self.length_max).is_some() {
+            count += 1;
+        }
+        if self.mode != ModeFilter::Any {
+            count += 1;
+        }
+        count
+    }
+
+    pub fn clear_all(&mut self) {
+        let fresh = Self::with_full_ranges();
+        self.artist.clear();
+        self.title.clear();
+        self.mapper.clear();
+        self.difficulty.clear();
+        self.tag.clear();
+        self.length_min.clear();
+        self.length_max.clear();
+        self.stars = fresh.stars;
+        self.ar = fresh.ar;
+        self.cs = fresh.cs;
+        self.od = fresh.od;
+        self.hp = fresh.hp;
+        self.bpm = fresh.bpm;
+        self.mode = ModeFilter::Any;
+    }
+
+    /// True when the length boxes are empty or parse as numbers.
+    pub fn length_valid(&self) -> bool {
+        let min_ok = self.length_min.trim().is_empty() || parse_bound(&self.length_min).is_some();
+        let max_ok = self.length_max.trim().is_empty() || parse_bound(&self.length_max).is_some();
+        min_ok && max_ok
+    }
+
     /// osu!web-style text for the active filters, shown read-only in the UI.
     pub fn to_osu_search(&self) -> String {
         let mut tokens = Vec::new();
