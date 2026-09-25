@@ -50,8 +50,13 @@ struct GithubRelease {
     assets: Vec<GithubAsset>,
 }
 
+/// Release tags are two-part (`v0.7`), while Cargo requires three parts
+/// (`0.7.0`) — the trailing `.0` is dropped for display so the shown
+/// version matches the release tag exactly.
 pub fn current_version_text() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
+        .trim_end_matches(".0")
+        .to_owned()
 }
 
 /// `true` when `latest_tag` (e.g. `v0.7.0`) is newer than `current`
@@ -217,35 +222,17 @@ pub fn extract_fresh_exe(staged: &Path, asset_name: &str) -> Result<PathBuf> {
         let mut out = fs::File::create(&target).context("staging the update files")?;
         io::copy(&mut entry, &mut out).context("staging the update files")?;
     }
-    find_exe(&out_dir).with_context(|| {
-        format!(
+    // The release zip always carries the exe at its root under a fixed
+    // name — no need to search for it.
+    let direct = out_dir.join(RELEASE_EXE_NAME);
+    if direct.is_file() {
+        Ok(direct)
+    } else {
+        anyhow::bail!(
             "update archive did not contain {RELEASE_EXE_NAME} (asset {})",
             asset_name
         )
-    })
-}
-
-fn find_exe(dir: &Path) -> Option<PathBuf> {
-    let direct = dir.join(RELEASE_EXE_NAME);
-    if direct.is_file() {
-        return Some(direct);
     }
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_exe(&path) {
-                return Some(found);
-            }
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(RELEASE_EXE_NAME))
-        {
-            return Some(path);
-        }
-    }
-    None
 }
 
 /// Swaps the running executable with the fresh one, then respawns the app
