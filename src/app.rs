@@ -1,4 +1,5 @@
 use crate::{
+    app_update::{self, AppRelease},
     collection,
     local::{self, LibraryScan, LocalBeatmap, LocalBeatmapSet, RepairSeverity, ScanEvent},
     osu_oauth::{self, OauthSession},
@@ -6,6 +7,7 @@ use crate::{
         AR_RANGE, BPM_RANGE, BeatmapFilters, CS_RANGE, HP_RANGE, ModeFilter, OD_RANGE, RangeFilter,
         STARS_RANGE,
     },
+    shrink::{self, SetShrinkReport, ShrinkEvent, ShrinkJob},
     updates::{self, OutdatedSet},
 };
 use anyhow::{Context, Result};
@@ -17,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread,
@@ -106,6 +108,18 @@ pub struct MapManagerApp {
     update_failures: usize,
     update_log: Vec<RepairLogEntry>,
     update_touched_folders: BTreeSet<PathBuf>,
+    // ── App self-update (manual button only, no background checks) ──
+    app_update_rx: Option<Receiver<AppUpdateEvent>>,
+    app_update_window_open: bool,
+    app_update_checking: bool,
+    app_update_status: String,
+    app_update_release: Option<AppRelease>,
+    app_update_up_to_date: bool,
+    app_update_downloading: bool,
+    app_update_downloaded: u64,
+    app_update_total: Option<u64>,
+    app_update_installing: bool,
+    app_update_error: Option<String>,
     expanded_map_md5: Option<String>,
     delete_confirmation: Option<DeleteIntent>,
     background_preview_path: Option<PathBuf>,
@@ -126,6 +140,30 @@ pub struct MapManagerApp {
     oauth_rx: Option<Receiver<Result<OauthSession>>>,
     update_check_rx: Option<Receiver<UpdateCheckEvent>>,
     update_rx: Option<Receiver<UpdateEvent>>,
+    // ── Shrink tab ──
+    shrink_reports: Vec<SetShrinkReport>,
+    shrink_options: shrink::ShrinkOptions,
+    /// ffprobe results reused across analyses (path + size + mtime key).
+    shrink_probe_cache: shrink::ProbeCache,
+    is_analyzing: bool,
+    analysis_done: usize,
+    analysis_total: usize,
+    analysis_rx: Option<Receiver<ShrinkAnalysisEvent>>,
+    analysis_cancel: Option<Arc<AtomicBool>>,
+    analysis_pause: Option<Arc<AtomicBool>>,
+    is_shrinking: bool,
+    shrink_progress: String,
+    shrink_total_assets: usize,
+    shrink_done_assets: usize,
+    shrink_saved_bytes: u64,
+    shrink_successes: usize,
+    shrink_failures: usize,
+    shrink_log: Vec<ShrinkLogEntry>,
+    shrink_rx: Option<Receiver<ShrinkEvent>>,
+    shrink_cancel: Option<Arc<AtomicBool>>,
+    shrink_pause: Option<Arc<AtomicBool>>,
+    shrink_touched_folders: BTreeSet<PathBuf>,
+    shrink_backups: Vec<ShrinkBackupRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +214,7 @@ enum AppTab {
     Library,
     Collections,
     Maintenance,
+    Shrink,
 }
 
 impl AppTab {
@@ -184,6 +223,7 @@ impl AppTab {
             Self::Library => "Library",
             Self::Collections => "Collections",
             Self::Maintenance => "Maintenance",
+            Self::Shrink => "Shrink",
         }
     }
 
@@ -192,6 +232,7 @@ impl AppTab {
             Self::Library => "Scan, filter and pick maps",
             Self::Collections => "Build and save collections",
             Self::Maintenance => "Repair, update and clean up",
+            Self::Shrink => "Compress audio, video and backgrounds",
         }
     }
 }
@@ -316,6 +357,14 @@ impl Drop for FfmpegPcmSource {
 }
 
 #[derive(Debug)]
+enum AppUpdateEvent {
+    CheckResult(Result<Option<AppRelease>, String>),
+    DownloadProgress { done: u64, total: Option<u64> },
+    DownloadFinished,
+    Failed { message: String },
+}
+
+#[derive(Debug)]
 enum RepairEvent {
     Started {
         total: usize,
@@ -386,6 +435,27 @@ struct RepairLogEntry {
     beatmapset_id: i64,
     status: RepairLogStatus,
     message: String,
+}
+
+#[derive(Debug)]
+enum ShrinkAnalysisEvent {
+    Started { sets: usize },
+    Report { report: SetShrinkReport },
+    Finished { cache: shrink::ProbeCache },
+}
+
+#[derive(Debug, Clone)]
+struct ShrinkLogEntry {
+    label: String,
+    status: RepairLogStatus,
+    message: String,
+}
+
+/// One session backup: the zip plus the set folder it restores.
+#[derive(Debug, Clone)]
+struct ShrinkBackupRecord {
+    zip: PathBuf,
+    folder: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -548,6 +618,39 @@ impl MapManagerApp {
             oauth_rx: None,
             update_check_rx: None,
             update_rx: None,
+            app_update_rx: None,
+            app_update_window_open: false,
+            app_update_checking: false,
+            app_update_status: String::new(),
+            app_update_release: None,
+            app_update_up_to_date: false,
+            app_update_downloading: false,
+            app_update_downloaded: 0,
+            app_update_total: None,
+            app_update_installing: false,
+            app_update_error: None,
+            shrink_reports: Vec::new(),
+            shrink_options: shrink::ShrinkOptions::default(),
+            shrink_probe_cache: HashMap::new(),
+            is_analyzing: false,
+            analysis_done: 0,
+            analysis_total: 0,
+            analysis_rx: None,
+            analysis_cancel: None,
+            analysis_pause: None,
+            is_shrinking: false,
+            shrink_progress: String::new(),
+            shrink_total_assets: 0,
+            shrink_done_assets: 0,
+            shrink_saved_bytes: 0,
+            shrink_successes: 0,
+            shrink_failures: 0,
+            shrink_log: Vec::new(),
+            shrink_rx: None,
+            shrink_cancel: None,
+            shrink_pause: None,
+            shrink_touched_folders: BTreeSet::new(),
+            shrink_backups: Vec::new(),
         };
         app.load_collections();
         app
@@ -555,6 +658,7 @@ impl MapManagerApp {
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.poll_background_load(ctx);
+        self.poll_app_update();
         if let Some(rx) = self.scan_rx.take() {
             let mut keep_rx = true;
             let mut disconnected = false;
@@ -800,6 +904,178 @@ impl MapManagerApp {
                     self.status = "Repair worker disconnected".to_owned();
                 } else {
                     self.repair_rx = Some(rx);
+                }
+            }
+        }
+
+        if let Some(rx) = self.analysis_rx.take() {
+            let mut keep_rx = true;
+            let mut disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
+                match event {
+                    ShrinkAnalysisEvent::Started { sets } => {
+                        self.analysis_total = sets;
+                        self.analysis_done = 0;
+                        self.status = format!("Analyzing {sets} set folder(s)…");
+                    }
+                    ShrinkAnalysisEvent::Report { report } => {
+                        self.analysis_done += 1;
+                        self.shrink_reports.push(report);
+                        self.status = format!(
+                            "Analyzed {}/{} set folder(s)…",
+                            self.analysis_done, self.analysis_total
+                        );
+                    }
+                    ShrinkAnalysisEvent::Finished { cache } => {
+                        self.is_analyzing = false;
+                        self.shrink_probe_cache = cache;
+                        let stopped = self
+                            .analysis_cancel
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                        // Biggest savings first.
+                        self.shrink_reports
+                            .sort_by_key(|r| std::cmp::Reverse(r.est_saved()));
+                        let (total_in, total_est, items) = shrink::summarize(&self.shrink_reports);
+                        let saved = total_in.saturating_sub(total_est);
+                        self.status = format!(
+                            "Analysis {}: {} set(s), {} file(s) shrinkable, est. {} → {} (save ~{})",
+                            if stopped {
+                                "stopped (partial results)"
+                            } else {
+                                "done"
+                            },
+                            self.shrink_reports.len(),
+                            items,
+                            shrink::human_bytes(total_in),
+                            shrink::human_bytes(total_est),
+                            shrink::human_bytes(saved),
+                        );
+                        keep_rx = false;
+                    }
+                }
+            }
+            if keep_rx {
+                if disconnected {
+                    self.is_analyzing = false;
+                    self.status = "Analysis worker disconnected".to_owned();
+                } else {
+                    self.analysis_rx = Some(rx);
+                }
+            }
+        }
+
+        if let Some(rx) = self.shrink_rx.take() {
+            let mut keep_rx = true;
+            let mut disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
+                match event {
+                    ShrinkEvent::Started { sets, assets } => {
+                        self.is_shrinking = true;
+                        self.shrink_total_assets = assets;
+                        self.shrink_done_assets = 0;
+                        self.shrink_saved_bytes = 0;
+                        self.shrink_successes = 0;
+                        self.shrink_failures = 0;
+                        self.shrink_log.clear();
+                        self.shrink_touched_folders.clear();
+                        self.shrink_progress =
+                            format!("Shrinking {assets} file(s) in {sets} set(s)");
+                        self.status = self.shrink_progress.clone();
+                    }
+                    ShrinkEvent::SetStarted { label } => {
+                        self.shrink_progress = format!(
+                            "Shrinking {}/{} files… {label}",
+                            self.shrink_done_assets, self.shrink_total_assets
+                        );
+                        self.status = self.shrink_progress.clone();
+                    }
+                    ShrinkEvent::AssetDone { saved } => {
+                        self.shrink_done_assets += 1;
+                        self.shrink_saved_bytes += saved;
+                    }
+                    ShrinkEvent::SetDone {
+                        folder,
+                        saved,
+                        backup,
+                    } => {
+                        self.shrink_successes += 1;
+                        self.shrink_touched_folders.insert(folder.clone());
+                        let label = folder
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("set")
+                            .to_owned();
+                        if let Some(zip) = backup {
+                            self.shrink_backups.push(ShrinkBackupRecord { zip, folder });
+                        }
+                        self.upsert_shrink_log(
+                            label,
+                            RepairLogStatus::Success,
+                            format!("saved {}", shrink::human_bytes(saved)),
+                        );
+                    }
+                    ShrinkEvent::SetFailed { folder, message } => {
+                        self.shrink_failures += 1;
+                        self.shrink_touched_folders.insert(folder.clone());
+                        let label = folder
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("set")
+                            .to_owned();
+                        self.upsert_shrink_log(label, RepairLogStatus::Failed, message.clone());
+                        self.shrink_progress = format!("Failed: {message}");
+                        self.status = self.shrink_progress.clone();
+                    }
+                    ShrinkEvent::Finished { saved, elapsed_s } => {
+                        self.is_shrinking = false;
+                        let cancelled = self
+                            .shrink_cancel
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                        self.status = format!(
+                            "Shrink {} in {:.0}s: {} set(s) ok, {} failed, saved {} — rescanning",
+                            if cancelled { "cancelled" } else { "finished" },
+                            elapsed_s,
+                            self.shrink_successes,
+                            self.shrink_failures,
+                            shrink::human_bytes(saved),
+                        );
+                        let touched = std::mem::take(&mut self.shrink_touched_folders);
+                        if !touched.is_empty() {
+                            self.prune_scan_folders(&touched);
+                        }
+                        // Reports are stale now (assets changed size).
+                        self.shrink_reports.clear();
+                        keep_rx = false;
+                        if !touched.is_empty() && !self.is_scanning {
+                            self.start_scan();
+                        }
+                    }
+                }
+            }
+            if keep_rx {
+                if disconnected {
+                    self.is_shrinking = false;
+                    self.status = "Shrink worker disconnected".to_owned();
+                } else {
+                    self.shrink_rx = Some(rx);
                 }
             }
         }
@@ -1237,6 +1513,12 @@ impl MapManagerApp {
             return;
         }
         self.loaded_root = root.clone();
+        // Shrink reports and probe entries are folder-keyed: a different
+        // library would render (and convert) stale paths.
+        self.shrink_reports.clear();
+        self.shrink_probe_cache.clear();
+        self.shrink_backups.clear();
+        self.shrink_log.clear();
         self.repair_ignores = load_repair_ignores(&root).unwrap_or_default();
         self.oauth_session = osu_oauth::load_oauth_session(&root);
         self.oauth_status = if self.oauth_session.is_some() {
@@ -1552,6 +1834,359 @@ impl MapManagerApp {
         self.repair_rx = Some(rx);
     }
 
+    fn shrink_backup_dir(&self) -> PathBuf {
+        app_data_path(&self.osu_root()).join("shrink-backups")
+    }
+
+    /// Analyze every scanned set folder for shrinkable assets. Results
+    /// stream in per set; sets with work are selected by default.
+    fn start_shrink_analysis(&mut self) {
+        if self.is_analyzing || self.is_shrinking {
+            self.status = "Shrink analysis or run already in progress".to_owned();
+            return;
+        }
+        let Some(scan) = &self.scan else {
+            self.status = "Scan your Songs directory before shrinking".to_owned();
+            return;
+        };
+        if scan.sets.is_empty() {
+            self.status = "No beatmapsets scanned yet".to_owned();
+            return;
+        }
+        let bins = shrink::resolve_bins(ffmpeg_executable());
+        if bins.ffprobe.is_none() {
+            self.status =
+                "ffprobe not found next to ffmpeg — audio/video plans will skip; images still work"
+                    .to_owned();
+        }
+        let targets: Vec<(PathBuf, String, Vec<LocalBeatmap>)> = scan
+            .sets
+            .iter()
+            .map(|set| {
+                let label = set
+                    .folder
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("set")
+                    .to_owned();
+                (set.folder.clone(), label, set.maps.clone())
+            })
+            .collect();
+        let options = self.shrink_options.clone();
+        let probe_cache = std::mem::take(&mut self.shrink_probe_cache);
+        let (tx, rx) = mpsc::channel();
+        self.analysis_rx = Some(rx);
+        self.is_analyzing = true;
+        self.analysis_done = 0;
+        self.analysis_total = targets.len();
+        // Library analysis replaces set reports but keeps appended skin
+        // reports (different root, different lifecycle).
+        if let Some(skins_dir) = skins_dir_for(&self.osu_root()) {
+            self.shrink_reports
+                .retain(|r| r.folder.starts_with(&skins_dir));
+        } else {
+            self.shrink_reports.clear();
+        }
+        self.status = format!("Analyzing {} set folder(s)…", targets.len());
+        // Already-shrunk files are skipped via the on-disk shrink cache,
+        // loaded once here and shared read-only by every worker.
+        let shrink_cache = shrink::ShrinkCache::load(&shrink_cache_path(&self.osu_root()));
+        if shrink_cache.len() > 0 {
+            self.status = format!(
+                "Analyzing set folders ({} file(s) remembered as shrunk)…",
+                shrink_cache.len()
+            );
+        }
+        let shrink_cache = Arc::new(shrink_cache);
+        let analysis_cancel = Arc::new(AtomicBool::new(false));
+        self.analysis_cancel = Some(analysis_cancel.clone());
+        let analysis_pause = Arc::new(AtomicBool::new(false));
+        self.analysis_pause = Some(analysis_pause.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(ShrinkAnalysisEvent::Started {
+                sets: targets.len(),
+            });
+            // Worker pool over set folders: ffprobe is process-spawn
+            // bound, so several in flight hide the latency almost
+            // linearly. Each worker owns a private cache shard; they
+            // merge at the end (no lock contention on the hot path).
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4)
+                .min(targets.len().max(1));
+            let next = Arc::new(AtomicUsize::new(0));
+            let targets = Arc::new(targets);
+            std::thread::scope(|scope| {
+                let mut shards = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    let targets = targets.clone();
+                    let next = next.clone();
+                    let bins = bins.clone();
+                    let options = options.clone();
+                    let shrink_cache = shrink_cache.clone();
+                    let cancel = analysis_cancel.clone();
+                    let pause = analysis_pause.clone();
+                    shards.push(scope.spawn(move || {
+                        let mut local = shrink::ProbeCache::new();
+                        loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if !shrink::wait_while_paused(&pause, &cancel) {
+                                break;
+                            }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((folder, label, maps)) = targets.get(index) else {
+                                break;
+                            };
+                            let report = shrink::analyze_set(
+                                folder,
+                                label.clone(),
+                                maps,
+                                &bins,
+                                &options,
+                                &mut local,
+                                &shrink_cache,
+                            );
+                            if tx.send(ShrinkAnalysisEvent::Report { report }).is_err() {
+                                break;
+                            }
+                        }
+                        local
+                    }));
+                }
+                let mut merged = probe_cache;
+                for shard in shards {
+                    if let Ok(local) = shard.join() {
+                        merged.extend(local);
+                    }
+                }
+                let _ = tx.send(ShrinkAnalysisEvent::Finished { cache: merged });
+            });
+        });
+    }
+
+    /// Append skin reports without touching set reports. Skins live
+    /// under `<osu root>/Skins`; each subfolder is one skin.
+    fn start_skin_analysis(&mut self) {
+        if self.is_analyzing || self.is_shrinking {
+            self.status = "Shrink analysis or run already in progress".to_owned();
+            return;
+        }
+        let Some(skins_dir) = skins_dir_for(&self.osu_root()) else {
+            self.status = "Set your Songs folder first so the Skins folder can be found".to_owned();
+            return;
+        };
+        if !skins_dir.is_dir() {
+            self.status = format!("No Skins folder next to Songs ({})", skins_dir.display());
+            return;
+        }
+        let mut targets: Vec<(PathBuf, String)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&skins_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let label = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("skin")
+                    .to_owned();
+                targets.push((path, format!("🎨 {label}")));
+            }
+        }
+        targets.sort();
+        if targets.is_empty() {
+            self.status = "No skins found".to_owned();
+            return;
+        }
+        // Skip skins already analyzed this session.
+        targets.retain(|(folder, _)| !self.shrink_reports.iter().any(|r| &r.folder == folder));
+        if targets.is_empty() {
+            self.status = "All skins already analyzed".to_owned();
+            return;
+        }
+        let probe_cache = std::mem::take(&mut self.shrink_probe_cache);
+        let options = self.shrink_options.clone();
+        let shrink_cache = Arc::new(shrink::ShrinkCache::load(&shrink_cache_path(
+            &self.osu_root(),
+        )));
+        let analysis_cancel = Arc::new(AtomicBool::new(false));
+        self.analysis_cancel = Some(analysis_cancel.clone());
+        let analysis_pause = Arc::new(AtomicBool::new(false));
+        self.analysis_pause = Some(analysis_pause.clone());
+        let (tx, rx) = mpsc::channel();
+        self.analysis_rx = Some(rx);
+        self.is_analyzing = true;
+        self.analysis_done = 0;
+        self.analysis_total = targets.len();
+        self.status = format!("Analyzing {} skin(s)…", targets.len());
+        std::thread::spawn(move || {
+            let _ = tx.send(ShrinkAnalysisEvent::Started {
+                sets: targets.len(),
+            });
+            for (folder, label) in targets {
+                if analysis_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !shrink::wait_while_paused(&analysis_pause, &analysis_cancel) {
+                    break;
+                }
+                // Skins never probe (image headers only), so the probe
+                // cache passes through untouched.
+                let report = shrink::analyze_skin(&folder, label, &options, &shrink_cache);
+                if tx.send(ShrinkAnalysisEvent::Report { report }).is_err() {
+                    break;
+                }
+            }
+            let _ = tx.send(ShrinkAnalysisEvent::Finished { cache: probe_cache });
+        });
+    }
+
+    fn start_shrink_run(&mut self) {
+        if self.is_shrinking || self.is_analyzing {
+            self.status = "A shrink run or analysis is already in progress".to_owned();
+            return;
+        }
+        let selected: Vec<SetShrinkReport> = self
+            .shrink_reports
+            .iter()
+            .filter(|r| r.work_items() > 0)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            self.status = "Nothing to shrink — analyze first".to_owned();
+            return;
+        }
+        if self.scan.is_none() {
+            self.status = "Scan your Songs directory before shrinking".to_owned();
+            return;
+        }
+        let mut jobs = Vec::new();
+        for report in selected {
+            jobs.push(ShrinkJob { report });
+        }
+        let bins = shrink::resolve_bins(ffmpeg_executable());
+        let backup_dir = self.shrink_backup_dir();
+        let cache_file = shrink_cache_path(&self.osu_root());
+        let options = self.shrink_options.clone();
+        let delete_orphans = options.delete_orphans;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.shrink_cancel = Some(cancel.clone());
+        let pause = Arc::new(AtomicBool::new(false));
+        self.shrink_pause = Some(pause.clone());
+        let (tx, rx) = mpsc::channel();
+        self.shrink_rx = Some(rx);
+        self.is_shrinking = true;
+        self.status = format!("Starting shrink for {} set(s)", jobs.len());
+        std::thread::spawn(move || {
+            shrink::run_shrink_jobs(
+                jobs,
+                bins,
+                options,
+                backup_dir,
+                delete_orphans,
+                cancel,
+                pause,
+                tx,
+                cache_file,
+            );
+        });
+    }
+
+    fn stop_shrink(&mut self) {
+        if let Some(cancel) = self.shrink_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping shrink after the current file…".to_owned();
+        }
+    }
+
+    fn stop_shrink_analysis(&mut self) {
+        if let Some(cancel) = self.analysis_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping analysis after the current folder…".to_owned();
+        }
+    }
+
+    fn toggle_analysis_pause(&mut self) {
+        if let Some(pause) = self.analysis_pause.as_ref() {
+            let paused = !pause.load(Ordering::Relaxed);
+            pause.store(paused, Ordering::Relaxed);
+            self.status = if paused {
+                "Analysis paused — resume to continue".to_owned()
+            } else {
+                "Analysis resumed".to_owned()
+            };
+        }
+    }
+
+    fn toggle_shrink_pause(&mut self) {
+        if let Some(pause) = self.shrink_pause.as_ref() {
+            let paused = !pause.load(Ordering::Relaxed);
+            pause.store(paused, Ordering::Relaxed);
+            self.status = if paused {
+                "Shrink paused after the current file — resume to continue".to_owned()
+            } else {
+                "Shrink resumed".to_owned()
+            };
+        }
+    }
+
+    fn analysis_paused(&self) -> bool {
+        self.analysis_pause
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    fn shrink_paused(&self) -> bool {
+        self.shrink_pause
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    fn upsert_shrink_log(&mut self, label: String, status: RepairLogStatus, message: String) {
+        if let Some(entry) = self.shrink_log.iter_mut().find(|e| e.label == label) {
+            entry.status = status;
+            entry.message = message;
+        } else {
+            self.shrink_log.push(ShrinkLogEntry {
+                label,
+                status,
+                message,
+            });
+        }
+    }
+
+    /// Restore one session backup over its set folder, then rescan it.
+    fn restore_shrink_backup(&mut self, index: usize) {
+        if self.is_shrinking || self.is_analyzing {
+            self.status = "Wait for the shrink run to finish before restoring".to_owned();
+            return;
+        }
+        let Some(record) = self.shrink_backups.get(index).cloned() else {
+            return;
+        };
+        match shrink::restore_backup(&record.zip, &record.folder) {
+            Ok(count) => {
+                self.status = format!("Restored {} file(s) to {}", count, record.folder.display());
+                let folder = record.folder.clone();
+                let mut touched = BTreeSet::new();
+                touched.insert(folder.clone());
+                self.prune_scan_folders(&touched);
+                if !self.is_scanning {
+                    self.start_scan();
+                }
+                // Analysis is now stale for the restored folder.
+                self.shrink_reports.retain(|r| r.folder != folder);
+            }
+            Err(err) => {
+                self.status = format!("Restore failed: {err:#}");
+            }
+        }
+    }
+
     fn start_update_check(&mut self) {
         if self.is_checking_updates || self.is_updating {
             self.status = "An update check or update is already running".to_owned();
@@ -1641,6 +2276,170 @@ impl MapManagerApp {
         std::thread::spawn(move || {
             run_update_jobs(jobs, backend_url, osu_root, oauth_session, tx);
         });
+    }
+
+    /// Manual app update: ask GitHub for the latest release (user-triggered).
+    fn start_app_update_check(&mut self) {
+        if self.app_update_checking || self.app_update_downloading || self.app_update_installing {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.app_update_rx = Some(rx);
+        self.app_update_checking = true;
+        self.app_update_status = "Checking for app updates…".to_owned();
+        self.app_update_error = None;
+        self.app_update_up_to_date = false;
+        std::thread::spawn(move || {
+            let current = app_update::current_version_text();
+            let result = match app_update::fetch_latest_release() {
+                Ok(None) => Ok(None),
+                Ok(Some(release)) if !app_update::is_newer_version(&release.tag, &current) => {
+                    Ok(None)
+                }
+                Ok(Some(release)) => Ok(Some(release)),
+                Err(err) => Err(format!("{err:#}")),
+            };
+            let _ = tx.send(AppUpdateEvent::CheckResult(result));
+        });
+    }
+
+    /// Manual app update: download the release, swap the exe, restart.
+    fn start_app_update_download(&mut self) {
+        let Some(release) = self.app_update_release.clone() else {
+            return;
+        };
+        if self.app_update_downloading || self.app_update_installing {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.app_update_rx = Some(rx);
+        self.app_update_downloading = true;
+        self.app_update_downloaded = 0;
+        self.app_update_total = None;
+        self.app_update_status = format!("Downloading {}…", release.asset_name);
+        self.app_update_error = None;
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let download = app_update::download_release_asset(&release, &|done, total| {
+                let _ = progress_tx.send(AppUpdateEvent::DownloadProgress { done, total });
+            });
+            let staged = match download {
+                Ok(staged) => staged,
+                Err(err) => {
+                    let _ = tx.send(AppUpdateEvent::Failed {
+                        message: format!("{err:#}"),
+                    });
+                    return;
+                }
+            };
+            let fresh = match app_update::extract_fresh_exe(&staged, &release.asset_name) {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    let _ = tx.send(AppUpdateEvent::Failed {
+                        message: format!("{err:#}"),
+                    });
+                    return;
+                }
+            };
+            let _ = tx.send(AppUpdateEvent::DownloadFinished);
+            if let Err(err) = app_update::install_and_restart(&fresh) {
+                let _ = tx.send(AppUpdateEvent::Failed {
+                    message: format!("{err:#}"),
+                });
+            }
+            // On success `install_and_restart` exits the process, so no
+            // further event is needed.
+        });
+    }
+
+    fn poll_app_update(&mut self) {
+        let Some(rx) = self.app_update_rx.take() else {
+            return;
+        };
+        let mut keep_rx = true;
+        loop {
+            let event = match rx.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.app_update_checking
+                        || self.app_update_downloading
+                        || self.app_update_installing
+                    {
+                        self.app_update_checking = false;
+                        self.app_update_downloading = false;
+                        self.app_update_installing = false;
+                        self.app_update_error = Some("Update worker stopped".to_owned());
+                        self.app_update_status = "App update failed".to_owned();
+                    }
+                    keep_rx = false;
+                    break;
+                }
+            };
+            match event {
+                AppUpdateEvent::CheckResult(Ok(None)) => {
+                    self.app_update_checking = false;
+                    self.app_update_release = None;
+                    self.app_update_up_to_date = true;
+                    self.app_update_status = format!(
+                        "{} is the latest version",
+                        app_update::current_version_text()
+                    );
+                    self.status = self.app_update_status.clone();
+                }
+                AppUpdateEvent::CheckResult(Ok(Some(release))) => {
+                    self.app_update_checking = false;
+                    self.app_update_release = Some(release.clone());
+                    self.app_update_up_to_date = false;
+                    self.app_update_status = format!(
+                        "Update available: {} → {}",
+                        app_update::current_version_text(),
+                        release.tag
+                    );
+                    self.status = self.app_update_status.clone();
+                }
+                AppUpdateEvent::CheckResult(Err(message)) => {
+                    self.app_update_checking = false;
+                    self.app_update_error = Some(message.clone());
+                    self.app_update_status = format!("App update check failed: {message}");
+                    self.status = self.app_update_status.clone();
+                }
+                AppUpdateEvent::DownloadProgress { done, total } => {
+                    self.app_update_downloaded = done;
+                    self.app_update_total = total;
+                    self.app_update_status = match total {
+                        Some(total) if total > 0 => format!(
+                            "Downloading… {:.1} / {:.1} MiB",
+                            done as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        ),
+                        _ => format!("Downloading… {:.1} MiB", done as f64 / 1_048_576.0),
+                    };
+                }
+                AppUpdateEvent::DownloadFinished => {
+                    self.app_update_downloading = false;
+                    self.app_update_installing = true;
+                    self.app_update_status = "Installing… restarting the app".to_owned();
+                    self.status = self.app_update_status.clone();
+                }
+                AppUpdateEvent::Failed { message } => {
+                    self.app_update_checking = false;
+                    self.app_update_downloading = false;
+                    self.app_update_installing = false;
+                    self.app_update_error = Some(message.clone());
+                    self.app_update_status = format!("App update failed: {message}");
+                    self.status = self.app_update_status.clone();
+                }
+            }
+        }
+        if keep_rx {
+            self.app_update_rx = Some(rx);
+        }
+        if self.app_update_checking || self.app_update_downloading || self.app_update_installing {
+            // Keep repainting while the worker reports progress.
+            // (The top-level `update` already repaints for other jobs; the
+            // update window requests its own repaints while open.)
+        }
     }
 
     /// Drops every scan entry under the given folders so the next scan
@@ -2244,6 +3043,316 @@ impl MapManagerApp {
         });
     }
 
+    fn render_shrink_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let content_width = ui.available_width().max(1.0);
+        egui::ScrollArea::vertical()
+            .id_source("shrink_pane")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let card_item_spacing = ui.spacing().item_spacing;
+                let card_gap = 8.0;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                fix_ui_width(ui, content_width);
+
+                if self.scan.is_none() {
+                    section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = card_item_spacing;
+                        fill_tile_width(ui);
+                        ui.heading("No scan yet");
+                        muted_label(
+                            ui,
+                            "Enter your Songs folder in the sidebar, then press Scan library.",
+                        );
+                    });
+                    return;
+                }
+
+                // ── 1. Analyze ──
+                section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = card_item_spacing;
+                    fill_tile_width(ui);
+                    ui.heading("🗜 Analyze");
+                    muted_label(
+                        ui,
+                        "Finds shrinkable song audio, background video and images. \
+                        Filenames and .osu files are never changed, so scores stay \
+                        submittable. Already-shrunk files are remembered and skipped. \
+                        Close osu! before shrinking.",
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if self.is_analyzing {
+                            if ui.button("⏹ Stop").clicked() {
+                                self.stop_shrink_analysis();
+                            }
+                            let paused = self.analysis_paused();
+                            if ui
+                                .button(if paused { "▶ Resume" } else { "⏸ Pause" })
+                                .on_hover_text(
+                                    "Pause takes effect after the current folder",
+                                )
+                                .clicked()
+                            {
+                                self.toggle_analysis_pause();
+                            }
+                            ui.add(egui::Spinner::new());
+                            muted_label(
+                                ui,
+                                if paused {
+                                    "Paused — resume to continue".to_owned()
+                                } else {
+                                    format!(
+                                        "Analyzing {}/{} folder(s)…",
+                                        self.analysis_done, self.analysis_total
+                                    )
+                                },
+                            );
+                        } else {
+                            if ui
+                                .add_enabled(
+                                    !self.is_shrinking,
+                                    egui::Button::new("🔍 Analyze library"),
+                                )
+                                .clicked()
+                            {
+                                self.start_shrink_analysis();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.is_shrinking,
+                                    egui::Button::new("🎨 Analyze skins"),
+                                )
+                                .on_hover_text(
+                                    "Lossless-ish image pass over <osu root>/Skins: same pixels, \
+                                    same names, tighter encodes. skin.ini and sounds untouched.",
+                                )
+                                .clicked()
+                            {
+                                self.start_skin_analysis();
+                            }
+                            if ui
+                                .small_button("Clear shrink cache")
+                                .on_hover_text(
+                                    "Forget which files were already shrunk, so the next \
+                                    analysis plans everything again.",
+                                )
+                                .clicked()
+                            {
+                                let path = shrink_cache_path(&self.osu_root());
+                                match std::fs::remove_file(&path) {
+                                    Ok(()) => {
+                                        self.status =
+                                            "Shrink cache cleared — next analysis plans everything again"
+                                                .to_owned()
+                                    }
+                                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                        self.status =
+                                            "Shrink cache is already empty".to_owned()
+                                    }
+                                    Err(err) => {
+                                        self.status =
+                                            format!("Could not clear shrink cache: {err}")
+                                    }
+                                }
+                            }
+                        }
+                        ui.checkbox(&mut self.shrink_options.backup, "Back up each set (.zip)")
+                            .on_hover_text(
+                                "Zips the set folder before touching it. Restore from the Backups section.",
+                            );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.shrink_options.jobs)
+                                .clamp_range(1..=4)
+                                .prefix("Parallel sets: "),
+                        )
+                        .on_hover_text(
+                            "How many set folders to shrink at once. x264 is CPU-heavy; \
+                            2 suits most machines, 1 is the most disk-friendly.",
+                        );
+                    });
+                    muted_label(
+                        ui,
+                        "Guarantee: filenames never change and .osu/.osb files are never \
+                        written, so maps keep submitting scores.",
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        let mut orphans = self.shrink_options.delete_orphans;
+                        if ui
+                            .checkbox(&mut orphans, "Delete unreferenced media")
+                            .on_hover_text(
+                                "Also delete media files nothing references. Off by default; \
+                                re-analyzes when changed.",
+                            )
+                            .changed()
+                        {
+                            self.shrink_options.delete_orphans = orphans;
+                            if !self.shrink_reports.is_empty()
+                                && !self.is_analyzing
+                                && !self.is_shrinking
+                            {
+                                self.start_shrink_analysis();
+                            }
+                        }
+                        let mut remove_videos = self.shrink_options.remove_videos;
+                        if ui
+                            .checkbox(&mut remove_videos, "Remove background videos")
+                            .on_hover_text(
+                                "Delete referenced background videos instead of compressing \
+                                them. The game shows the background image instead, and \
+                                .osu files are untouched. Off by default; re-analyzes \
+                                when changed. Backups recommended.",
+                            )
+                            .changed()
+                        {
+                            self.shrink_options.remove_videos = remove_videos;
+                            if !self.shrink_reports.is_empty()
+                                && !self.is_analyzing
+                                && !self.is_shrinking
+                            {
+                                self.start_shrink_analysis();
+                            }
+                        }
+                    });
+                    if !self.shrink_reports.is_empty() {
+                        let (total_in, total_est, items) =
+                            shrink::summarize(&self.shrink_reports);
+                        let cached: usize =
+                            self.shrink_reports.iter().map(|r| r.cached_items()).sum();
+                        muted_label(
+                            ui,
+                            format!(
+                                "{} folder(s) · {} file(s) shrinkable{} · {} → ~{} (save ~{})",
+                                self.shrink_reports.len(),
+                                items,
+                                if cached > 0 {
+                                    format!(" · {cached} already shrunk")
+                                } else {
+                                    String::new()
+                                },
+                                shrink::human_bytes(total_in),
+                                shrink::human_bytes(total_est),
+                                shrink::human_bytes(total_in.saturating_sub(total_est)),
+                            ),
+                        );
+                    }
+                });
+                ui.add_space(card_gap);
+
+                // ── 2. Run ──
+                section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = card_item_spacing;
+                    fill_tile_width(ui);
+                    ui.heading("Shrink");
+                    let ready = self
+                        .shrink_reports
+                        .iter()
+                        .filter(|r| r.work_items() > 0)
+                        .count();
+                    ui.horizontal_wrapped(|ui| {
+                        if self.is_shrinking {
+                            if ui.button("⏹ Stop after current file").clicked() {
+                                self.stop_shrink();
+                            }
+                            let paused = self.shrink_paused();
+                            if ui
+                                .button(if paused { "▶ Resume" } else { "⏸ Pause" })
+                                .on_hover_text(
+                                    "Pause takes effect after the current file; \
+                                    in-flight encodes always finish first",
+                                )
+                                .clicked()
+                            {
+                                self.toggle_shrink_pause();
+                            }
+                            ui.add(egui::Spinner::new());
+                            muted_label(
+                                ui,
+                                if paused {
+                                    "Paused — resume to continue".to_owned()
+                                } else {
+                                    format!(
+                                        "{}/{} files · saved {}",
+                                        self.shrink_done_assets,
+                                        self.shrink_total_assets,
+                                        shrink::human_bytes(self.shrink_saved_bytes),
+                                    )
+                                },
+                            );
+                        } else if ui
+                            .add_enabled(
+                                ready > 0,
+                                egui::Button::new(format!("Shrink {ready} set(s)")),
+                            )
+                            .clicked()
+                        {
+                            self.start_shrink_run();
+                        }
+                    });
+                    if !self.shrink_log.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .id_source("shrink_log")
+                            .max_height(160.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for entry in self.shrink_log.iter().rev().take(40) {
+                                    let dot = match entry.status {
+                                        RepairLogStatus::Success => "✓",
+                                        RepairLogStatus::Failed => "✗",
+                                        RepairLogStatus::InProgress => "…",
+                                    };
+                                    ui.label(format!(
+                                        "{dot} {}: {}",
+                                        entry.label, entry.message
+                                    ));
+                                }
+                            });
+                    }
+                });
+                ui.add_space(card_gap);
+
+                // ── 3. Backups ──
+                section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = card_item_spacing;
+                    fill_tile_width(ui);
+                    ui.heading("Backups");
+                    if self.shrink_backups.is_empty() {
+                        muted_label(
+                            ui,
+                            "No backups this session. Each shrunk set is zipped before it is touched.",
+                        );
+                    } else {
+                        for index in 0..self.shrink_backups.len() {
+                            let (zip_name, folder_name) = {
+                                let record = &self.shrink_backups[index];
+                                (
+                                    record
+                                        .zip
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("backup.zip")
+                                        .to_owned(),
+                                    record
+                                        .folder
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("set")
+                                        .to_owned(),
+                                )
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{folder_name} ({zip_name})"));
+                                if ui.small_button("Restore").clicked() {
+                                    self.restore_shrink_backup(index);
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+    }
+
     fn render_collections_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut load_selected = false;
         let mut save_selection = false;
@@ -2613,6 +3722,114 @@ impl MapManagerApp {
         }
     }
 
+    fn maybe_show_app_update_window(&mut self, ctx: &egui::Context) {
+        if !self.app_update_window_open {
+            return;
+        }
+        let mut close = false;
+        let mut check_now = false;
+        let mut download_now = false;
+        let mut open_releases = false;
+        egui::Window::new(format!(
+            "App update ({})",
+            app_update::current_version_text()
+        ))
+        .collapsible(false)
+        .resizable(true)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label("Checks GitHub Releases. Downloading replaces the app exe and restarts.");
+            ui.add_space(4.0);
+            if !self.app_update_status.is_empty() {
+                ui.label(self.app_update_status.clone());
+            }
+            if self.app_update_downloading {
+                let progress = match self.app_update_total {
+                    Some(total) if total > 0 => {
+                        (self.app_update_downloaded as f32 / total as f32).clamp(0.0, 1.0)
+                    }
+                    _ => 0.0,
+                };
+                ui.add(egui::ProgressBar::new(progress).show_percentage());
+            }
+            if self.app_update_installing {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Installing… the app restarts automatically.");
+                });
+            }
+            if let Some(release) = self.app_update_release.clone() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("{} available", release.tag)).strong());
+                if !release.notes.trim().is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.label(release.notes.clone());
+                        });
+                }
+            } else if self.app_update_up_to_date {
+                ui.add_space(4.0);
+                ui.label("You're on the latest release.");
+            }
+            if let Some(error) = self.app_update_error.clone() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(error)
+                        .small()
+                        .color(egui::Color32::from_rgb(0xc4, 0x6a, 0x6a)),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+                let checking = self.app_update_checking
+                    || self.app_update_downloading
+                    || self.app_update_installing;
+                if ui
+                    .add_enabled(!checking, egui::Button::new("Check now"))
+                    .clicked()
+                {
+                    check_now = true;
+                }
+                if let Some(release) = self.app_update_release.clone()
+                    && ui
+                        .add_enabled(!checking, egui::Button::new("Download & restart"))
+                        .on_hover_text(format!("Downloads {}", release.asset_name))
+                        .clicked()
+                {
+                    download_now = true;
+                }
+                if ui.small_button("Open releases page").clicked() {
+                    open_releases = true;
+                }
+            });
+        });
+        // Repaint while a worker is active so progress stays live.
+        if self.app_update_checking || self.app_update_downloading || self.app_update_installing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        if close {
+            self.app_update_window_open = false;
+        }
+        if check_now {
+            self.start_app_update_check();
+        }
+        if download_now {
+            self.start_app_update_download();
+        }
+        if open_releases {
+            let _ = webbrowser::open(&format!(
+                "https://github.com/{}/{}/releases/latest",
+                app_update::GITHUB_OWNER,
+                app_update::GITHUB_REPO
+            ));
+        }
+    }
+
     fn cache_background(&mut self, path: PathBuf, texture: egui::TextureHandle) {
         if self.background_cache.contains_key(&path) {
             return;
@@ -2810,6 +4027,8 @@ impl eframe::App for MapManagerApp {
         self.poll_audio_playback();
         if self.is_scanning
             || self.is_repairing
+            || self.is_analyzing
+            || self.is_shrinking
             || self.audio_player.is_some()
             || !self.background_in_flight.is_empty()
         {
@@ -2822,7 +4041,12 @@ impl eframe::App for MapManagerApp {
                 ui.horizontal(|ui| {
                     ui.heading("osu! Map Manager");
                     ui.separator();
-                    for tab in [AppTab::Library, AppTab::Collections, AppTab::Maintenance] {
+                    for tab in [
+                        AppTab::Library,
+                        AppTab::Collections,
+                        AppTab::Maintenance,
+                        AppTab::Shrink,
+                    ] {
                         let selected = self.active_tab == tab;
                         if ui.selectable_label(selected, tab.label()).clicked() {
                             self.active_tab = tab;
@@ -2831,6 +4055,19 @@ impl eframe::App for MapManagerApp {
                     ui.separator();
                     muted_label(ui, self.active_tab.subtitle());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(app_update::current_version_text())
+                                .small()
+                                .weak(),
+                        )
+                        .on_hover_text("Current app version");
+                        if ui
+                            .small_button("↻ Update")
+                            .on_hover_text("Check for app updates")
+                            .clicked()
+                        {
+                            self.app_update_window_open = true;
+                        }
                         if let Some(player) = self.audio_player.as_ref() {
                             let paused = player.sink.is_paused();
                             let filename = player
@@ -3057,6 +4294,25 @@ impl eframe::App for MapManagerApp {
                             "“Export list (.tsv)” writes the selection as a plain-text spreadsheet list (tab-separated values — opens in Excel or Google Sheets).",
                         );
                     }
+                    AppTab::Shrink => {
+                        ui.heading("Shrink");
+                        muted_label(ui, "Compress set assets to save disk.");
+                        ui.separator();
+                        if self.scan.is_some() {
+                            ui.label(egui::RichText::new("Library").strong());
+                            ui.label(format!(
+                                "{} set(s) scanned",
+                                self.scan.as_ref().map(|s| s.sets.len()).unwrap_or(0)
+                            ));
+                            ui.label(format!(
+                                "{} folder(s) analyzed · {} file(s) shrinkable",
+                                self.shrink_reports.len(),
+                                self.shrink_reports.iter().map(|r| r.work_items()).sum::<usize>()
+                            ));
+                        } else {
+                            muted_label(ui, "Scan your library to enable shrinking.");
+                        }
+                    }
                     AppTab::Maintenance => {
                         ui.heading("Maintenance");
                         muted_label(ui, "Keep your library healthy.");
@@ -3208,6 +4464,9 @@ impl eframe::App for MapManagerApp {
                     }
                     AppTab::Collections => {
                         self.render_collections_page(ui, ctx);
+                    }
+                    AppTab::Shrink => {
+                        self.render_shrink_page(ui, ctx);
                     }
                     AppTab::Maintenance => {
                         let content_width = ui.available_width().max(1.0);
@@ -3735,6 +4994,7 @@ impl eframe::App for MapManagerApp {
         }
 
         self.maybe_show_delete_confirmation(ctx);
+        self.maybe_show_app_update_window(ctx);
     }
 }
 
@@ -4997,6 +6257,19 @@ fn save_scan_cache(osu_root: &str, scan: &LibraryScan) -> Result<()> {
 
 fn scan_cache_path(osu_root: &str) -> PathBuf {
     app_data_path(osu_root).join("scan_cache.json")
+}
+
+/// `<osu root>/Skins` when a root is set, for the shrink tab's skin pass.
+fn skins_dir_for(osu_root: &str) -> Option<PathBuf> {
+    if osu_root.trim().is_empty() {
+        return None;
+    }
+    Some(expand_prefilled_path(osu_root).join("Skins"))
+}
+
+/// Where the shrink tab persists already-shrunk files.
+fn shrink_cache_path(osu_root: &str) -> PathBuf {
+    app_data_path(osu_root).join("shrink_cache.json")
 }
 
 fn app_data_path(osu_root: &str) -> PathBuf {

@@ -1,11 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+mod app_update;
 mod collection;
 mod local;
 mod osu_db;
 mod osu_oauth;
 mod query;
+mod shrink;
 mod updates;
 
 use anyhow::Result;

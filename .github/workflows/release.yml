@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Package exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/osu-map-manager.exe dist/osu-map-manager.exe
+          Compress-Archive -Path dist/osu-map-manager.exe -DestinationPath osu-map-manager-windows-x86_64.zip -Force
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: osu-map-manager-windows-x86_64.zip
+          generate_release_notes: true

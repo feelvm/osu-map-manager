@@ -145,6 +145,36 @@ beatmap id cannot be checked.
 
 Use TSV export when you want a plain-text list of the selected maps before writing a collection.
 
+## Shrinking Beatmap Assets
+
+The `Shrink` tab compresses song audio, background video/images and skins to save disk:
+
+1. Scan your library, then open `Shrink` and click `Analyze library` (and optionally
+   `Analyze skins` for `<osu root>/Skins`).
+2. Review the totals; analysis and shrinking can be stopped or paused at any time.
+3. Click `Shrink N set(s)` to process everything analyzed.
+
+Rules that keep the library safe:
+
+- Only file *contents* ever change: filenames and `.osu`/`.osb` files are never
+  touched, so maps keep submitting scores. Close osu! first.
+- Song audio goes to 192k MP3 / OGG q6, video to H.264 ≤720p without audio,
+  images are downscaled past 1920px with a quality pass. Files that would grow
+  are kept untouched instead of failing.
+- Storyboard `Sample` sounds count as protected references (never orphans).
+- Already-shrunk files are remembered in `.osu-map-manager/shrink_cache.json`
+  and skipped on later runs — no wasted re-encodes, no stacked JPEG generations.
+  Changing quality settings re-plans affected files; `Clear shrink cache` forgets all.
+- `.wav` hitsounds, `.osu`/`.osb`/`skin.ini` and animated `.gif` are never touched.
+- Anything convertible only via a rename (`.flv` video, `.wav` song audio) is
+  skipped outright rather than risking checksum changes.
+- Each folder is zipped under `.osu-map-manager/shrink-backups` first; restore any
+  backup from the tab if something looks wrong in-game.
+- Optional extras, both default off: delete media nothing references, and remove
+  background videos entirely (the game shows the background image instead).
+- Skins get a pixels-exact pass only (same names, same dimensions, tighter encodes);
+  `skin.ini` and skin sounds are left alone.
+
 ## Notes and Limitations
 
 - The app scans local files; it does not automatically know everything shown on osu!web.
