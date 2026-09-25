@@ -534,10 +534,11 @@ fn cached_probe(cache: &mut ProbeCache, ffprobe: Option<&Path>, path: &Path) -> 
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_secs();
-    if let Some((cached_len, cached_mtime, probe)) = cache.get(path) {
-        if *cached_len == len && *cached_mtime == mtime {
-            return Some(probe.clone());
-        }
+    if let Some((cached_len, cached_mtime, probe)) = cache.get(path)
+        && *cached_len == len
+        && *cached_mtime == mtime
+    {
+        return Some(probe.clone());
     }
     let probe = probe_media(ffprobe, path)?;
     cache.insert(path.to_owned(), (len, mtime, probe.clone()));
@@ -607,17 +608,15 @@ fn probe_media(ffprobe: Option<&Path>, path: &Path) -> Option<MediaProbe> {
                 probe.bitrate = Some(bps);
             }
         }
-        if primary && (ctype == "video" || probe.codec.is_empty()) {
-            if ctype == "video" {
-                probe.codec = stream
-                    .get("codec_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                probe.width = stream.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                probe.height = stream.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                primary = false;
-            }
+        if primary && ctype == "video" {
+            probe.codec = stream
+                .get("codec_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            probe.width = stream.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            probe.height = stream.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            primary = false;
         }
     }
     Some(probe)
@@ -790,7 +789,7 @@ pub fn analyze_set(
         // Anything else (zips, txts, db files): out of scope, invisible.
     }
 
-    assets.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    assets.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let total_in: u64 = assets.iter().map(|a| a.bytes).sum();
     let total_est: u64 = assets.iter().map(|a| a.est_bytes).sum();
     SetShrinkReport {
@@ -917,7 +916,7 @@ pub fn analyze_skin(
         }
     }
 
-    assets.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    assets.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let total_in: u64 = assets.iter().map(|a| a.bytes).sum();
     let total_est: u64 = assets.iter().map(|a| a.est_bytes).sum();
     SetShrinkReport {
@@ -1015,11 +1014,11 @@ fn plan_song_audio(
     let src_bps = probe.bitrate.unwrap_or_else(|| {
         // Container bitrate fallback: total minus nothing (song files
         // are audio-only in practice).
-        probe
-            .duration_s
-            .is_significant()
-            .then(|| (bytes as f64 * 8.0 / probe.duration_s) as u64)
-            .unwrap_or(0)
+        if probe.duration_s.is_significant() {
+            (bytes as f64 * 8.0 / probe.duration_s) as u64
+        } else {
+            0
+        }
     });
     if src_bps <= AUDIO_REENCODE_ABOVE_BPS || !probe.duration_s.is_significant() {
         return skip_asset(name.to_owned(), bytes, kind, "already ≤192k");
@@ -1199,7 +1198,7 @@ fn run_ffmpeg(ffmpeg: &Path, args: &[String], cancel: &AtomicBool) -> Result<(u6
         .with_context(|| format!("spawning {}", ffmpeg.display()))?;
     let mut stderr_tail = Vec::<String>::new();
     if let Some(err) = child.stderr.take() {
-        for line in BufReader::new(err).lines().filter_map(|l| l.ok()) {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
             stderr_tail.push(line);
             if stderr_tail.len() > 20 {
                 stderr_tail.remove(0);
@@ -1683,6 +1682,7 @@ pub fn run_shrink_jobs(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one_set(
     job: &ShrinkJob,
     bins: &ShrinkBins,
@@ -2153,9 +2153,11 @@ mod tests {
                 ffmpeg: PathBuf::from("ffmpeg"),
                 ffprobe: None,
             };
-            let mut options = ShrinkOptions::default();
-            options.delete_orphans = true;
-            options.backup = false;
+            let options = ShrinkOptions {
+                delete_orphans: true,
+                backup: false,
+                ..Default::default()
+            };
             let report = analyze_set(
                 &set,
                 format!("set{i}"),
@@ -2168,10 +2170,12 @@ mod tests {
             jobs.push(ShrinkJob { report });
         }
         let (tx, rx) = mpsc::channel();
-        let mut options = ShrinkOptions::default();
-        options.jobs = 3;
-        options.backup = false;
-        options.delete_orphans = true;
+        let options = ShrinkOptions {
+            jobs: 3,
+            backup: false,
+            delete_orphans: true,
+            ..Default::default()
+        };
         let bins = ShrinkBins {
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: None,
@@ -2222,9 +2226,11 @@ mod tests {
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: None,
         };
-        let mut options = ShrinkOptions::default();
-        options.delete_orphans = true;
-        options.backup = false;
+        let options = ShrinkOptions {
+            delete_orphans: true,
+            backup: false,
+            ..Default::default()
+        };
         let report = analyze_set(
             &set,
             name.into(),
@@ -2522,8 +2528,10 @@ mod tests {
         assert_eq!(report2.total_est, report2.total_in);
 
         // …but a settings change re-plans it (new quality = new work).
-        let mut changed = ShrinkOptions::default();
-        changed.jpeg_quality = 90;
+        let changed = ShrinkOptions {
+            jpeg_quality: 90,
+            ..Default::default()
+        };
         let report3 = analyze_skin(&skin, "Skin".into(), &changed, &cache);
         assert_eq!(report3.work_items(), 1);
         assert_eq!(report3.cached_items(), 0);
@@ -2585,8 +2593,10 @@ mod tests {
             ffprobe: None,
         };
         // Orphan deletion on: the sample must still be protected.
-        let mut options = ShrinkOptions::default();
-        options.delete_orphans = true;
+        let options = ShrinkOptions {
+            delete_orphans: true,
+            ..Default::default()
+        };
         let report = analyze_set(
             &dir,
             "set".into(),
@@ -2711,8 +2721,10 @@ mod tests {
         let clip = plain.assets.iter().find(|a| a.name == "clip.mp4").unwrap();
         assert_ne!(clip.action, ShrinkAction::RemoveVideo);
         // Opt-in: removal planned with zero estimated bytes.
-        let mut options = ShrinkOptions::default();
-        options.remove_videos = true;
+        let options = ShrinkOptions {
+            remove_videos: true,
+            ..Default::default()
+        };
         let report = analyze_set(
             &dir,
             "set".into(),
@@ -2786,8 +2798,10 @@ mod tests {
             .unwrap();
         assert_eq!(orphan.kind, ShrinkAssetKind::Orphan);
         assert!(!orphan.action.is_work());
-        let mut on = ShrinkOptions::default();
-        on.delete_orphans = true;
+        let on = ShrinkOptions {
+            delete_orphans: true,
+            ..Default::default()
+        };
         let report = analyze_set(
             &dir,
             "set".into(),
