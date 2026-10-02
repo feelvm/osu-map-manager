@@ -14,6 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The exe must report exactly the release tag, so the version is
+      # stamped from the tag instead of trusting a manually bumped
+      # Cargo.toml (`cargo update` then syncs the lockfile for --locked).
+      - name: Stamp the app version from the release tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+].+)?$') {
+            throw "release tag '$tag' must be vX.Y.Z so the exe reports exactly the tag"
+          }
+          (Get-Content Cargo.toml -Raw) -replace '(?m)^version\s*=\s*"[^"]*"', "version = `"$version`"" | Set-Content Cargo.toml -NoNewline
+          cargo update -p osu-map-manager
       - run: cargo build --release --locked
       - name: Package exe
         shell: pwsh

@@ -50,13 +50,10 @@ struct GithubRelease {
     assets: Vec<GithubAsset>,
 }
 
-/// Release tags are two-part (`v0.7`), while Cargo requires three parts
-/// (`0.7.0`) — the trailing `.0` is dropped for display so the shown
-/// version matches the release tag exactly.
+/// The release workflow stamps `Cargo.toml`'s version from the release tag
+/// before building, so the displayed version always matches the tag.
 pub fn current_version_text() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
-        .trim_end_matches(".0")
-        .to_owned()
 }
 
 /// `true` when `latest_tag` (e.g. `v0.7.0`) is newer than `current`
