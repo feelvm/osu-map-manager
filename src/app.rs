@@ -8,6 +8,7 @@ use crate::{
         STARS_RANGE,
     },
     shrink::{self, SetShrinkReport, ShrinkEvent, ShrinkJob},
+    skin_editor::SkinEditorState,
     updates::{self, OutdatedSet},
 };
 use anyhow::{Context, Result};
@@ -67,6 +68,27 @@ pub struct MapManagerApp {
     selected_md5s: BTreeSet<String>,
     filtered_map_indexes: Vec<usize>,
     filtered_cache_key: String,
+    /// md5 → position inside `filtered_map_indexes`, rebuilt together with
+    /// the filtered list so inspector/prefetch lookups stay O(1) instead of
+    /// scanning the list every frame.
+    filtered_pos_by_map_index: HashMap<usize, usize>,
+    /// md5 → position inside the scan's map list, rebuilt lazily when the
+    /// scan changes. Avoids a full linear scan on every frame while a map
+    /// is selected.
+    md5_to_map_index: HashMap<String, usize>,
+    md5_index_key: (u64, usize),
+    /// Cached `collection_backup_info` result: re-parsing `collection.db`
+    /// every frame (sidebar + center + dialogs all ask for it) means disk
+    /// I/O plus a full parse at 60 fps. The key is the db path plus the
+    /// backup file's size/mtime, so saves and restores invalidate it.
+    backup_info_cache_path: Option<PathBuf>,
+    backup_info_cache_file: Option<(u64, u64, u32)>,
+    backup_info_cached: Option<BackupInfo>,
+    /// Cached md5 → map lookup for the selected collection's contents.
+    /// Rebuilding it from the whole scan every frame is O(library) per
+    /// frame; the key is (selected collection, scan generation).
+    collection_contents_key: (Option<usize>, u64),
+    collection_contents_cache: BTreeMap<String, LocalBeatmap>,
     /// Bumped on every scan mutation (finish, stop, prune, delete) so the
     /// filtered-list and repair-job caches cannot go stale when the map count
     /// alone does not change.
@@ -164,6 +186,7 @@ pub struct MapManagerApp {
     shrink_pause: Option<Arc<AtomicBool>>,
     shrink_touched_folders: BTreeSet<PathBuf>,
     shrink_backups: Vec<ShrinkBackupRecord>,
+    skin_editor: SkinEditorState,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +205,7 @@ enum DeleteIntent {
 /// What the automatic backup holds: when it was written and how many
 /// collections/maps it contains. Shown next to the undo button and inside
 /// its confirmation so the restore point is obvious.
+#[derive(Clone)]
 struct BackupInfo {
     when: String,
     collections: usize,
@@ -215,6 +239,7 @@ enum AppTab {
     Collections,
     Maintenance,
     Shrink,
+    SkinEditor,
 }
 
 impl AppTab {
@@ -224,6 +249,7 @@ impl AppTab {
             Self::Collections => "Collections",
             Self::Maintenance => "Maintenance",
             Self::Shrink => "Shrink",
+            Self::SkinEditor => "Skin Editor",
         }
     }
 
@@ -233,6 +259,7 @@ impl AppTab {
             Self::Collections => "Build and save collections",
             Self::Maintenance => "Repair, update and clean up",
             Self::Shrink => "Compress audio, video and backgrounds",
+            Self::SkinEditor => "Preview, remix and save skins",
         }
     }
 }
@@ -560,6 +587,14 @@ impl MapManagerApp {
             selected_md5s: BTreeSet::new(),
             filtered_map_indexes: Vec::new(),
             filtered_cache_key: String::new(),
+            filtered_pos_by_map_index: HashMap::new(),
+            md5_to_map_index: HashMap::new(),
+            md5_index_key: (u64::MAX, usize::MAX),
+            backup_info_cache_path: None,
+            backup_info_cache_file: None,
+            backup_info_cached: None,
+            collection_contents_key: (None, u64::MAX),
+            collection_contents_cache: BTreeMap::new(),
             scan_generation: 0,
             repair_jobs_cache: Vec::new(),
             repair_jobs_cache_key: String::new(),
@@ -651,6 +686,7 @@ impl MapManagerApp {
             shrink_pause: None,
             shrink_touched_folders: BTreeSet::new(),
             shrink_backups: Vec::new(),
+            skin_editor: SkinEditorState::new(),
         };
         app.load_collections();
         app
@@ -2546,8 +2582,81 @@ impl MapManagerApp {
         self.scan_generation += 1;
         self.filtered_cache_key.clear();
         self.filtered_map_indexes.clear();
+        self.filtered_pos_by_map_index.clear();
         self.repair_jobs_cache_key.clear();
         self.repair_jobs_cache.clear();
+        // The md5 index and the collection-contents cache key off the
+        // generation/map count, so they go stale automatically.
+        self.collection_contents_key = (None, u64::MAX);
+    }
+
+    /// md5 → index inside the scan's map list, rebuilding the index when the
+    /// scan changed. Keeps per-frame inspector/prefetch lookups O(1).
+    fn map_index_for_md5(&mut self, md5: &str) -> Option<usize> {
+        let key = (
+            self.scan_generation,
+            self.scan.as_ref().map_or(0, |scan| scan.maps.len()),
+        );
+        if self.md5_index_key != key {
+            self.md5_to_map_index.clear();
+            if let Some(scan) = &self.scan {
+                self.md5_to_map_index.reserve(scan.maps.len());
+                for (index, map) in scan.maps.iter().enumerate() {
+                    self.md5_to_map_index.insert(map.md5.clone(), index);
+                }
+            }
+            self.md5_index_key = key;
+        }
+        self.md5_to_map_index.get(md5).copied()
+    }
+
+    /// Cached [`collection_backup_info`]: reads the backup file's metadata
+    /// (cheap) and only re-parses `collection.db` when the file changed.
+    /// Called every frame from several places, so the uncached version
+    /// would do disk I/O plus a full parse at display refresh rates.
+    fn cached_collection_backup_info(&mut self) -> Option<BackupInfo> {
+        let db_path = self.collection_db_path();
+        let backup = db_path.as_ref()?.with_extension("db.bak");
+        let fingerprint = fs::metadata(&backup).ok().and_then(|meta| {
+            meta.modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| (meta.len(), age.as_secs(), age.subsec_nanos()))
+        });
+        if self.backup_info_cache_path.as_ref() == Some(&backup)
+            && self.backup_info_cache_file == fingerprint
+        {
+            return self.backup_info_cached.clone();
+        }
+        let info = collection_backup_info(db_path);
+        self.backup_info_cache_path = Some(backup);
+        self.backup_info_cache_file = fingerprint;
+        self.backup_info_cached = info.clone();
+        info
+    }
+
+    /// Rebuilds the md5 → map lookup for the currently selected
+    /// collection's contents, but only when the selection or the scan
+    /// changed. Callers then read `collection_contents_cache` directly
+    /// (no per-frame rebuild, no per-frame clone of the whole map).
+    fn refresh_collection_contents(&mut self) {
+        let key = (self.selected_collection_index, self.scan_generation);
+        if self.collection_contents_key == key {
+            return;
+        }
+        self.collection_contents_cache.clear();
+        if let (Some(index), Some(scan)) = (self.selected_collection_index, &self.scan)
+            && let Some(collection) = self.collections.get(index)
+        {
+            let wanted: BTreeSet<&str> = collection.hashes.iter().map(String::as_str).collect();
+            for map in &scan.maps {
+                if wanted.contains(map.md5.as_str()) {
+                    self.collection_contents_cache
+                        .insert(map.md5.clone(), map.clone());
+                }
+            }
+        }
+        self.collection_contents_key = key;
     }
 
     fn filtered_cache_key(&self) -> String {
@@ -2569,6 +2678,7 @@ impl MapManagerApp {
         }
 
         self.filtered_map_indexes.clear();
+        self.filtered_pos_by_map_index.clear();
         if let Some(scan) = &self.scan {
             let text = self.filters.lowered_text();
             self.filtered_map_indexes
@@ -2577,6 +2687,11 @@ impl MapManagerApp {
                         .matches_local_lowered(map, &text)
                         .then_some(index)
                 }));
+            self.filtered_pos_by_map_index
+                .reserve(self.filtered_map_indexes.len());
+            for (position, &map_index) in self.filtered_map_indexes.iter().enumerate() {
+                self.filtered_pos_by_map_index.insert(map_index, position);
+            }
         }
         self.filtered_cache_key = key;
     }
@@ -2680,11 +2795,9 @@ impl MapManagerApp {
                 egui::vec2(inspector_width, height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    let inspected_map = self.expanded_map_md5.as_ref().and_then(|md5| {
-                        self.scan
-                            .as_ref()
-                            .and_then(|scan| scan.maps.iter().find(|map| &map.md5 == md5))
-                            .cloned()
+                    let inspected_map = self.expanded_map_md5.clone().and_then(|md5| {
+                        let index = self.map_index_for_md5(&md5)?;
+                        self.scan.as_ref()?.maps.get(index).cloned()
                     });
                     if let Some(map) = inspected_map {
                         self.render_map_inspector(ui, ctx, height, &map);
@@ -2705,14 +2818,9 @@ impl MapManagerApp {
     fn render_map_browser(&mut self, ui: &mut egui::Ui, max_height: f32) {
         const HEADER_HEIGHT: f32 = 46.0;
 
-        let inspected_row = self.expanded_map_md5.as_ref().and_then(|expanded_md5| {
-            self.scan.as_ref().and_then(|scan| {
-                self.filtered_map_indexes.iter().position(|&index| {
-                    scan.maps
-                        .get(index)
-                        .is_some_and(|map| &map.md5 == expanded_md5)
-                })
-            })
+        let inspected_row = self.expanded_map_md5.clone().and_then(|expanded_md5| {
+            let map_index = self.map_index_for_md5(&expanded_md5)?;
+            self.filtered_pos_by_map_index.get(&map_index).copied()
         });
         let row_count = self.filtered_map_indexes.len();
         let total_height = row_count as f32 * HEADER_HEIGHT;
@@ -2740,18 +2848,30 @@ impl MapManagerApp {
                         continue;
                     }
 
-                    let Some(map) = self.scan.as_ref().and_then(|scan| {
-                        self.filtered_map_indexes
-                            .get(row)
-                            .and_then(|&index| scan.maps.get(index))
-                            .cloned()
-                    }) else {
+                    // Copy out only the small display fields here; the full
+                    // map is cloned lazily below, only when the user
+                    // actually toggles this row's selection.
+                    let Some((map_md5, title, details, label)) =
+                        self.scan.as_ref().and_then(|scan| {
+                            self.filtered_map_indexes
+                                .get(row)
+                                .and_then(|&index| scan.maps.get(index))
+                                .map(|map| {
+                                    (
+                                        map.md5.clone(),
+                                        format!("{} - {}", map.artist, map.title),
+                                        compact_map_details(map),
+                                        map.label(),
+                                    )
+                                })
+                        })
+                    else {
                         continue;
                     };
 
                     let header_rect =
                         egui::Rect::from_min_size(row_rect.min, egui::vec2(width, HEADER_HEIGHT));
-                    let selected = self.selected_md5s.contains(&map.md5);
+                    let selected = self.selected_md5s.contains(&map_md5);
                     let fill = if is_inspected {
                         egui::Color32::from_rgb(0x30, 0x2e, 0x2a)
                     } else if selected {
@@ -2775,7 +2895,7 @@ impl MapManagerApp {
                     // clip rect while scrolling, so positional auto-ids would
                     // shift between frames and clash.
                     let selection_changed = ui
-                        .push_id(("map_select", &map.md5), |ui| {
+                        .push_id(("map_select", &map_md5), |ui| {
                             ui.allocate_ui_at_rect(checkbox_area, |ui| {
                                 ui.centered_and_justified(|ui| ui.checkbox(&mut selected_value, ""))
                                     .inner
@@ -2786,9 +2906,16 @@ impl MapManagerApp {
                         .inner;
                     if selection_changed {
                         if selected_value {
-                            self.select_map(&map);
+                            if let Some(selected_map) = self.scan.as_ref().and_then(|scan| {
+                                self.filtered_map_indexes
+                                    .get(row)
+                                    .and_then(|&index| scan.maps.get(index))
+                                    .cloned()
+                            }) {
+                                self.select_map(&selected_map);
+                            }
                         } else {
-                            self.deselect_md5(&map.md5);
+                            self.deselect_md5(&map_md5);
                         }
                     }
 
@@ -2801,11 +2928,9 @@ impl MapManagerApp {
                     );
                     let row_response = ui.interact(
                         content_rect,
-                        ui.id().with(("map_inspector", &map.md5)),
+                        ui.id().with(("map_inspector", &map_md5)),
                         egui::Sense::click(),
                     );
-                    let title = format!("{} - {}", map.artist, map.title);
-                    let details = compact_map_details(&map);
                     let title_rect = egui::Rect::from_min_max(
                         egui::pos2(content_rect.left() + 10.0, content_rect.top() + 4.0),
                         egui::pos2(content_rect.right() - 8.0, content_rect.top() + 23.0),
@@ -2828,10 +2953,9 @@ impl MapManagerApp {
                         egui::TextStyle::Small.resolve(ui.style()),
                         egui::Color32::from_rgb(0xb3, 0xad, 0xa5),
                     );
-                    let row_response =
-                        row_response.on_hover_text(format!("{}\n{}", map.label(), details));
+                    let row_response = row_response.on_hover_text(format!("{label}\n{details}"));
                     if row_response.clicked() {
-                        self.expanded_map_md5 = Some(map.md5.clone());
+                        self.expanded_map_md5 = Some(map_md5);
                     }
                 }
             });
@@ -3482,7 +3606,7 @@ impl MapManagerApp {
                         if ui.button("Export list (.tsv)").on_hover_text("Write the selected maps to a plain-text spreadsheet list (TSV = tab-separated values, opens in Excel or Google Sheets) in the app data folder").clicked() {
                             self.export_manifest();
                         }
-                        let backup = collection_backup_info(self.collection_db_path());
+                        let backup = self.cached_collection_backup_info();
                         let undo_hover = match &backup {
                             Some(info) => format!(
                                 "Undo the last save: restore the backup from {} ({} collection(s), {} map(s))",
@@ -3517,90 +3641,94 @@ impl MapManagerApp {
                         muted_label(ui, "No collections loaded. Pick maps in Library, name the collection above, and press Save.");
                     } else if self.selected_collection_index.is_none() {
                         muted_label(ui, "Choose a collection above to review its maps.");
-                    } else {
-                        if let Some(collection) = self
-                            .selected_collection_index
-                            .and_then(|index| self.collections.get(index))
-                            .cloned()
-                        {
-                            let wanted_hashes = collection
-                                .hashes
-                                .iter()
-                                .map(String::as_str)
-                                .collect::<BTreeSet<_>>();
-                            let scanned_maps = self.scan.as_ref().map(|scan| {
-                                scan.maps
-                                    .iter()
-                                    .filter(|map| wanted_hashes.contains(map.md5.as_str()))
-                                    .map(|map| (map.md5.clone(), map.clone()))
-                                    .collect::<BTreeMap<_, _>>()
-                            });
-                            let matched = scanned_maps.as_ref().map_or(0, BTreeMap::len);
-                            muted_label(
-                                ui,
-                                format!(
-                                    "{} map(s), {} matched in the current scan",
-                                    collection.hashes.len(),
-                                    matched
-                                ),
-                            );
-                            egui::ScrollArea::vertical()
-                                .id_source("collections_page_maps")
-                                .max_height(360.0)
-                                .show(ui, |ui| {
-                                    let mut shown = 0_usize;
-                                    for hash in &collection.hashes {
-                                        if shown >= 200 {
+                    } else if self.selected_collection_index.is_some() {
+                        self.refresh_collection_contents();
+                        // Selection toggles are collected while rendering and
+                        // applied afterwards, so the row loop only needs shared
+                        // borrows and the scan-wide lookup stays cached instead
+                        // of being rebuilt from the whole library every frame.
+                        let mut pending: Vec<(bool, String)> = Vec::new();
+                        let matched = self.collection_contents_cache.len();
+                        let selected_index =
+                            self.selected_collection_index.expect("just checked");
+                        let hash_count = self
+                            .collections
+                            .get(selected_index)
+                            .map_or(0, |collection| collection.hashes.len());
+                        muted_label(
+                            ui,
+                            format!("{hash_count} map(s), {matched} matched in the current scan"),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_source("collections_page_maps")
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                let mut shown = 0_usize;
+                                for hash_index in 0..hash_count {
+                                    if shown >= 200 {
+                                        break;
+                                    }
+                                    let (hash, label) = {
+                                        let Some(hash) = self
+                                            .collections
+                                            .get(selected_index)
+                                            .and_then(|collection| {
+                                                collection.hashes.get(hash_index)
+                                            })
+                                        else {
                                             break;
-                                        }
-                                        let mut selected = self.selected_md5s.contains(hash);
-                                        if let Some(map) = scanned_maps
-                                            .as_ref()
-                                            .and_then(|maps| maps.get(hash.as_str()))
-                                        {
-                                            let changed = ui
-                                                .horizontal(|ui| {
-                                                    let changed = ui
-                                                        .checkbox(&mut selected, "")
-                                                        .changed();
-                                                    ui.label(self.map_result_label(map));
-                                                    changed
-                                                })
-                                                .inner;
-                                            if changed {
-                                                if selected {
-                                                    self.select_map(map);
-                                                } else {
-                                                    self.deselect_md5(hash);
-                                                }
-                                            }
-                                        } else {
-                                            let changed = ui
-                                                .horizontal(|ui| {
-                                                    let changed = ui
-                                                        .checkbox(&mut selected, "")
-                                                        .changed();
-                                                    muted_label(ui, format!("Missing locally: {hash}"));
-                                                    changed
-                                                })
-                                                .inner;
-                                            if changed {
-                                                if selected {
-                                                    self.select_missing_hash(hash);
-                                                } else {
-                                                    self.deselect_md5(hash);
-                                                }
-                                            }
-                                        }
-                                        shown += 1;
+                                        };
+                                        let label = self
+                                            .collection_contents_cache
+                                            .get(hash)
+                                            .map(|map| self.map_result_label(map));
+                                        (hash.clone(), label)
+                                    };
+                                    let mut selected = self.selected_md5s.contains(&hash);
+                                    let changed = if let Some(label) = label {
+                                        ui.horizontal(|ui| {
+                                            let changed =
+                                                ui.checkbox(&mut selected, "").changed();
+                                            ui.label(label);
+                                            changed
+                                        })
+                                        .inner
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            let changed =
+                                                ui.checkbox(&mut selected, "").changed();
+                                            muted_label(
+                                                ui,
+                                                format!("Missing locally: {hash}"),
+                                            );
+                                            changed
+                                        })
+                                        .inner
+                                    };
+                                    if changed {
+                                        pending.push((selected, hash));
                                     }
-                                    if collection.hashes.len() > shown {
-                                        muted_label(
-                                            ui,
-                                            format!("{} more map(s)", collection.hashes.len() - shown),
-                                        );
-                                    }
-                                });
+                                    shown += 1;
+                                }
+                                if hash_count > shown {
+                                    muted_label(
+                                        ui,
+                                        format!("{} more map(s)", hash_count - shown),
+                                    );
+                                }
+                            });
+                        for (select, hash) in pending {
+                            if select {
+                                if let Some(map) =
+                                    self.collection_contents_cache.get(&hash).cloned()
+                                {
+                                    self.select_map(&map);
+                                } else {
+                                    self.select_missing_hash(&hash);
+                                }
+                            } else {
+                                self.deselect_md5(&hash);
+                            }
                         }
                     }
 
@@ -3662,7 +3790,7 @@ impl MapManagerApp {
             DeleteIntent::RestoreBackup => {
                 let current_collections = self.collections.len();
                 let current_maps: usize = self.collections.iter().map(|c| c.hashes.len()).sum();
-                let message = match collection_backup_info(self.collection_db_path()) {
+                let message = match self.cached_collection_backup_info() {
                     Some(info) => format!(
                         "Undo the last save and return to the backup from {}?\n\nBackup: {} collection(s), {} map(s).\nCurrent: {current_collections} collection(s), {current_maps} map(s).\n\nAnything saved since the backup will be lost.",
                         info.when, info.collections, info.maps
@@ -3902,15 +4030,14 @@ impl MapManagerApp {
         }
     }
 
-    fn neighbor_background_paths(&self, md5: &str) -> Vec<PathBuf> {
-        let Some(scan) = &self.scan else {
+    fn neighbor_background_paths(&mut self, md5: &str) -> Vec<PathBuf> {
+        let position = self
+            .map_index_for_md5(md5)
+            .and_then(|map_index| self.filtered_pos_by_map_index.get(&map_index).copied());
+        let Some(position) = position else {
             return Vec::new();
         };
-        let Some(position) = self
-            .filtered_map_indexes
-            .iter()
-            .position(|&index| scan.maps.get(index).is_some_and(|map| map.md5 == md5))
-        else {
+        let Some(scan) = &self.scan else {
             return Vec::new();
         };
         let mut paths = Vec::new();
@@ -4024,6 +4151,7 @@ impl MapManagerApp {
 impl eframe::App for MapManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
+        self.skin_editor.poll(ctx);
         self.poll_audio_playback();
         if self.is_scanning
             || self.is_repairing
@@ -4031,6 +4159,7 @@ impl eframe::App for MapManagerApp {
             || self.is_shrinking
             || self.audio_player.is_some()
             || !self.background_in_flight.is_empty()
+            || self.skin_editor.needs_repaint()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -4046,6 +4175,7 @@ impl eframe::App for MapManagerApp {
                         AppTab::Collections,
                         AppTab::Maintenance,
                         AppTab::Shrink,
+                        AppTab::SkinEditor,
                     ] {
                         let selected = self.active_tab == tab;
                         if ui.selectable_label(selected, tab.label()).clicked() {
@@ -4274,7 +4404,7 @@ impl eframe::App for MapManagerApp {
                         );
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Undo").strong());
-                        match collection_backup_info(self.collection_db_path()) {
+                        match self.cached_collection_backup_info() {
                             Some(info) => muted_label(
                                 ui,
                                 format!(
@@ -4348,6 +4478,16 @@ impl eframe::App for MapManagerApp {
                         } else {
                             muted_label(ui, "Scan your library to see health stats.");
                         }
+                    }
+                    AppTab::SkinEditor => {
+                        let osu_root = self.osu_root();
+                        let skins_dir = skins_dir_for(&osu_root);
+                        let skin_cache = skin_cache_path_for(&osu_root);
+                        self.skin_editor.sidebar(
+                            ui,
+                            skins_dir.as_deref(),
+                            skin_cache.as_deref(),
+                        );
                     }
                 });
             });
@@ -4467,6 +4607,9 @@ impl eframe::App for MapManagerApp {
                     }
                     AppTab::Shrink => {
                         self.render_shrink_page(ui, ctx);
+                    }
+                    AppTab::SkinEditor => {
+                        self.skin_editor.center_page(ui, ctx);
                     }
                     AppTab::Maintenance => {
                         let content_width = ui.available_width().max(1.0);
@@ -5346,7 +5489,7 @@ fn panel_frame(style: &egui::Style) -> egui::Frame {
         ))
 }
 
-fn section_frame(style: &egui::Style) -> egui::Frame {
+pub(crate) fn section_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::group(style)
         .inner_margin(egui::Margin::same(12.0))
         .outer_margin(egui::Margin::same(0.0))
@@ -5381,7 +5524,7 @@ fn nested_frame(style: &egui::Style) -> egui::Frame {
         ))
 }
 
-fn muted_label(ui: &mut egui::Ui, text: impl Into<String>) {
+pub(crate) fn muted_label(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(text.into()).color(egui::Color32::from_rgb(0xb3, 0xad, 0xa5)),
@@ -6265,6 +6408,15 @@ fn skins_dir_for(osu_root: &str) -> Option<PathBuf> {
         return None;
     }
     Some(expand_prefilled_path(osu_root).join("Skins"))
+}
+
+/// `<osu root>/.osu-map-manager/skin_cache.json`: fingerprints of the last
+/// skin scan, so unchanged skins load without re-decoding their images.
+fn skin_cache_path_for(osu_root: &str) -> Option<PathBuf> {
+    if osu_root.trim().is_empty() {
+        return None;
+    }
+    Some(app_data_path(osu_root).join("skin_cache.json"))
 }
 
 /// Where the shrink tab persists already-shrunk files.

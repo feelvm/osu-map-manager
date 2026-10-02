@@ -8,6 +8,7 @@ mod osu_db;
 mod osu_oauth;
 mod query;
 mod shrink;
+mod skin_editor;
 mod updates;
 
 use anyhow::Result;
