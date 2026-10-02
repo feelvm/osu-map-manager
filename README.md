@@ -17,6 +17,9 @@ star rating, length, mode, and other fields, then write the selected results int
 - Export a TSV list of selected maps for review.
 - Detect maps with missing audio or background files.
 - Repair affected beatmapsets.
+- Delete natively mapped taiko, catch, or mania `.osu` files you do not want.
+- Preview installed skins and remix their elements in the Skin Editor.
+- Update the app itself from GitHub Releases.
 
 ## Before You Start
 
@@ -24,20 +27,37 @@ You need:
 
 - [osu!](https://osu.ppy.sh/home/download) installed on your computer.
 - A local osu! `Songs` folder with beatmaps in it.
-- This app built or downloaded for your system.
 - [FFmpeg](https://ffmpeg.org/download.html) available on `PATH`, set through `FFMPEG_PATH`, or placed beside the app executable.
-- [Rustup](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed for building from source.
 
-If you are running from source, start it with:
+## Installing the App
+
+### Option 1: Download a Release
+
+Download the latest Windows build from
+[GitHub Releases](https://github.com/feelvm/osu-map-manager/releases), unzip it, and run
+`osu-map-manager.exe`. No installation steps are needed.
+
+### Option 2: Build from Source
+
+Building requires [Rustup](https://doc.rust-lang.org/cargo/getting-started/installation.html).
+From the repository folder:
 
 ```powershell
-cargo run
+cargo run --release
 ```
+
+This compiles the app and starts it. `cargo build --release` produces the standalone
+executable under `target\release\` without starting it.
 
 ## Basic Workflow
 
+The app is organized into tabs: `Library` (scan, filter and pick maps),
+`Collections` (build and save collections), `Maintenance` (repair, update and
+clean up), `Shrink` (compress audio, video and backgrounds), and `Skin Editor`
+(preview, remix and save skins).
+
 1. Open osu! Map Manager.
-2. Enter your osu! `Songs` folder.
+2. Confirm the auto-detected osu! `Songs` folder.
 3. Click scan to read your installed beatmaps.
 4. Add one or more filters.
 5. Review the matching maps.
@@ -45,27 +65,12 @@ cargo run
 7. Choose a collection name.
 8. Write `collection.db`.
 
+The app finds your `Songs` folder automatically (the standard install location under
+`%LOCALAPPDATA%\osu!`) and derives the osu! install root from it, so it can also read
+`osu!.db` and `collection.db` next to `Songs` when they exist.
+
 The app backs up your existing `collection.db` before replacing it, keeping the
 last three versions (`collection.db.bak`, `.bak.1`, `.bak.2`).
-
-## Choosing the Songs Folder
-
-Enter your osu! `Songs` folder, for example:
-
-```text
-C:\Users\%USERPROFILE%\AppData\Local\osu!\Songs
-```
-
-The app derives the osu! install root from it automatically, so it can also read
-`osu!.db` and `collection.db` next to `Songs` when they exist:
-
-```text
-Songs\
-osu!.db
-```
-
-The `Songs` folder contains the `.osu` files. `osu!.db` can provide extra local metadata such as
-stored star ratings where available.
 
 After a full scan, the app caches the parsed library under `.osu-map-manager`. On the next start it
 loads that cache immediately, and the next scan reuses cached maps while parsing newly added `.osu`
@@ -108,7 +113,7 @@ After writing, start osu! and check the Collections tab.
 The app can detect installed maps that reference missing required files, such as missing audio or
 background files.
 
-Open the `Repairs and delete` tab to fix them. Each affected beatmapset lists its missing files
+Open the `Maintenance` tab to fix them. Each affected beatmapset lists its missing files
 and has its own `Repair this set` button (or use `Repair all`). Repair redownloads the
 beatmapset through the built-in backend and restores only the missing files,
 so your local scores and edits are left untouched. The log reports where each download came from
@@ -125,7 +130,7 @@ Your osu! OAuth app must have its callback URL set to exactly
 ## Updating Outdated Maps
 
 osu! marks maps with `update to latest version` when the installed `.osu` file no longer matches
-the online version. The `Repairs and delete` tab has an `Update outdated beatmaps` section that
+the online version. The `Maintenance` tab has an `Update outdated beatmaps` section that
 does the same comparison in bulk:
 
 1. Click `Check for updates`. The app compares every installed difficulty that has an online
@@ -140,6 +145,40 @@ does the same comparison in bulk:
 
 Sets that no longer exist online are reported and skipped. Difficulties without an online
 beatmap id cannot be checked.
+
+## Cleaning up Non-Standard Modes
+
+The `Maintenance` tab has a `Clean up non-std modes` section that removes natively mapped
+taiko, catch, and mania `.osu` files from your library. Tick the modes you want gone, then
+click `Delete selected non-std maps` and confirm.
+
+Converted maps share the original std `.osu` file, so only natively mapped taiko/catch/mania
+files can appear here — the original std difficulties are never touched. Deletion is
+permanent: the files are removed from disk (not moved to the Recycle Bin), so make sure the
+selection matches what you want before confirming.
+
+## Editing Skins
+
+The `Skin Editor` tab lists the skins found in your `<osu root>/Skins` folder and previews
+each one with a mock gameplay view drawn from the skin's own elements — hit circles with the
+`skin.ini` combo colours, approach circles, combo numbers and a moving cursor, honouring the
+`skin.ini` switches that visibly change circles and the cursor.
+
+From there you can:
+
+- Replace any element with an asset pooled from every installed skin, and import your own
+  image files straight into the matching element slots.
+- Scale the cursor with a single `Cursor size` control that keeps each file's exact pixel
+  canvas.
+- Save the result as a complete copy of the base skin named `<skin name> v1` (then `v2`, and
+  so on, skipping versions that already exist). The base skin is never modified.
+
+## Updating the App
+
+The `↻ Update` button in the sidebar opens an `App update` window that checks GitHub Releases
+for a newer version. If one is available, `Download & restart` fetches it, replaces the app
+executable, and restarts the app automatically. Checking is manual; nothing happens in the
+background.
 
 ## Exporting a Map List
 
