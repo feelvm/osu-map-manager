@@ -356,13 +356,23 @@ fn parse_ini_bool(value: &str) -> Option<bool> {
 /// Sanitises a `[Fonts]` path prefix (`Assets/default/default`): forward
 /// slashes, no leading `./` or `/`, and never escaping the skin folder.
 fn sanitise_prefix(raw: &str) -> Option<String> {
-    let mut prefix = raw.split("//").next().unwrap_or(raw).trim().replace('\\', "/");
+    let mut prefix = raw
+        .split("//")
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .replace('\\', "/");
     while prefix.starts_with("./") {
         prefix = prefix[2..].to_owned();
     }
-    prefix = prefix.trim_start_matches('/').trim_end_matches('/').to_owned();
+    prefix = prefix
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_owned();
     if prefix.is_empty()
-        || prefix.split('/').any(|part| part.is_empty() || part == ".." || part == ".")
+        || prefix
+            .split('/')
+            .any(|part| part.is_empty() || part == ".." || part == ".")
         || prefix.contains(':')
     {
         return None;
@@ -476,17 +486,16 @@ fn read_skin_meta(path: &Path) -> SkinMeta {
                 meta.hitcircle_prefix = sanitise_prefix(value);
             }
         } else if (section == "colours" || section == "colors")
-            && let Some(number) = key.strip_prefix("combo").and_then(|rest| {
-                rest.trim().parse::<u32>().ok().filter(|n| *n >= 1)
-            })
+            && let Some(number) = key
+                .strip_prefix("combo")
+                .and_then(|rest| rest.trim().parse::<u32>().ok().filter(|n| *n >= 1))
             && let Some(colour) = parse_colour(value)
         {
             combos.insert(number, colour);
         }
     }
     meta.combo_colours = combos.into_values().collect();
-    meta.render_opts.overlay_above_number =
-        overlay_above.or(overlay_above_typo).unwrap_or(true);
+    meta.render_opts.overlay_above_number = overlay_above.or(overlay_above_typo).unwrap_or(true);
     meta
 }
 
@@ -541,11 +550,7 @@ fn collect_nested_candidates(root: &Path) -> Vec<(String, PathBuf, usize)> {
                 }
                 walk(&path, depth + 1, out);
             } else if path.is_file() {
-                out.push((
-                    entry.file_name().to_string_lossy().to_string(),
-                    path,
-                    depth,
-                ));
+                out.push((entry.file_name().to_string_lossy().to_string(), path, depth));
             }
         }
     }
@@ -1974,11 +1979,13 @@ struct DecodedTexture {
 
 /// `hitcircle@2x.png` → true.
 fn path_is_2x(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-        name.to_ascii_lowercase()
-            .rsplit_once('.')
-            .is_some_and(|(stem, _)| stem.ends_with("@2x"))
-    })
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.to_ascii_lowercase()
+                .rsplit_once('.')
+                .is_some_and(|(stem, _)| stem.ends_with("@2x"))
+        })
 }
 
 fn decode_texture(path: &Path, max_dim: u32) -> Result<DecodedTexture> {
@@ -2115,7 +2122,8 @@ impl SkinEditorState {
             scan_rx: None,
             selected: None,
             overrides: BTreeMap::new(),
-            cursor_resize: 1.0,            force_rescan: false,
+            cursor_resize: 1.0,
+            force_rescan: false,
             tex: HashMap::new(),
             tex_order: Vec::new(),
             failed: HashSet::new(),
@@ -2274,9 +2282,7 @@ impl SkinEditorState {
                             self.pending_select_folder = Some(outcome.name.clone());
                             let mut message = format!(
                                 "Saved \"{}\" — {} file(s) copied, {} element(s) replaced",
-                                outcome.name,
-                                outcome.files_copied,
-                                outcome.overrides_applied
+                                outcome.name, outcome.files_copied, outcome.overrides_applied
                             );
                             if outcome.resizes_applied > 0 {
                                 message.push_str(&format!(", {} resized", outcome.resizes_applied));
@@ -2521,13 +2527,8 @@ impl SkinEditorState {
                         skin.render_opts,
                     )
                 };
-                let assets = self.load_scene_assets(
-                    &elements,
-                    THUMB_DIM,
-                    combo_colours,
-                    render_opts,
-                    1.0,
-                );
+                let assets =
+                    self.load_scene_assets(&elements, THUMB_DIM, combo_colours, render_opts, 1.0);
                 let painter = ui.painter_at(rect);
                 draw_scene(&painter, rect, &assets, time);
                 if row_selected {
@@ -3026,11 +3027,13 @@ impl SkinEditorState {
         });
         if let Some(status) = &self.import_status {
             ui.label(
-                egui::RichText::new(status).small().color(if self.import_ok {
-                    egui::Color32::from_rgb(0x7f, 0xa6, 0x86)
-                } else {
-                    egui::Color32::from_rgb(0xc2, 0x6b, 0x72)
-                }),
+                egui::RichText::new(status)
+                    .small()
+                    .color(if self.import_ok {
+                        egui::Color32::from_rgb(0x7f, 0xa6, 0x86)
+                    } else {
+                        egui::Color32::from_rgb(0xc2, 0x6b, 0x72)
+                    }),
             );
         }
         ui.add_space(4.0);
@@ -3894,8 +3897,7 @@ fn draw_scene(painter: &egui::Painter, rect: egui::Rect, assets: &SceneAssets, t
             break;
         };
         let alpha = (1.0 - step as f32 / 7.0) * 0.85;
-        let height =
-            dim(if assets.trail.is_some() { 40.0 } else { 36.0 }) * assets.cursor_scale;
+        let height = dim(if assets.trail.is_some() { 40.0 } else { 36.0 }) * assets.cursor_scale;
         let width = height * texture_aspect(texture);
         draw_cursor_quad(
             painter,
@@ -3978,16 +3980,11 @@ fn draw_circle(
             }
             None => size * anim,
         };
-        let approach_box =
-            egui::Rect::from_center_size(center, egui::vec2(outer, outer));
+        let approach_box = egui::Rect::from_center_size(center, egui::vec2(outer, outer));
         match &assets.approach {
             Some(texture) => draw_fitted(painter, texture, approach_box, tint),
             None => {
-                painter.circle_stroke(
-                    center,
-                    outer * 0.5,
-                    egui::Stroke::new(2.0_f32, tint),
-                );
+                painter.circle_stroke(center, outer * 0.5, egui::Stroke::new(2.0_f32, tint));
             }
         };
     }
@@ -4693,14 +4690,11 @@ mod tests {
         let posix = |path: &Path| path.to_string_lossy().replace('\\', "/");
         let scanned = scan_skins(&skins);
         let white = scanned.iter().find(|s| s.folder_name == "White").unwrap();
-        assert!(posix(&white.elements["default-2.png"])
-            .ends_with("Assets/default/default-2@2x.png"));
-        assert!(posix(&white.elements["default-3.png"])
-            .ends_with("Assets/default/default-3.png"));
-        let custom = scanned
-            .iter()
-            .find(|s| s.folder_name == "Custom")
-            .unwrap();
+        assert!(
+            posix(&white.elements["default-2.png"]).ends_with("Assets/default/default-2@2x.png")
+        );
+        assert!(posix(&white.elements["default-3.png"]).ends_with("Assets/default/default-3.png"));
+        let custom = scanned.iter().find(|s| s.folder_name == "Custom").unwrap();
         assert!(posix(&custom.elements["default-4.png"]).ends_with("fx/hit-4@2x.png"));
         let plain = scanned.iter().find(|s| s.folder_name == "Plain").unwrap();
         assert_eq!(
