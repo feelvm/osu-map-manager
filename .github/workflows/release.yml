@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  # Releases are published from the web UI, which creates the tag on
+  # publish; this guarantees a stamped build is attached to the published
+  # release even when the tag-push event does not fire.
+  release:
+    types: [published]
+
+# Publishing a release can fire both triggers at once; keep a single build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
