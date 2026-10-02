@@ -1969,7 +1969,9 @@ const RESIZE_STEP: f32 = 0.05;
 struct DecodedTexture {
     image: egui::ColorImage,
     /// Any opaque pixel at all? Instafade skins ship circle layers that are
-    /// fully transparent — the game draws nothing for them.
+    /// fully transparent — the game draws nothing for them. Only asserted from
+    /// tests, hence the allowance.
+    #[allow(dead_code)]
     visible: bool,
     /// Trimmed artwork height in 1x game units: file pixels, halved for `@2x`
     /// files (the game draws those at half their pixel size). Computed before
@@ -3019,10 +3021,9 @@ impl SkinEditorState {
                      filed into the element slot its file name matches.",
                 )
                 .clicked()
+                && let Some(folder) = rfd::FileDialog::new().pick_folder()
             {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    self.import_folder(&folder);
-                }
+                self.import_folder(&folder);
             }
         });
         if let Some(status) = &self.import_status {
@@ -4664,7 +4665,7 @@ mod tests {
         let nested = white.join("Assets").join("default");
         fs::create_dir_all(&nested).unwrap();
         fs::write(
-            &white.join("skin.ini"),
+            white.join("skin.ini"),
             "[General]\nName: White\n\n[Fonts]\nHitCirclePrefix: Assets/default/default\n",
         )
         .unwrap();
@@ -4674,7 +4675,7 @@ mod tests {
         let custom = skins.join("Custom");
         fs::create_dir_all(custom.join("fx")).unwrap();
         fs::write(
-            &custom.join("skin.ini"),
+            custom.join("skin.ini"),
             "[General]\nName: Custom\n\n[Fonts]\nHitCirclePrefix: fx/hit\n",
         )
         .unwrap();
