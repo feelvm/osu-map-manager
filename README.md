@@ -17,6 +17,7 @@ star rating, length, mode, and other fields, then write the selected results int
 - Export a TSV list of selected maps for review.
 - Detect maps with missing audio or background files.
 - Repair affected beatmapsets.
+- Ignore missing backgrounds if you deleted them to save space.
 - Delete natively mapped taiko, catch, or mania `.osu` files you do not want.
 - Preview installed skins and remix their elements in the Skin Editor.
 - Update the app itself from GitHub Releases.
@@ -118,6 +119,11 @@ and has its own `Repair this set` button (or use `Repair all`). Repair redownloa
 beatmapset through the built-in backend and restores only the missing files,
 so your local scores and edits are left untouched. The log reports where each download came from
 and which files were restored; repaired folders are rescanned automatically afterwards.
+
+If you deleted beatmap backgrounds yourself to save space, turn on `Ignore missing backgrounds`
+(sidebar `⚙ Advanced` section, or the `Maintenance` tab): missing-background findings then
+disappear from the issue counts, lists and repair jobs, while missing audio is still reported.
+The choice is saved per library.
 
 For downloads via the official osu! API, click `Sign in with osu!`. This opens osu! in your
 browser and completes through the backend Worker (which holds the OAuth client secret), then the

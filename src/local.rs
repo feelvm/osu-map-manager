@@ -101,6 +101,12 @@ pub struct RepairIssue {
     pub beatmap: PathBuf,
     pub message: String,
     pub severity: RepairSeverity,
+    /// Filename the issue is about (audio/background), carried from the scan
+    /// so repair grouping can list what to restore without re-statting every
+    /// flagged file. `None` for parse warnings and for scan caches written by
+    /// older builds (`serde(default)` keeps those caches loadable).
+    #[serde(default)]
+    pub missing_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +304,7 @@ fn scan_songs_dir_streaming_inner(
                             ParseIssueKind::ParseError => err.to_string(),
                         },
                         severity: RepairSeverity::ParseWarning,
+                        missing_file: None,
                     };
                     let _ = tx.send(ScanEvent::Problem { issue });
                 }
@@ -547,6 +554,7 @@ fn find_repair_issues(map: &LocalBeatmap) -> Vec<RepairIssue> {
                 beatmap: map.path.clone(),
                 message: format!("Missing audio file: {audio}"),
                 severity: RepairSeverity::MissingRequiredFile,
+                missing_file: Some(audio.clone()),
             });
         }
     }
@@ -557,6 +565,7 @@ fn find_repair_issues(map: &LocalBeatmap) -> Vec<RepairIssue> {
                 beatmap: map.path.clone(),
                 message: format!("Missing background file: {background}"),
                 severity: RepairSeverity::MissingRequiredFile,
+                missing_file: Some(background.clone()),
             });
         }
     }
@@ -748,10 +757,22 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Tests run in parallel and must not share one temp folder: one test's
+    /// cleanup would delete another test's audio file mid-assert.
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
     #[test]
     fn missing_background_is_not_reported_when_map_has_no_background() {
-        let folder =
-            std::env::temp_dir().join(format!("osu-map-manager-test-{}", std::process::id()));
+        let folder = unique_temp_dir("osu-map-manager-test-nobg");
         fs::create_dir_all(&folder).unwrap();
         let osu_path = folder.join("no-bg.osu");
         let mut file = fs::File::create(&osu_path).unwrap();
@@ -792,6 +813,63 @@ ApproachRate:9
         assert!(issues.is_empty());
 
         let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn missing_file_issues_carry_their_filename() {
+        let folder = unique_temp_dir("osu-map-manager-test-bg");
+        fs::create_dir_all(&folder).unwrap();
+        let osu_path = folder.join("deleted-bg.osu");
+        let mut file = fs::File::create(&osu_path).unwrap();
+        writeln!(
+            file,
+            "osu file format v14
+
+[General]
+AudioFilename: audio.mp3
+
+[Metadata]
+Title:Deleted Background
+Artist:Test
+Creator:Mapper
+Version:Normal
+BeatmapSetID:123
+BeatmapID:456
+
+[Events]
+//Background and Video events
+0,0,\"bg.jpg\",0,0
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+
+[HitObjects]
+256,192,1000,1,0,0:0:0:0:"
+        )
+        .unwrap();
+        fs::write(folder.join("audio.mp3"), b"fake").unwrap();
+
+        let map = parse_osu_file(&osu_path).unwrap();
+        let issues = find_repair_issues(&map);
+
+        // The background was deleted (the whole point of the issue report);
+        // audio is present, so exactly one issue and it names the file.
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].missing_file.as_deref(), Some("bg.jpg"));
+
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn issues_from_older_caches_without_missing_file_still_load() {
+        // Scan caches written before `missing_file` existed must keep loading.
+        let issue: RepairIssue = serde_json::from_str(
+            r#"{"beatmap":"C:\\osu!\\Songs\\1\\map.osu","message":"Missing background file: bg.jpg","severity":"MissingRequiredFile"}"#,
+        )
+        .unwrap();
+        assert_eq!(issue.severity, RepairSeverity::MissingRequiredFile);
+        assert_eq!(issue.missing_file, None);
     }
 
     #[test]

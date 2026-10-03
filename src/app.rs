@@ -24,11 +24,26 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const BEATMAPSET_DOWNLOAD_DELAY: Duration = Duration::from_secs(2);
 const SCAN_CACHE_VERSION: u32 = 5;
+/// Minimum interval between repair-job rebuilds while a scan is streaming.
+/// When many maps have missing files, `problems.len()` (part of the rebuild
+/// key) grows on every streamed map event, so without this the whole-library
+/// rebuild runs nearly every frame for the entire scan.
+const REPAIR_JOBS_REBUILD_INTERVAL: Duration = Duration::from_secs(1);
+/// Job cards rendered on the Maintenance tab before the list is cut off. When
+/// every map is flagged (e.g. deleted backgrounds) there can be thousands of
+/// cards and egui lays all of them out on every frame the tab is open; the
+/// totals above the list and `Repair all` still cover the full set.
+const MAX_RENDERED_REPAIR_JOBS: usize = 200;
+/// Raw issue rows rendered before the list is cut off (same rationale).
+const MAX_RENDERED_REPAIR_ISSUES: usize = 500;
+/// Most recent repair-log entries rendered; older ones stay hidden while the
+/// totals and progress bar above cover the whole batch.
+const MAX_RENDERED_REPAIR_LOG: usize = 50;
 const BACKGROUND_CACHE_LIMIT: usize = 24;
 const BACKGROUND_PREVIEW_WIDTH: u16 = 1200;
 const BACKGROUND_PREVIEW_HEIGHT: u16 = 675;
@@ -95,6 +110,9 @@ pub struct MapManagerApp {
     scan_generation: u64,
     repair_jobs_cache: Vec<RepairJob>,
     repair_jobs_cache_key: String,
+    /// Last time the repair-jobs cache was rebuilt, used to rate-limit
+    /// rebuilds while a scan is streaming (see `refresh_repair_jobs`).
+    repair_jobs_last_rebuild: Instant,
     scan: Option<LibraryScan>,
     is_scanning: bool,
     is_repairing: bool,
@@ -495,6 +513,11 @@ enum RepairLogStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RepairIgnoreStore {
     entries: Vec<IgnoredRepairIssue>,
+    /// When set, missing-background issues are hidden from counts, lists and
+    /// repair jobs entirely — for libraries whose backgrounds were deleted
+    /// deliberately to save space. Persisted so the choice survives restarts.
+    #[serde(default)]
+    ignore_missing_backgrounds: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,11 +583,16 @@ impl MapManagerApp {
                 .iter()
                 .filter(|map| matches_visible_filters(&filters, map))
                 .count();
+            let repair_issues = visible_problems(
+                &scan.problems,
+                repair_ignores.ignore_missing_backgrounds,
+            )
+            .count();
             format!(
                 "Loaded cached scan: {matching_maps} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
                 scan.maps.len(),
                 scan.sets.len(),
-                scan.problems.len()
+                repair_issues
             )
         });
 
@@ -598,6 +626,7 @@ impl MapManagerApp {
             scan_generation: 0,
             repair_jobs_cache: Vec::new(),
             repair_jobs_cache_key: String::new(),
+            repair_jobs_last_rebuild: Instant::now(),
             scan: cached_scan,
             is_scanning: false,
             is_repairing: false,
@@ -767,6 +796,8 @@ impl MapManagerApp {
                         self.is_scanning = false;
                         self.scan_cancel = None;
                         self.scan_generation += 1;
+                        let ignore_missing_backgrounds =
+                            self.repair_ignores.ignore_missing_backgrounds;
                         let cache_root = self.osu_root();
                         if let Some(scan) = &mut self.scan {
                             scan.sets = sets;
@@ -775,12 +806,15 @@ impl MapManagerApp {
                                 .iter()
                                 .filter(|map| matches_visible_filters(&self.filters, map))
                                 .count();
+                            let repair_issues =
+                                visible_problems(&scan.problems, ignore_missing_backgrounds)
+                                    .count();
                             self.status = format!(
                                 "Scan complete: {} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
                                 matching_maps,
                                 scan.maps.len(),
                                 scan.sets.len(),
-                                scan.problems.len()
+                                repair_issues
                             );
                             if let Err(err) = save_scan_cache(&cache_root, scan) {
                                 self.status =
@@ -795,6 +829,8 @@ impl MapManagerApp {
                         self.is_scanning = false;
                         self.scan_cancel = None;
                         self.scan_generation += 1;
+                        let ignore_missing_backgrounds =
+                            self.repair_ignores.ignore_missing_backgrounds;
                         if let Some(scan) = &mut self.scan {
                             scan.sets = sets;
                             let matching_maps = scan
@@ -802,12 +838,15 @@ impl MapManagerApp {
                                 .iter()
                                 .filter(|map| matches_visible_filters(&self.filters, map))
                                 .count();
+                            let repair_issues =
+                                visible_problems(&scan.problems, ignore_missing_backgrounds)
+                                    .count();
                             self.status = format!(
                                 "Scan stopped: {} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
                                 matching_maps,
                                 scan.maps.len(),
                                 scan.sets.len(),
-                                scan.problems.len()
+                                repair_issues
                             );
                         } else {
                             self.status = "Scan stopped".to_owned();
@@ -1367,10 +1406,14 @@ impl MapManagerApp {
                                 self.background_preview_error = None;
                             }
                         }
-                        Err(err) => {
+                        Err(_) => {
                             if self.background_preview_path.as_deref() == Some(&path) {
+                                // Kept short on purpose: the underlying cause
+                                // (unreadable/corrupt image) is not actionable
+                                // in-app, and the long chain-typed error with
+                                // the full path overflows the preview box.
                                 self.background_preview_error =
-                                    Some(format!("Could not load background: {err:#}"));
+                                    Some("Could not load background".to_owned());
                             }
                         }
                     }
@@ -1828,7 +1871,7 @@ impl MapManagerApp {
             return;
         }
 
-        self.refresh_repair_jobs();
+        self.refresh_repair_jobs_now();
         let jobs = self.repair_jobs_cache.clone();
         if jobs.is_empty() {
             self.status = "No repairable corrupted beatmapsets found".to_owned();
@@ -1844,7 +1887,7 @@ impl MapManagerApp {
             return;
         }
 
-        self.refresh_repair_jobs();
+        self.refresh_repair_jobs_now();
         let Some(job) = self
             .repair_jobs_cache
             .iter()
@@ -2700,22 +2743,51 @@ impl MapManagerApp {
         let Some(scan) = &self.scan else {
             return String::new();
         };
+        // The opt-out flag is part of the key so toggling the checkbox
+        // regroups the jobs immediately, without a rescan.
         format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             self.scan_generation,
             scan.maps.len(),
-            scan.problems.len()
+            scan.problems.len(),
+            self.repair_ignores.ignore_missing_backgrounds
         )
     }
 
+    /// Rebuilds the repair-jobs cache when the scan changed. While a scan is
+    /// streaming, rebuilds are rate-limited to [`REPAIR_JOBS_REBUILD_INTERVAL`]:
+    /// with many flagged maps (e.g. deleted backgrounds) the key changes on
+    /// every streamed map event, and an O(library) rebuild per frame froze the
+    /// UI for the whole scan.
     fn refresh_repair_jobs(&mut self) {
+        self.refresh_repair_jobs_limited(false);
+    }
+
+    /// Unthrottled rebuild for user-initiated actions that must act on the
+    /// current problems (repair all / repair single), even mid-scan.
+    fn refresh_repair_jobs_now(&mut self) {
+        self.refresh_repair_jobs_limited(true);
+    }
+
+    fn refresh_repair_jobs_limited(&mut self, force: bool) {
         let key = self.repair_jobs_cache_key();
         if key == self.repair_jobs_cache_key {
             return;
         }
-
-        self.repair_jobs_cache = self.scan.as_ref().map(repair_jobs).unwrap_or_default();
+        if !force
+            && self.is_scanning
+            && self.repair_jobs_last_rebuild.elapsed() < REPAIR_JOBS_REBUILD_INTERVAL
+        {
+            return;
+        }
+        let ignore_missing_backgrounds = self.repair_ignores.ignore_missing_backgrounds;
+        self.repair_jobs_cache = self
+            .scan
+            .as_ref()
+            .map(|scan| repair_jobs(scan, ignore_missing_backgrounds))
+            .unwrap_or_default();
         self.repair_jobs_cache_key = key;
+        self.repair_jobs_last_rebuild = Instant::now();
     }
 
     fn clear_selection(&mut self) {
@@ -4164,6 +4236,10 @@ impl eframe::App for MapManagerApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
+        // Set from both checkbox sites (sidebar Advanced section and the
+        // Maintenance card); persistence happens after the panels below.
+        let mut ignore_backgrounds_toggled = false;
+
         egui::TopBottomPanel::top("top")
             .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
@@ -4362,6 +4438,9 @@ impl eframe::App for MapManagerApp {
                         .show(ui, |ui| {
                             ui.checkbox(&mut self.skip_parse_timeouts, "Skip map parse timeouts");
                             ui.checkbox(&mut self.skip_parse_errors, "Skip map parse errors");
+                            if ignore_backgrounds_checkbox(&mut self.repair_ignores, ui) {
+                                ignore_backgrounds_toggled = true;
+                            }
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("osu! search text").strong());
                             let mut query_text = self.filters.to_osu_search();
@@ -4455,20 +4534,24 @@ impl eframe::App for MapManagerApp {
                         );
                         ui.separator();
                         if let Some(scan) = &self.scan {
-                            let missing = scan
-                                .problems
-                                .iter()
-                                .filter(|issue| {
-                                    issue.severity
-                                        == crate::local::RepairSeverity::MissingRequiredFile
-                                })
-                                .count();
+                            let ignore_missing_backgrounds =
+                                self.repair_ignores.ignore_missing_backgrounds;
+                            let missing = visible_problems(
+                                &scan.problems,
+                                ignore_missing_backgrounds,
+                            )
+                            .filter(|issue| {
+                                issue.severity
+                                    == crate::local::RepairSeverity::MissingRequiredFile
+                            })
+                            .count();
                             ui.label(egui::RichText::new("Library health").strong());
                             ui.label(format!(
                                 "{} maps · {} sets · {} issue(s)",
                                 scan.maps.len(),
                                 scan.sets.len(),
-                                scan.problems.len()
+                                visible_problems(&scan.problems, ignore_missing_backgrounds)
+                                    .count()
                             ));
                             ui.label(format!(
                                 "{} missing-file · {} outdated",
@@ -4550,7 +4633,15 @@ impl eframe::App for MapManagerApp {
                         } else {
                             let (scanned_maps, scanned_sets, repair_issues) =
                                 self.scan.as_ref().map_or((0, 0, 0), |scan| {
-                                    (scan.maps.len(), scan.sets.len(), scan.problems.len())
+                                    (
+                                        scan.maps.len(),
+                                        scan.sets.len(),
+                                        visible_problems(
+                                            &scan.problems,
+                                            self.repair_ignores.ignore_missing_backgrounds,
+                                        )
+                                        .count(),
+                                    )
                             });
                             section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing = card_item_spacing;
@@ -4624,13 +4715,16 @@ impl eframe::App for MapManagerApp {
 
                                 if let Some(scan) = &self.scan {
                                     let jobs = &self.repair_jobs_cache;
-                                    let missing_file_issues = scan
-                                        .problems
-                                        .iter()
-                                        .filter(|issue| {
-                                            issue.severity == RepairSeverity::MissingRequiredFile
-                                        })
-                                        .count();
+                                    let ignore_missing_backgrounds =
+                                        self.repair_ignores.ignore_missing_backgrounds;
+                                    let missing_file_issues = visible_problems(
+                                        &scan.problems,
+                                        ignore_missing_backgrounds,
+                                    )
+                                    .filter(|issue| {
+                                        issue.severity == RepairSeverity::MissingRequiredFile
+                                    })
+                                    .count();
                                     section_frame(ctx.style().as_ref()).show(ui, |ui| {
                                         ui.spacing_mut().item_spacing = card_item_spacing;
                                         fill_tile_width(ui);
@@ -4646,6 +4740,16 @@ impl eframe::App for MapManagerApp {
                                         muted_label(
                                             ui,
                                             "Redownloads the set and restores only the missing files — scores and edits are kept.",
+                                        );
+                                        if ignore_backgrounds_checkbox(
+                                            &mut self.repair_ignores,
+                                            ui,
+                                        ) {
+                                            ignore_backgrounds_toggled = true;
+                                        }
+                                        muted_label(
+                                            ui,
+                                            "Turn on if backgrounds were deleted to save space: they disappear from issue counts and repairs. Missing audio is still reported.",
                                         );
                                         ui.horizontal_wrapped(|ui| {
                                             if self.oauth_session.is_some() {
@@ -4734,7 +4838,22 @@ impl eframe::App for MapManagerApp {
                                                 .id_source("repairable_sets")
                                                 .max_height(280.0)
                                                 .show(ui, |ui| {
-                                                    for entry in &self.repair_log {
+                                                    let log_skip = self
+                                                        .repair_log
+                                                        .len()
+                                                        .saturating_sub(MAX_RENDERED_REPAIR_LOG);
+                                                    if log_skip > 0 {
+                                                        muted_label(
+                                                            ui,
+                                                            format!(
+                                                                "… {} earlier log entr(ies) hidden",
+                                                                log_skip
+                                                            ),
+                                                        );
+                                                    }
+                                                    for entry in
+                                                        &self.repair_log[log_skip..]
+                                                    {
                                                         status_log_label(
                                                             ui,
                                                             entry.status,
@@ -4745,7 +4864,8 @@ impl eframe::App for MapManagerApp {
                                                             &entry.message,
                                                         );
                                                     }
-                                                    for job in jobs {
+                                                    for job in jobs.iter().take(MAX_RENDERED_REPAIR_JOBS)
+                                                    {
                                                         let beatmapset_id = job.beatmapset_id;
                                                         nested_frame(ui.style()).show(ui, |ui| {
                                                             fill_tile_width(ui);
@@ -4785,14 +4905,37 @@ impl eframe::App for MapManagerApp {
                                                             }
                                                         });
                                                     }
+                                                    if jobs.len() > MAX_RENDERED_REPAIR_JOBS {
+                                                        muted_label(
+                                                            ui,
+                                                            format!(
+                                                                "… {} more set(s) hidden — “Repair all” still covers them",
+                                                                jobs.len() - MAX_RENDERED_REPAIR_JOBS
+                                                            ),
+                                                        );
+                                                    }
                                                 });
-                                        } else if !scan.problems.is_empty() {
+                                        } else if visible_problems(
+                                            &scan.problems,
+                                            ignore_missing_backgrounds,
+                                        )
+                                        .count()
+                                            > 0
+                                        {
                                             ui.add_space(6.0);
+                                            let visible_issues: Vec<_> = visible_problems(
+                                                &scan.problems,
+                                                ignore_missing_backgrounds,
+                                            )
+                                            .collect();
                                             egui::ScrollArea::vertical()
                                                 .id_source("repair")
                                                 .max_height(240.0)
                                                 .show(ui, |ui| {
-                                                    for issue in &scan.problems {
+                                                    for issue in visible_issues
+                                                        .iter()
+                                                        .take(MAX_RENDERED_REPAIR_ISSUES)
+                                                    {
                                                         let severity = match issue.severity {
                                                             RepairSeverity::MissingRequiredFile => {
                                                                 "missing"
@@ -4805,6 +4948,18 @@ impl eframe::App for MapManagerApp {
                                                                 "{severity}: {} ({})",
                                                                 issue.message,
                                                                 issue.beatmap.display()
+                                                            ),
+                                                        );
+                                                    }
+                                                    if visible_issues.len()
+                                                        > MAX_RENDERED_REPAIR_ISSUES
+                                                    {
+                                                        muted_label(
+                                                            ui,
+                                                            format!(
+                                                                "… {} more issue(s) hidden",
+                                                                visible_issues.len()
+                                                                    - MAX_RENDERED_REPAIR_ISSUES
                                                             ),
                                                         );
                                                     }
@@ -5105,6 +5260,22 @@ impl eframe::App for MapManagerApp {
         }
         if let Some(beatmapset_id) = repair_single_requested {
             self.start_repair_single(beatmapset_id);
+        }
+        if ignore_backgrounds_toggled {
+            // The repair-jobs cache key includes the flag, so counts and jobs
+            // update on the next refresh; only the persistence is left here.
+            match save_repair_ignores(&self.osu_root(), &self.repair_ignores) {
+                Ok(()) => {
+                    self.status = if self.repair_ignores.ignore_missing_backgrounds {
+                        "Missing backgrounds are now ignored".to_owned()
+                    } else {
+                        "Missing backgrounds are checked again".to_owned()
+                    };
+                }
+                Err(err) => {
+                    self.status = format!("Saving repair settings failed: {err:#}");
+                }
+            }
         }
         if update_check_requested {
             self.start_update_check();
@@ -5839,23 +6010,63 @@ fn format_duration(seconds: f32) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
-fn repair_jobs(scan: &LibraryScan) -> Vec<RepairJob> {
-    let corrupted_paths: BTreeSet<_> = scan
-        .problems
+/// Whether an issue is about a missing background (as opposed to missing
+/// audio or a parse warning). Matches the stable message text so scan caches
+/// written before issues carried `missing_file` are covered too.
+fn is_missing_background_issue(issue: &local::RepairIssue) -> bool {
+    issue
+        .message
+        .to_ascii_lowercase()
+        .contains("missing background file")
+}
+
+/// The missing-background opt-out checkbox, shared by the sidebar's Advanced
+/// section and the Maintenance card. Updates the persisted ignore store in
+/// place; returns true when the value changed and the caller should save it.
+fn ignore_backgrounds_checkbox(store: &mut RepairIgnoreStore, ui: &mut egui::Ui) -> bool {
+    let mut ignore = store.ignore_missing_backgrounds;
+    let changed = ui
+        .checkbox(&mut ignore, "Ignore missing backgrounds")
+        .changed();
+    if changed {
+        store.ignore_missing_backgrounds = ignore;
+    }
+    changed
+}
+
+/// Problems left after the missing-background opt-out (see
+/// [`RepairIgnoreStore::ignore_missing_backgrounds`]). Every count, list and
+/// repair grouping must go through this so the checkbox takes effect
+/// everywhere at once, including on already-cached scans.
+fn visible_problems(
+    problems: &[local::RepairIssue],
+    ignore_missing_backgrounds: bool,
+) -> impl Iterator<Item = &local::RepairIssue> {
+    problems
         .iter()
+        .filter(move |issue| !(ignore_missing_backgrounds && is_missing_background_issue(issue)))
+}
+
+fn repair_jobs(scan: &LibraryScan, ignore_missing_backgrounds: bool) -> Vec<RepairJob> {
+    let corrupted_paths: BTreeSet<_> = visible_problems(&scan.problems, ignore_missing_backgrounds)
         .filter(|issue| issue.severity == RepairSeverity::MissingRequiredFile)
         .map(|issue| issue.beatmap.clone())
         .collect();
     let mut issue_messages = BTreeMap::<PathBuf, Vec<String>>::new();
-    for issue in scan
-        .problems
-        .iter()
+    let mut issue_missing_files = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for issue in visible_problems(&scan.problems, ignore_missing_backgrounds)
         .filter(|issue| issue.severity == RepairSeverity::MissingRequiredFile)
     {
         issue_messages
             .entry(issue.beatmap.clone())
             .or_default()
             .push(issue.message.clone());
+        if let Some(file) = &issue.missing_file {
+            issue_missing_files
+                .entry(issue.beatmap.clone())
+                .or_default()
+                .insert(file.clone());
+        }
     }
 
     let mut grouped = BTreeMap::<
@@ -5877,8 +6088,19 @@ fn repair_jobs(scan: &LibraryScan) -> Vec<RepairJob> {
             let entry = grouped.entry(beatmapset_id).or_default();
             entry.0.push(map.label());
             entry.1.insert(map.folder.clone());
-            for missing in missing_asset_filenames(map) {
-                entry.3.insert(missing);
+            match issue_missing_files.get(&map.path) {
+                // The scan already determined which files are missing; reusing
+                // the filenames it attached to the issues keeps this rebuild
+                // (which used to run once per streamed map event) free of disk
+                // access even when every map in the library is flagged.
+                Some(files) => entry.3.extend(files.iter().cloned()),
+                // Scan caches written before issues carried their filename:
+                // re-derive by checking the referenced files on disk.
+                None => {
+                    for missing in missing_asset_filenames(map, ignore_missing_backgrounds) {
+                        entry.3.insert(missing);
+                    }
+                }
             }
             for message in issue_messages.get(&map.path).into_iter().flatten() {
                 let file = map
@@ -5924,17 +6146,20 @@ fn repair_jobs(scan: &LibraryScan) -> Vec<RepairJob> {
         .collect()
 }
 
-/// Asset file names the scanner flagged as missing for this map. Derived from
-/// the map's own audio/background references (not by parsing message text) so
-/// the repair knows exactly which files to restore from the download.
-fn missing_asset_filenames(map: &LocalBeatmap) -> Vec<String> {
+/// Asset file names missing for this map, derived by checking the map's own
+/// audio/background references on disk. Fallback for scan caches written
+/// before [`RepairIssue`] carried `missing_file`; current scans reuse the
+/// filenames attached to the issues instead of re-statting every flagged file.
+/// Backgrounds are skipped when the missing-background opt-out is set.
+fn missing_asset_filenames(map: &LocalBeatmap, ignore_missing_backgrounds: bool) -> Vec<String> {
     let mut missing = Vec::new();
     if let Some(audio) = &map.audio_filename
         && !map.folder.join(audio).exists()
     {
         missing.push(audio.clone());
     }
-    if let Some(background) = &map.background_filename
+    if !ignore_missing_backgrounds
+        && let Some(background) = &map.background_filename
         && !map.folder.join(background).exists()
     {
         missing.push(background.clone());
@@ -6824,5 +7049,168 @@ mod tests {
         assert!(err.to_string().contains("gone.mp3"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn flagged_scan(folder: &Path, osu_path: &Path, missing_file: Option<String>) -> LibraryScan {
+        let map = LocalBeatmap {
+            path: osu_path.to_owned(),
+            folder: folder.to_owned(),
+            md5: "map-md5".into(),
+            beatmapset_id: Some(12345),
+            background_filename: Some("bg.jpg".into()),
+            ..Default::default()
+        };
+        LibraryScan {
+            maps: vec![map],
+            problems: vec![local::RepairIssue {
+                beatmap: osu_path.to_owned(),
+                message: "Missing background file: bg.jpg".into(),
+                severity: RepairSeverity::MissingRequiredFile,
+                missing_file,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repair_jobs_reuse_issue_carried_filenames_without_disk_checks() {
+        // The background exists on disk here; the issue still claims it was
+        // missing at scan time. Grouping must trust the scan's verdict (the
+        // disk-stating fallback would find nothing to restore).
+        let root = unique_temp_dir("osu-repair-carried");
+        let folder = root.join("12345 (Artist - Title)");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("bg.jpg"), b"jpg").unwrap();
+        let osu_path = folder.join("Artist - Title (Mapper) [Normal].osu");
+        fs::write(&osu_path, b"osu file format v14").unwrap();
+
+        let jobs = repair_jobs(
+            &flagged_scan(&folder, &osu_path, Some("bg.jpg".into())),
+            false,
+        );
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].beatmapset_id, 12345);
+        assert_eq!(jobs[0].missing_files, vec!["bg.jpg".to_owned()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repair_jobs_fall_back_to_disk_for_caches_without_carried_filenames() {
+        // Scan caches written before issues carried their filename: the file
+        // really is gone, and the stat-based fallback must recover its name.
+        let root = unique_temp_dir("osu-repair-fallback");
+        let folder = root.join("12345 (Artist - Title)");
+        fs::create_dir_all(&folder).unwrap();
+        let osu_path = folder.join("Artist - Title (Mapper) [Normal].osu");
+        fs::write(&osu_path, b"osu file format v14").unwrap();
+
+        let jobs = repair_jobs(&flagged_scan(&folder, &osu_path, None), false);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].missing_files, vec!["bg.jpg".to_owned()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignoring_backgrounds_hides_those_issues_from_repair_grouping() {
+        let root = unique_temp_dir("osu-repair-ignore-bg");
+        let folder = root.join("12345 (Artist - Title)");
+        fs::create_dir_all(&folder).unwrap();
+        let osu_path = folder.join("Artist - Title (Mapper) [Normal].osu");
+        fs::write(&osu_path, b"osu file format v14").unwrap();
+
+        // Background-only issue: with the opt-out on there is nothing to
+        // repair, so no job is built at all.
+        let background_only = flagged_scan(&folder, &osu_path, Some("bg.jpg".into()));
+        assert!(repair_jobs(&background_only, true).is_empty());
+        assert_eq!(repair_jobs(&background_only, false).len(), 1);
+
+        // Audio + background missing on one map: the job keeps only the audio.
+        let map = LocalBeatmap {
+            path: osu_path.clone(),
+            folder: folder.clone(),
+            md5: "map-md5".into(),
+            beatmapset_id: Some(12345),
+            audio_filename: Some("audio.mp3".into()),
+            background_filename: Some("bg.jpg".into()),
+            ..Default::default()
+        };
+        let scan = LibraryScan {
+            maps: vec![map],
+            problems: vec![
+                local::RepairIssue {
+                    beatmap: osu_path.clone(),
+                    message: "Missing audio file: audio.mp3".into(),
+                    severity: RepairSeverity::MissingRequiredFile,
+                    missing_file: Some("audio.mp3".into()),
+                },
+                local::RepairIssue {
+                    beatmap: osu_path.clone(),
+                    message: "Missing background file: bg.jpg".into(),
+                    severity: RepairSeverity::MissingRequiredFile,
+                    missing_file: Some("bg.jpg".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let jobs = repair_jobs(&scan, true);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].missing_files, vec!["audio.mp3".to_owned()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn visible_problems_drop_only_background_issues() {
+        let problems = vec![
+            local::RepairIssue {
+                beatmap: PathBuf::from("a.osu"),
+                message: "Missing audio file: audio.mp3".into(),
+                severity: RepairSeverity::MissingRequiredFile,
+                missing_file: Some("audio.mp3".into()),
+            },
+            local::RepairIssue {
+                beatmap: PathBuf::from("b.osu"),
+                message: "Missing background file: bg.jpg".into(),
+                severity: RepairSeverity::MissingRequiredFile,
+                missing_file: Some("bg.jpg".into()),
+            },
+            local::RepairIssue {
+                beatmap: PathBuf::from("c.osu"),
+                message: "Timed out parsing map file after 8 seconds".into(),
+                severity: RepairSeverity::ParseWarning,
+                missing_file: None,
+            },
+        ];
+
+        assert_eq!(visible_problems(&problems, false).count(), 3);
+        let visible: Vec<_> = visible_problems(&problems, true)
+            .map(|issue| issue.message.clone())
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                "Missing audio file: audio.mp3".to_owned(),
+                "Timed out parsing map file after 8 seconds".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn ignore_store_defaults_and_round_trips_background_flag() {
+        // Old repair_ignores.json without the flag keeps loading.
+        let old: RepairIgnoreStore = serde_json::from_str(r#"{"entries":[]}"#).unwrap();
+        assert!(!old.ignore_missing_backgrounds);
+
+        let store = RepairIgnoreStore {
+            ignore_missing_backgrounds: true,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&store).unwrap();
+        let parsed: RepairIgnoreStore = serde_json::from_str(&text).unwrap();
+        assert!(parsed.ignore_missing_backgrounds);
     }
 }
