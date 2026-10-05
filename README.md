@@ -20,6 +20,8 @@ star rating, length, mode, and other fields, then write the selected results int
 - Ignore missing backgrounds if you deleted them to save space.
 - Delete natively mapped taiko, catch, or mania `.osu` files you do not want.
 - Preview installed skins and remix their elements in the Skin Editor.
+- Set one image as the background of every beatmap in the library from the Extras tab,
+  without touching any `.osu`/`.osb` file (rollback included).
 - Update the app itself from GitHub Releases.
 
 ## Before You Start
@@ -54,8 +56,9 @@ executable under `target\release\` without starting it.
 
 The app is organized into tabs: `Library` (scan, filter and pick maps),
 `Collections` (build and save collections), `Maintenance` (repair, update and
-clean up), `Shrink` (compress audio, video and backgrounds), and `Skin Editor`
-(preview, remix and save skins).
+clean up), `Shrink` (compress audio, video and backgrounds), `Skin Editor`
+(preview, remix and save skins), and `Extras` (bulk tools for the whole
+library).
 
 1. Open osu! Map Manager.
 2. Confirm the auto-detected osu! `Songs` folder.
@@ -219,6 +222,54 @@ Rules that keep the library safe:
   background videos entirely (the game shows the background image instead).
 - Skins get a pixels-exact pass only (same names, same dimensions, tighter encodes);
   `skin.ini` and skin sounds are left alone.
+
+## Extras: One Background for Every Beatmap
+
+The `Extras` tab applies one change across the whole scanned library. Its first tool
+replaces the background of every beatmap with a single image — **without ever altering
+`.osu` or `.osb` files**:
+
+1. Scan your library, then open `Extras` and click `Choose image…` (jpg, png, webp or bmp).
+2. Check the preview, then click `Set background on N set(s)`. A confirmation dialog
+   states the scope before anything is written. Close osu! first.
+3. For every background file the scanned charts reference, the image content is
+   overwritten with the imported image — re-encoded to match each file's extension
+   (`.jpg` targets get JPEG, `.png` targets get PNG, past 1920px wide it is
+   downscaled like the Shrink tab), so every difficulty shows the same background.
+
+Because chart files are only ever *read*, map checksums do not change: local scores
+keep matching, osu! keeps submitting scores, and collections stay valid. Sprite and
+video lines are ignored — storyboard art is never touched. Charts without a
+background line keep their look (adding one would require editing the chart). The
+app rescans the library automatically when the job finishes, and the tab shows
+per-folder progress, an activity log, and per-folder failures if a set folder went
+missing since the scan.
+
+### Caching
+
+Files already containing the imported image are remembered in
+`.osu-map-manager/extras_cache.json`, so running the apply again with the same image
+is fast: cached files are skipped entirely (no rewrite, no new backup) and the log
+reports them as "already up to date". Applying a *different* image ignores the cache
+and rewrites everything. Entries are conservative — if a file's size or modification
+time changed since the job wrote it (an outside edit, or a rollback restoring the
+original), the entry no longer counts and the file is replaced again.
+
+### Rolling back
+
+Every apply writes a rollback manifest (plus backup copies of each replaced image)
+under `.osu-map-manager/extras-backups/`. The `Rollback` card shows the newest apply
+and can undo it:
+
+1. Click `Roll back to original backgrounds`. Close osu! first.
+2. Every replaced background file gets its original content back, byte-identical.
+   Backgrounds the job *created* (a chart referenced a file that was missing) are
+   removed again.
+
+When a rollback completes cleanly its manifest and backup files are deleted; rolling
+back an older apply is then possible if several applies were made in a row. Folders
+that fail (for example because the set was deleted since the scan) keep their rollback
+data so the attempt can be repeated.
 
 ## Notes and Limitations
 

@@ -76,6 +76,9 @@ pub struct RemoteBeatmapLookup {
 pub struct LocalDiffRef {
     pub beatmap_id: Option<i64>,
     pub md5: String,
+    /// Name of the `.osu` file; lets osu!.db lookups fall back to the
+    /// filename when the map's md5 changed after osu! last imported it.
+    pub osu_filename: String,
     pub label: String,
     pub folder: PathBuf,
 }
@@ -85,6 +88,12 @@ impl LocalDiffRef {
         Self {
             beatmap_id: map.beatmap_id,
             md5: map.md5.clone(),
+            osu_filename: map
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned(),
             label: map.label(),
             folder: map.folder.clone(),
         }
@@ -119,6 +128,32 @@ impl OutdatedSet {
     pub fn total_checked(&self) -> usize {
         self.outdated.len() + self.up_to_date
     }
+}
+
+/// Whether a beatmapset in the given online ranking status is checked for
+/// updates at all. Ranked, approved and qualified sets are frozen: osu!
+/// does not publish a new version while a set holds one of those statuses,
+/// so a checksum mismatch there is local corruption (the repair tab's job),
+/// not an available update. Loved sets are skipped as well by policy, so
+/// the check only spends requests on statuses whose content can change.
+pub fn can_receive_updates(status: &str) -> bool {
+    !matches!(
+        status.to_ascii_lowercase().as_str(),
+        "ranked" | "approved" | "qualified" | "loved"
+    )
+}
+
+/// Same decision for the raw rank-status byte stored in osu!.db (see
+/// `osu_db::DB_STATUS_*`), used to skip those sets before spending any
+/// online request.
+pub fn db_status_can_receive_updates(status: u8) -> bool {
+    !matches!(
+        status,
+        crate::osu_db::DB_STATUS_RANKED
+            | crate::osu_db::DB_STATUS_APPROVED
+            | crate::osu_db::DB_STATUS_QUALIFIED
+            | crate::osu_db::DB_STATUS_LOVED
+    )
 }
 
 /// Compares local difficulties against fresh remote metadata. Local diffs
@@ -274,15 +309,16 @@ pub fn fetch_set_meta_blocking(
     {
         request = request.bearer_auth(token.trim());
     }
+    let context = format!("fetching beatmapset {beatmapset_id}");
     let response = request
         .send()
-        .with_context(|| format!("fetching beatmapset {beatmapset_id}"))?;
+        .map_err(|err| transport_error(&context, &err))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
     response
         .error_for_status()
-        .with_context(|| format!("fetching beatmapset {beatmapset_id}"))?
+        .map_err(|err| transport_error(&context, &err))?
         .json::<RemoteSetMeta>()
         .context("decoding beatmapset metadata")
         .map(Some)
@@ -306,19 +342,33 @@ pub fn fetch_beatmap_blocking(
     {
         request = request.bearer_auth(token.trim());
     }
+    let context = format!("fetching beatmap {beatmap_id}");
     let response = request
         .send()
-        .with_context(|| format!("fetching beatmap {beatmap_id}"))?;
+        .map_err(|err| transport_error(&context, &err))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
     response
         .error_for_status()
-        .with_context(|| format!("fetching beatmap {beatmap_id}"))?
+        .map_err(|err| transport_error(&context, &err))?
         .json::<RemoteBeatmapLookup>()
         .context("decoding beatmap metadata")
         .map(Some)
 }
+
+/// Official osu! API download endpoint — the same one the website uses,
+/// called with the signed-in user's own token.
+const OSU_API_DOWNLOAD_BASE_URL: &str = "https://osu.ppy.sh/api/v2/beatmapsets";
+/// Public beatmap mirror used when there is no osu! sign-in. Downloads go
+/// straight to the mirror instead of through the backend Worker.
+const MIRROR_DOWNLOAD_BASE_URL: &str = "https://catboy.best/d";
+
+/// Identifies the app to osu!'s official API.
+const APP_USER_AGENT: &str = concat!("osu-map-manager/", env!("CARGO_PKG_VERSION"));
+/// The mirror rejects user agents it cannot classify as a browser, so
+/// mirror downloads present one.
+const MIRROR_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 /// Upper bound for a downloaded `.osz`: generous for video maps, but a
 /// mirror streaming forever must not fill the disk.
@@ -347,39 +397,71 @@ pub fn check_extract_budget(file_count: usize, total_bytes: u64, folder: &Path) 
     Ok(())
 }
 
-/// Downloads a beatmapset `.osz` through the Worker. Sends the osu! OAuth
-/// token when signed in so the Worker can use the official osu! API; without
-/// a token the Worker serves the mirror. Returns the download source reported
-/// by the Worker (`osu-api` or `mirror`).
+/// Downloads a beatmapset `.osz` straight from the best available source:
+/// the official osu! API when signed in (the user's own token, exactly what
+/// the website uses), falling back to the public mirror otherwise. Returns
+/// the download source (`osu-api` or `mirror`).
 pub fn download_beatmapset_file(
     client: &reqwest::blocking::Client,
-    backend_url: &str,
     beatmapset_id: i64,
     access_token: Option<&str>,
     destination: &Path,
 ) -> Result<String> {
-    let url = format!(
-        "{}/beatmapsets/{beatmapset_id}/download",
-        backend_url.trim().trim_end_matches('/')
-    );
-    let mut request = client.get(&url);
+    let mut signed_in_error = None;
     if let Some(token) = access_token
-        && !token.trim().is_empty()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
     {
-        request = request.bearer_auth(token.trim());
+        match download_from(
+            client,
+            OSU_API_DOWNLOAD_BASE_URL,
+            beatmapset_id,
+            Some(token),
+            APP_USER_AGENT,
+            destination,
+        ) {
+            Ok(()) => return Ok("osu-api".to_owned()),
+            Err(err) => signed_in_error = Some(err),
+        }
+    }
+    download_from(
+        client,
+        MIRROR_DOWNLOAD_BASE_URL,
+        beatmapset_id,
+        None,
+        MIRROR_USER_AGENT,
+        destination,
+    )
+    .map_err(|err| match signed_in_error {
+        Some(official) => err.context(format!("official download failed first: {official:#}")),
+        None => err,
+    })
+    .map(|_| "mirror".to_owned())
+}
+
+fn download_from(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    beatmapset_id: i64,
+    access_token: Option<&str>,
+    user_agent: &str,
+    destination: &Path,
+) -> Result<()> {
+    let context = format!("downloading beatmapset {beatmapset_id}");
+    let mut request = client
+        .get(format!("{base_url}/{beatmapset_id}"))
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .header(reqwest::header::ACCEPT, "application/octet-stream");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
     }
     let response = request
         .send()
-        .with_context(|| format!("downloading {url}"))?
+        .map_err(|err| transport_error(&context, &err))?
         .error_for_status()
-        .with_context(|| format!("downloading {url}"))?;
-    let download_source = response
-        .headers()
-        .get("X-Download-Source")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("mirror")
-        .to_owned();
-    let mut file = fs::File::create(destination)?;
+        .map_err(|err| transport_error(&context, &err))?;
+    let mut file = fs::File::create(destination)
+        .with_context(|| format!("creating {}", destination.display()))?;
     // Read one byte past the cap so an over-long stream is detected instead
     // of being silently truncated into a corrupt archive.
     let mut limited = response.take(MAX_OSZ_DOWNLOAD_BYTES + 1);
@@ -387,7 +469,32 @@ pub fn download_beatmapset_file(
     if copied > MAX_OSZ_DOWNLOAD_BYTES {
         anyhow::bail!("download for set {beatmapset_id} exceeds 1 GiB; refusing to keep it");
     }
-    Ok(download_source)
+    Ok(())
+}
+
+/// Renders a request failure without ever surfacing the backend URL, which
+/// must not be visible to users.
+pub(crate) fn transport_error(context: &str, err: &reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!("{context}: {}", describe_transport_error(err))
+}
+
+pub(crate) fn describe_transport_error(err: &reqwest::Error) -> String {
+    if let Some(status) = err.status() {
+        return format!("HTTP {status}");
+    }
+    if err.is_timeout() {
+        return "request timed out".to_owned();
+    }
+    if err.is_connect() {
+        return "could not connect".to_owned();
+    }
+    // reqwest appends " for url (...)" to its Display — strip it so the
+    // backend URL never appears in user-facing messages.
+    let text = err.to_string();
+    match text.find(" for url (") {
+        Some(index) => text[..index].trim_end().to_owned(),
+        None => text,
+    }
 }
 
 pub fn verify_osz(osz_path: &Path) -> Result<()> {
@@ -466,13 +573,8 @@ pub fn apply_update_blocking(
         fs::create_dir_all(parent)?;
     }
 
-    let download_source = download_beatmapset_file(
-        client,
-        backend_url,
-        job.beatmapset_id,
-        access_token,
-        &temp_path,
-    )?;
+    let download_source =
+        download_beatmapset_file(client, job.beatmapset_id, access_token, &temp_path)?;
     verify_osz(&temp_path)?;
 
     let mut outcome = UpdateOutcome {
@@ -675,6 +777,7 @@ mod tests {
         LocalDiffRef {
             beatmap_id: id,
             md5: md5.to_owned(),
+            osu_filename: String::new(),
             label: label.to_owned(),
             folder: PathBuf::from("folder"),
         }
@@ -711,6 +814,34 @@ mod tests {
                 .iter()
                 .any(|diff| diff.label.contains("removed upstream"))
         );
+    }
+
+    #[test]
+    fn skipped_statuses_cannot_receive_updates() {
+        assert!(!can_receive_updates("ranked"));
+        assert!(!can_receive_updates("Ranked"));
+        assert!(!can_receive_updates("approved"));
+        assert!(!can_receive_updates("qualified"));
+        assert!(!can_receive_updates("QUALIFIED"));
+        assert!(!can_receive_updates("loved"));
+        assert!(!can_receive_updates("LOVED"));
+        assert!(can_receive_updates("pending"));
+        assert!(can_receive_updates("graveyard"));
+        assert!(can_receive_updates("wip"));
+        assert!(can_receive_updates(""));
+    }
+
+    #[test]
+    fn skipped_db_statuses_cannot_receive_updates() {
+        use crate::osu_db::{
+            DB_STATUS_APPROVED, DB_STATUS_LOVED, DB_STATUS_QUALIFIED, DB_STATUS_RANKED,
+        };
+        assert!(!db_status_can_receive_updates(DB_STATUS_RANKED));
+        assert!(!db_status_can_receive_updates(DB_STATUS_APPROVED));
+        assert!(!db_status_can_receive_updates(DB_STATUS_QUALIFIED));
+        assert!(!db_status_can_receive_updates(DB_STATUS_LOVED));
+        assert!(db_status_can_receive_updates(2)); // pending
+        assert!(db_status_can_receive_updates(0)); // unknown
     }
 
     #[test]

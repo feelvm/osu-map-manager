@@ -1,7 +1,10 @@
-//! Manual app self-update from GitHub Releases.
+//! App self-update from GitHub Releases.
 //!
-//! Flow (all user-triggered, no background checks):
-//! 1. "Check for app update" asks the GitHub API for the latest release.
+//! Flow (one passive startup check + user-triggered download):
+//! 1. At startup a silent check asks the GitHub API for the latest release;
+//!    a newer tag only highlights the "↻ Update" button, errors are ignored.
+//! 2. "Check for app update" repeats that check on demand and shows the
+//!    result inside the update window.
 //! 2. If a newer tag is found, "Download & restart" fetches the release
 //!    zip, extracts the fresh `osu-map-manager.exe` and swaps it over the
 //!    running executable via `self-replace`.

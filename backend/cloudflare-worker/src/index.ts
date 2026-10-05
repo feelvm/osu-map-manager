@@ -402,7 +402,7 @@ async function downloadBeatmapset(beatmapsetId: number, env: Env, request: Reque
         headers: {
           "Accept": "application/octet-stream",
           "Authorization": authorization.trim(),
-          "User-Agent": "osu-map-manager/0.1 (+https://osu-map-manager.stanislavberman.workers.dev)"
+          "User-Agent": "osu-map-manager/0.1"
         }
       });
       if (official.ok && official.body) {
@@ -418,7 +418,10 @@ async function downloadBeatmapset(beatmapsetId: number, env: Env, request: Reque
   const upstream = await fetch(`${env.BEATMAP_MIRROR_DOWNLOAD_BASE_URL}/${beatmapsetId}`, {
     headers: {
       "Accept": "application/octet-stream",
-      "User-Agent": "osu-map-manager/0.1 (+https://osu-map-manager.stanislavberman.workers.dev)"
+      // catboy.best rejects user agents it cannot classify as a browser,
+      // so present one (a plain app UA gets a 403).
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     }
   });
 

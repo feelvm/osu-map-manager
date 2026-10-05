@@ -1,7 +1,9 @@
 use crate::{
     app_update::{self, AppRelease},
     collection,
+    extras::{self, ExtrasEvent, ExtrasManifest, RollbackEvent},
     local::{self, LibraryScan, LocalBeatmap, LocalBeatmapSet, RepairSeverity, ScanEvent},
+    osu_db,
     osu_oauth::{self, OauthSession},
     query::{
         AR_RANGE, BPM_RANGE, BeatmapFilters, CS_RANGE, HP_RANGE, ModeFilter, OD_RANGE, RangeFilter,
@@ -50,6 +52,8 @@ const BACKGROUND_PREVIEW_HEIGHT: u16 = 675;
 /// Fixed on-screen height of the inspector background box. Every background
 /// (and the missing-background banner) renders at exactly this size.
 const MAP_PREVIEW_HEIGHT: f32 = 270.0;
+/// Fixed on-screen height of the Extras tab's imported-image preview box.
+const EXTRAS_PREVIEW_HEIGHT: f32 = 320.0;
 /// How many neighbors on each side of the selected map get decoded ahead of
 /// time so stepping through the list usually hits the cache.
 const BACKGROUND_PREFETCH_RADIUS: usize = 3;
@@ -135,12 +139,21 @@ pub struct MapManagerApp {
     repair_ignores: RepairIgnoreStore,
     outdated_sets: Vec<OutdatedSet>,
     is_checking_updates: bool,
+    update_check_pause: Option<Arc<AtomicBool>>,
+    update_check_cancel: Option<Arc<AtomicBool>>,
     update_check_done: usize,
     update_check_total: usize,
     update_check_uncheckable: usize,
     update_unavailable: usize,
+    update_skipped: usize,
+    /// osu!.db pre-filter context for the latest/current check: why the
+    /// filter is unavailable or how many sets it removed. Rendered as its
+    /// own persistent label so progress messages cannot flash it away.
+    update_check_db_note: Option<String>,
     update_check_status: String,
     is_updating: bool,
+    update_pause: Option<Arc<AtomicBool>>,
+    update_cancel: Option<Arc<AtomicBool>>,
     update_progress: String,
     update_total: usize,
     update_done: usize,
@@ -148,10 +161,13 @@ pub struct MapManagerApp {
     update_failures: usize,
     update_log: Vec<RepairLogEntry>,
     update_touched_folders: BTreeSet<PathBuf>,
-    // ── App self-update (manual button only, no background checks) ──
+    // ── App self-update (passive startup highlight + manual button) ──
     app_update_rx: Option<Receiver<AppUpdateEvent>>,
     app_update_window_open: bool,
     app_update_checking: bool,
+    /// `true` while the one-shot startup check runs; its result never
+    /// touches the status bar, it only drives the button highlight.
+    app_update_background_check: bool,
     app_update_status: String,
     app_update_release: Option<AppRelease>,
     app_update_up_to_date: bool,
@@ -198,12 +214,50 @@ pub struct MapManagerApp {
     shrink_saved_bytes: u64,
     shrink_successes: usize,
     shrink_failures: usize,
-    shrink_log: Vec<ShrinkLogEntry>,
+    shrink_log: Vec<JobLogEntry>,
     shrink_rx: Option<Receiver<ShrinkEvent>>,
     shrink_cancel: Option<Arc<AtomicBool>>,
     shrink_pause: Option<Arc<AtomicBool>>,
     shrink_touched_folders: BTreeSet<PathBuf>,
     shrink_backups: Vec<ShrinkBackupRecord>,
+    // ── Extras tab ──
+    /// Imported image ready to apply: validated, decoded for the preview and
+    /// kept as raw bytes so every folder gets a byte-identical copy.
+    extras_image_bytes: Option<Arc<Vec<u8>>>,
+    /// Lowercase content format of the imported image (jpg/png/webp/bmp).
+    extras_image_ext: Option<String>,
+    extras_image_name: Option<String>,
+    extras_image_texture: Option<egui::TextureHandle>,
+    extras_image_size: Option<(u32, u32)>,
+    extras_image_rx: Option<Receiver<Result<ExtrasImage>>>,
+    extras_running: bool,
+    extras_progress: String,
+    extras_folders_done: usize,
+    extras_folders_total: usize,
+    extras_files_replaced: usize,
+    extras_files_cached: usize,
+    extras_files_skipped: usize,
+    extras_successes: usize,
+    extras_failures: usize,
+    extras_log: Vec<JobLogEntry>,
+    extras_rx: Option<Receiver<ExtrasEvent>>,
+    extras_cancel: Option<Arc<AtomicBool>>,
+    extras_touched_folders: BTreeSet<PathBuf>,
+    // ── Extras rollback ──
+    /// Summary of the newest apply job's manifest on disk; the rollback
+    /// card offers to undo exactly this job.
+    extras_last_job: Option<LastExtrasJob>,
+    extras_last_job_loaded: bool,
+    extras_rolling_back: bool,
+    rollback_progress: String,
+    rollback_folders_done: usize,
+    rollback_folders_total: usize,
+    rollback_restored: usize,
+    rollback_successes: usize,
+    rollback_failures: usize,
+    rollback_rx: Option<Receiver<RollbackEvent>>,
+    rollback_cancel: Option<Arc<AtomicBool>>,
+    rollback_touched_folders: BTreeSet<PathBuf>,
     skin_editor: SkinEditorState,
 }
 
@@ -217,6 +271,11 @@ enum DeleteIntent {
         maps: usize,
         hashes: usize,
         exists: bool,
+    },
+    /// Bulk background replacement asks for explicit confirmation because it
+    /// overwrites the background image files across the whole library.
+    SetBackground {
+        sets: usize,
     },
 }
 
@@ -258,6 +317,7 @@ enum AppTab {
     Maintenance,
     Shrink,
     SkinEditor,
+    Extras,
 }
 
 impl AppTab {
@@ -268,6 +328,7 @@ impl AppTab {
             Self::Maintenance => "Maintenance",
             Self::Shrink => "Shrink",
             Self::SkinEditor => "Skin Editor",
+            Self::Extras => "Extras",
         }
     }
 
@@ -278,6 +339,7 @@ impl AppTab {
             Self::Maintenance => "Repair, update and clean up",
             Self::Shrink => "Compress audio, video and backgrounds",
             Self::SkinEditor => "Preview, remix and save skins",
+            Self::Extras => "Bulk tools for the whole library",
         }
     }
 }
@@ -409,6 +471,20 @@ enum AppUpdateEvent {
     Failed { message: String },
 }
 
+/// Shared by the startup highlight check and the manual "Check now" button.
+fn spawn_app_update_check_worker(tx: mpsc::Sender<AppUpdateEvent>) {
+    std::thread::spawn(move || {
+        let current = app_update::current_version_text();
+        let result = match app_update::fetch_latest_release() {
+            Ok(None) => Ok(None),
+            Ok(Some(release)) if !app_update::is_newer_version(&release.tag, &current) => Ok(None),
+            Ok(Some(release)) => Ok(Some(release)),
+            Err(err) => Err(format!("{err:#}")),
+        };
+        let _ = tx.send(AppUpdateEvent::CheckResult(result));
+    });
+}
+
 #[derive(Debug)]
 enum RepairEvent {
     Started {
@@ -438,12 +514,23 @@ enum UpdateCheckEvent {
     Started {
         total: usize,
         uncheckable: usize,
+        /// Sets removed by the osu!.db pre-filter before any network
+        /// request; counted once instead of logged per set.
+        db_skipped: usize,
+        /// Context about the osu!.db pre-filter: either why it is
+        /// unavailable (every set will be checked online) or how many sets
+        /// it removed.
+        db_note: Option<String>,
     },
     Checked {
         done: usize,
         total: usize,
     },
     Found(OutdatedSet),
+    Skipped {
+        beatmapset_id: i64,
+        reason: String,
+    },
     Unavailable {
         beatmapset_id: Option<i64>,
         reason: String,
@@ -490,10 +577,32 @@ enum ShrinkAnalysisEvent {
 }
 
 #[derive(Debug, Clone)]
-struct ShrinkLogEntry {
+/// One row in a batch job's activity log. Shared by the Shrink and Extras
+/// tabs, whose logs carry the same label/status/message shape.
+struct JobLogEntry {
     label: String,
     status: RepairLogStatus,
     message: String,
+}
+
+/// An image picked for the Extras background job: decoded once on a worker
+/// thread (which also validates that osu! can load it), then kept as raw
+/// bytes for the per-folder copies plus a downscaled preview for the UI.
+struct ExtrasImage {
+    bytes: Arc<Vec<u8>>,
+    ext: String,
+    preview: egui::ColorImage,
+    size: (u32, u32),
+}
+
+/// What the newest rollback manifest on disk says, enough for the Extras
+/// rollback card. The full manifest is read by the rollback worker only.
+#[derive(Debug, Clone)]
+struct LastExtrasJob {
+    manifest_path: PathBuf,
+    when: String,
+    image_name: String,
+    folders: usize,
 }
 
 /// One session backup: the zip plus the set folder it restores.
@@ -508,6 +617,9 @@ enum RepairLogStatus {
     InProgress,
     Success,
     Failed,
+    /// Nothing was wrong — the item did not need the action (e.g. ranked,
+    /// qualified or loved beatmapsets, which the update check skips).
+    Skipped,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -649,12 +761,18 @@ impl MapManagerApp {
             repair_ignores,
             outdated_sets: Vec::new(),
             is_checking_updates: false,
+            update_check_pause: None,
+            update_check_cancel: None,
             update_check_done: 0,
             update_check_total: 0,
             update_check_uncheckable: 0,
             update_unavailable: 0,
+            update_skipped: 0,
+            update_check_db_note: None,
             update_check_status: String::new(),
             is_updating: false,
+            update_pause: None,
+            update_cancel: None,
             update_progress: String::new(),
             update_total: 0,
             update_done: 0,
@@ -685,6 +803,7 @@ impl MapManagerApp {
             app_update_rx: None,
             app_update_window_open: false,
             app_update_checking: false,
+            app_update_background_check: false,
             app_update_status: String::new(),
             app_update_release: None,
             app_update_up_to_date: false,
@@ -715,14 +834,48 @@ impl MapManagerApp {
             shrink_pause: None,
             shrink_touched_folders: BTreeSet::new(),
             shrink_backups: Vec::new(),
+            extras_image_bytes: None,
+            extras_image_ext: None,
+            extras_image_name: None,
+            extras_image_texture: None,
+            extras_image_size: None,
+            extras_image_rx: None,
+            extras_running: false,
+            extras_progress: String::new(),
+            extras_folders_done: 0,
+            extras_folders_total: 0,
+            extras_files_replaced: 0,
+            extras_files_cached: 0,
+            extras_files_skipped: 0,
+            extras_successes: 0,
+            extras_failures: 0,
+            extras_log: Vec::new(),
+            extras_rx: None,
+            extras_cancel: None,
+            extras_touched_folders: BTreeSet::new(),
+            extras_last_job: None,
+            extras_last_job_loaded: false,
+            extras_rolling_back: false,
+            rollback_progress: String::new(),
+            rollback_folders_done: 0,
+            rollback_folders_total: 0,
+            rollback_restored: 0,
+            rollback_successes: 0,
+            rollback_failures: 0,
+            rollback_rx: None,
+            rollback_cancel: None,
+            rollback_touched_folders: BTreeSet::new(),
             skin_editor: SkinEditorState::new(),
         };
         app.load_collections();
+        app.start_app_update_background_check();
         app
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.poll_background_load(ctx);
+        self.poll_extras(ctx);
+        self.poll_extras_rollback();
         self.poll_app_update();
         if let Some(rx) = self.scan_rx.take() {
             let mut keep_rx = true;
@@ -1204,13 +1357,30 @@ impl MapManagerApp {
                     }
                 };
                 match event {
-                    UpdateCheckEvent::Started { total, uncheckable } => {
+                    UpdateCheckEvent::Started {
+                        total,
+                        uncheckable,
+                        db_skipped,
+                        db_note,
+                    } => {
                         self.is_checking_updates = true;
                         self.update_check_done = 0;
                         self.update_check_total = total;
                         self.update_check_uncheckable = uncheckable;
                         self.update_unavailable = 0;
+                        self.update_skipped = db_skipped;
+                        self.update_check_db_note = db_note;
                         self.outdated_sets.clear();
+                        if db_skipped > 0 {
+                            self.update_log.push(RepairLogEntry {
+                                beatmapset_id: 0,
+                                status: RepairLogStatus::Skipped,
+                                message: format!(
+                                    "{db_skipped} ranked/approved/qualified/loved set(s) \
+                                     skipped locally via osu!.db"
+                                ),
+                            });
+                        }
                         self.update_check_status =
                             format!("Checking {total} beatmapset(s) against osu!web");
                         self.status = self.update_check_status.clone();
@@ -1236,6 +1406,18 @@ impl MapManagerApp {
                         );
                         self.outdated_sets.push(set);
                     }
+                    UpdateCheckEvent::Skipped {
+                        beatmapset_id,
+                        reason,
+                    } => {
+                        self.update_skipped += 1;
+                        upsert_log(
+                            &mut self.update_log,
+                            beatmapset_id,
+                            RepairLogStatus::Skipped,
+                            reason,
+                        );
+                    }
                     UpdateCheckEvent::Unavailable {
                         beatmapset_id,
                         reason,
@@ -1253,10 +1435,11 @@ impl MapManagerApp {
                     UpdateCheckEvent::Finished => {
                         self.is_checking_updates = false;
                         self.update_check_status = format!(
-                            "Update check finished: {} outdated out of {} checked ({} unavailable, {} uncheckable)",
+                            "Update check finished: {} outdated out of {} checked ({} unavailable, {} skipped, {} uncheckable)",
                             self.outdated_sets.len(),
                             self.update_check_total,
                             self.update_unavailable,
+                            self.update_skipped,
                             self.update_check_uncheckable
                         );
                         self.status = self.update_check_status.clone();
@@ -2213,6 +2396,56 @@ impl MapManagerApp {
         }
     }
 
+    fn toggle_update_pause(&mut self) {
+        if let Some(pause) = self.update_pause.as_ref() {
+            let paused = !pause.load(Ordering::Relaxed);
+            pause.store(paused, Ordering::Relaxed);
+            self.status = if paused {
+                "Update paused after the current set — resume to continue".to_owned()
+            } else {
+                "Update resumed".to_owned()
+            };
+        }
+    }
+
+    fn update_paused(&self) -> bool {
+        self.update_pause
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    fn stop_update(&mut self) {
+        if let Some(cancel) = self.update_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping update after the current set…".to_owned();
+        }
+    }
+
+    fn toggle_update_check_pause(&mut self) {
+        if let Some(pause) = self.update_check_pause.as_ref() {
+            let paused = !pause.load(Ordering::Relaxed);
+            pause.store(paused, Ordering::Relaxed);
+            self.status = if paused {
+                "Update check paused — resume to continue".to_owned()
+            } else {
+                "Update check resumed".to_owned()
+            };
+        }
+    }
+
+    fn update_check_paused(&self) -> bool {
+        self.update_check_pause
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    fn stop_update_check(&mut self) {
+        if let Some(cancel) = self.update_check_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping update check after the current request…".to_owned();
+        }
+    }
+
     fn analysis_paused(&self) -> bool {
         self.analysis_pause
             .as_ref()
@@ -2230,12 +2463,460 @@ impl MapManagerApp {
             entry.status = status;
             entry.message = message;
         } else {
-            self.shrink_log.push(ShrinkLogEntry {
+            self.shrink_log.push(JobLogEntry {
                 label,
                 status,
                 message,
             });
         }
+    }
+
+    fn upsert_extras_log(&mut self, label: String, status: RepairLogStatus, message: String) {
+        if let Some(entry) = self.extras_log.iter_mut().find(|e| e.label == label) {
+            entry.status = status;
+            entry.message = message;
+        } else {
+            self.extras_log.push(JobLogEntry {
+                label,
+                status,
+                message,
+            });
+        }
+    }
+
+    // ── Extras: bulk background replacement ──
+
+    fn pick_extras_image(&mut self) {
+        if self.extras_running || self.extras_rolling_back || self.extras_image_rx.is_some() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Images", extras::SUPPORTED_EXTS)
+            .pick_file()
+        else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image")
+            .to_owned();
+        self.extras_image_name = Some(name);
+        self.extras_image_bytes = None;
+        self.extras_image_ext = None;
+        self.extras_image_texture = None;
+        self.extras_image_size = None;
+        let (tx, rx) = mpsc::channel();
+        self.extras_image_rx = Some(rx);
+        self.status = format!(
+            "Importing {}…",
+            self.extras_image_name.as_deref().unwrap_or("image")
+        );
+        std::thread::spawn(move || {
+            let _ = tx.send(load_extras_image(&path));
+        });
+    }
+
+    fn clear_extras_image(&mut self) {
+        self.extras_image_bytes = None;
+        self.extras_image_ext = None;
+        self.extras_image_name = None;
+        self.extras_image_texture = None;
+        self.extras_image_size = None;
+    }
+
+    /// One folder per distinct beatmapset folder in the scan, sorted so the
+    /// run order is stable and the progress bar moves predictably.
+    fn extras_target_folders(&self) -> Vec<PathBuf> {
+        self.scan
+            .as_ref()
+            .map(|scan| {
+                scan.maps
+                    .iter()
+                    .map(|map| map.folder.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn start_extras_apply(&mut self) {
+        if self.extras_running || self.extras_rolling_back {
+            self.status = "A background job is already running".to_owned();
+            return;
+        }
+        if self.is_scanning {
+            self.status = "Wait for the scan to finish before applying".to_owned();
+            return;
+        }
+        let Some(image) = self.extras_image_bytes.clone() else {
+            self.status = "Import an image first".to_owned();
+            return;
+        };
+        let Some(ext) = self.extras_image_ext.clone() else {
+            self.status = "Import an image first".to_owned();
+            return;
+        };
+        let folders = self.extras_target_folders();
+        if folders.is_empty() {
+            self.status = "No beatmapsets to update — scan your library first".to_owned();
+            return;
+        }
+        // One rollback manifest per apply, named by timestamp so the newest
+        // job is the lexicographic winner when looking for it later.
+        let backups = extras_backup_dir(&self.osu_root());
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let mut job_id = stamp.clone();
+        let mut manifest_path = backups.join(format!("{job_id}.json"));
+        let mut suffix = 2;
+        while manifest_path.exists() {
+            job_id = format!("{stamp}-{suffix}");
+            manifest_path = backups.join(format!("{job_id}.json"));
+            suffix += 1;
+        }
+        let image_name = self.extras_image_name.clone().unwrap_or_default();
+        let cache_file = extras_cache_path(&self.osu_root());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.extras_cancel = Some(cancel.clone());
+        let (tx, rx) = mpsc::channel();
+        self.extras_rx = Some(rx);
+        self.extras_running = true;
+        self.status = format!(
+            "Starting background replacement for {} folder(s)",
+            folders.len()
+        );
+        std::thread::spawn(move || {
+            extras::run_background_jobs(
+                folders,
+                image,
+                ext,
+                image_name,
+                cancel,
+                tx,
+                backups.join(&job_id),
+                manifest_path,
+                cache_file,
+            );
+        });
+    }
+
+    fn stop_extras(&mut self) {
+        if let Some(cancel) = self.extras_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping after the current folder…".to_owned();
+        }
+    }
+
+    fn start_extras_rollback(&mut self) {
+        if self.extras_running || self.extras_rolling_back {
+            self.status = "A background job is already running".to_owned();
+            return;
+        }
+        if self.is_scanning {
+            self.status = "Wait for the scan to finish before rolling back".to_owned();
+            return;
+        }
+        let Some(job) = self.extras_last_job.clone() else {
+            self.status = "No background apply to roll back".to_owned();
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.rollback_cancel = Some(cancel.clone());
+        let (tx, rx) = mpsc::channel();
+        self.rollback_rx = Some(rx);
+        self.extras_rolling_back = true;
+        self.status = format!("Rolling back the apply from {}…", job.when);
+        std::thread::spawn(move || {
+            extras::run_rollback_job(job.manifest_path, cancel, tx);
+        });
+    }
+
+    fn stop_extras_rollback(&mut self) {
+        if let Some(cancel) = self.rollback_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping rollback after the current folder…".to_owned();
+        }
+    }
+
+    fn poll_extras(&mut self, ctx: &egui::Context) {
+        // Imported-image decode result: exactly one message per pick.
+        if let Some(rx) = self.extras_image_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(image)) => {
+                    let texture = ctx.load_texture(
+                        "extras-background",
+                        image.preview.clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.extras_image_texture = Some(texture);
+                    self.extras_image_bytes = Some(image.bytes);
+                    self.extras_image_ext = Some(image.ext);
+                    self.extras_image_size = Some(image.size);
+                    let (width, height) = image.size;
+                    self.status = format!(
+                        "Imported {} ({}×{}, {} bytes) — ready to apply",
+                        self.extras_image_name.as_deref().unwrap_or("image"),
+                        width,
+                        height,
+                        self.extras_image_bytes
+                            .as_ref()
+                            .map_or(0, |bytes| bytes.len())
+                    );
+                }
+                Ok(Err(err)) => {
+                    self.clear_extras_image();
+                    self.status = format!("Image import failed: {err:#}");
+                }
+                Err(mpsc::TryRecvError::Empty) => self.extras_image_rx = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
+        // Background-replacement job events.
+        if let Some(rx) = self.extras_rx.take() {
+            let mut keep_rx = true;
+            let mut disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
+                match event {
+                    ExtrasEvent::Started { folders } => {
+                        self.extras_folders_total = folders;
+                        self.extras_folders_done = 0;
+                        self.extras_files_replaced = 0;
+                        self.extras_files_cached = 0;
+                        self.extras_files_skipped = 0;
+                        self.extras_successes = 0;
+                        self.extras_failures = 0;
+                        self.extras_log.clear();
+                        self.extras_touched_folders.clear();
+                        self.extras_progress =
+                            format!("Applying background to {folders} folder(s)…");
+                        self.status = self.extras_progress.clone();
+                    }
+                    ExtrasEvent::FolderDone {
+                        folder,
+                        files,
+                        cached,
+                        skipped,
+                    } => {
+                        self.extras_folders_done += 1;
+                        self.extras_successes += 1;
+                        self.extras_files_replaced += files;
+                        self.extras_files_cached += cached;
+                        self.extras_files_skipped += skipped;
+                        self.extras_touched_folders.insert(folder.clone());
+                        let label = folder
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("set")
+                            .to_owned();
+                        let mut message = format!("{files} background file(s) replaced");
+                        if cached > 0 {
+                            message.push_str(&format!(" · {cached} already up to date"));
+                        }
+                        if skipped > 0 {
+                            message.push_str(&format!(" · {skipped} skipped (format)"));
+                        }
+                        self.upsert_extras_log(label, RepairLogStatus::Success, message);
+                        self.extras_progress = format!(
+                            "Applying background… {}/{} folder(s)",
+                            self.extras_folders_done, self.extras_folders_total
+                        );
+                    }
+                    ExtrasEvent::FolderFailed { folder, message } => {
+                        self.extras_folders_done += 1;
+                        self.extras_failures += 1;
+                        self.extras_touched_folders.insert(folder.clone());
+                        let label = folder
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("set")
+                            .to_owned();
+                        self.upsert_extras_log(label, RepairLogStatus::Failed, message.clone());
+                        self.extras_progress = format!(
+                            "Applying background… {}/{} folder(s) — last failed: {message}",
+                            self.extras_folders_done, self.extras_folders_total
+                        );
+                    }
+                    ExtrasEvent::Failed { message } => {
+                        self.extras_progress = format!("Failed: {message}");
+                        self.status = self.extras_progress.clone();
+                    }
+                    ExtrasEvent::Finished { files, elapsed_s } => {
+                        self.extras_running = false;
+                        let cancelled = self
+                            .extras_cancel
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                        let skipped_note = if self.extras_files_skipped > 0 {
+                            format!(
+                                ", {} file(s) skipped (unsupported format)",
+                                self.extras_files_skipped
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let cached_note = if self.extras_files_cached > 0 {
+                            format!(", {} already up to date (cached)", self.extras_files_cached)
+                        } else {
+                            String::new()
+                        };
+                        self.status = format!(
+                            "Backgrounds {} in {:.0}s: {} folder(s) ok, {} failed, {} image file(s) replaced{}{} — rescanning",
+                            if cancelled { "cancelled" } else { "replaced" },
+                            elapsed_s,
+                            self.extras_successes,
+                            self.extras_failures,
+                            files,
+                            cached_note,
+                            skipped_note,
+                        );
+                        let touched = std::mem::take(&mut self.extras_touched_folders);
+                        if !touched.is_empty() {
+                            self.prune_scan_folders(&touched);
+                        }
+                        keep_rx = false;
+                        if !touched.is_empty() && !self.is_scanning {
+                            self.start_scan();
+                        }
+                        self.refresh_last_extras_job();
+                    }
+                }
+            }
+            if keep_rx {
+                if disconnected {
+                    self.extras_running = false;
+                    self.status = "Background replacement worker disconnected".to_owned();
+                } else {
+                    self.extras_rx = Some(rx);
+                }
+            }
+        }
+    }
+
+    fn poll_extras_rollback(&mut self) {
+        let Some(rx) = self.rollback_rx.take() else {
+            return;
+        };
+        let mut keep_rx = true;
+        let mut disconnected = false;
+        loop {
+            let event = match rx.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
+            match event {
+                RollbackEvent::Started { folders } => {
+                    self.rollback_folders_total = folders;
+                    self.rollback_folders_done = 0;
+                    self.rollback_restored = 0;
+                    self.rollback_successes = 0;
+                    self.rollback_failures = 0;
+                    self.extras_log.clear();
+                    self.rollback_touched_folders.clear();
+                    self.rollback_progress = format!("Rolling back {folders} folder(s)…");
+                    self.status = self.rollback_progress.clone();
+                }
+                RollbackEvent::FolderDone { folder, restored } => {
+                    self.rollback_folders_done += 1;
+                    self.rollback_successes += 1;
+                    self.rollback_restored += restored;
+                    self.rollback_touched_folders.insert(folder.clone());
+                    let label = folder
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("set")
+                        .to_owned();
+                    self.upsert_extras_log(
+                        label,
+                        RepairLogStatus::Success,
+                        format!("{restored} background file(s) restored"),
+                    );
+                    self.rollback_progress = format!(
+                        "Rolling back… {}/{} folder(s)",
+                        self.rollback_folders_done, self.rollback_folders_total
+                    );
+                }
+                RollbackEvent::FolderFailed { folder, message } => {
+                    self.rollback_folders_done += 1;
+                    self.rollback_failures += 1;
+                    self.rollback_touched_folders.insert(folder.clone());
+                    let label = folder
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("set")
+                        .to_owned();
+                    self.upsert_extras_log(label, RepairLogStatus::Failed, message.clone());
+                    self.rollback_progress = format!(
+                        "Rolling back… {}/{} folder(s) — last failed: {message}",
+                        self.rollback_folders_done, self.rollback_folders_total
+                    );
+                }
+                RollbackEvent::Failed { message } => {
+                    self.rollback_progress = format!("Failed: {message}");
+                    self.status = self.rollback_progress.clone();
+                }
+                RollbackEvent::Finished {
+                    restored,
+                    cleaned,
+                    elapsed_s,
+                } => {
+                    self.extras_rolling_back = false;
+                    let cancelled = self
+                        .rollback_cancel
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                    let kept_note = if cleaned {
+                        String::new()
+                    } else {
+                        " — rollback data kept".to_owned()
+                    };
+                    self.status = format!(
+                        "Rollback {} in {:.0}s: {} folder(s) ok, {} failed, {} background file(s) restored{} — rescanning",
+                        if cancelled { "cancelled" } else { "finished" },
+                        elapsed_s,
+                        self.rollback_successes,
+                        self.rollback_failures,
+                        restored,
+                        kept_note,
+                    );
+                    let touched = std::mem::take(&mut self.rollback_touched_folders);
+                    if !touched.is_empty() {
+                        self.prune_scan_folders(&touched);
+                    }
+                    keep_rx = false;
+                    if !touched.is_empty() && !self.is_scanning {
+                        self.start_scan();
+                    }
+                    self.refresh_last_extras_job();
+                }
+            }
+        }
+        if keep_rx {
+            if disconnected {
+                self.extras_rolling_back = false;
+                self.status = "Rollback worker disconnected".to_owned();
+            } else {
+                self.rollback_rx = Some(rx);
+            }
+        }
+    }
+
+    fn refresh_last_extras_job(&mut self) {
+        self.extras_last_job = read_last_extras_job(&self.osu_root());
+        self.extras_last_job_loaded = true;
     }
 
     /// Restore one session backup over its set folder, then rescan it.
@@ -2285,6 +2966,11 @@ impl MapManagerApp {
 
         let (tx, rx) = mpsc::channel();
         self.update_check_rx = Some(rx);
+        let pause = Arc::new(AtomicBool::new(false));
+        self.update_check_pause = Some(pause.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.update_check_cancel = Some(cancel.clone());
+        self.update_check_db_note = None;
         self.update_log.clear();
         self.status = format!("Starting update check for {} beatmapset(s)", targets.len());
         let backend_url = osu_oauth::backend_url();
@@ -2298,6 +2984,8 @@ impl MapManagerApp {
                 osu_root,
                 oauth_session,
                 tx,
+                pause,
+                cancel,
             );
         });
     }
@@ -2348,12 +3036,24 @@ impl MapManagerApp {
         }
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
+        let pause = Arc::new(AtomicBool::new(false));
+        self.update_pause = Some(pause.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.update_cancel = Some(cancel.clone());
         self.status = format!("Starting update for {} beatmapset(s)", jobs.len());
         let backend_url = osu_oauth::backend_url();
         let osu_root = self.osu_root();
         let oauth_session = self.oauth_session.clone();
         std::thread::spawn(move || {
-            run_update_jobs(jobs, backend_url, osu_root, oauth_session, tx);
+            run_update_jobs(
+                jobs,
+                backend_url,
+                osu_root,
+                oauth_session,
+                tx,
+                pause,
+                cancel,
+            );
         });
     }
 
@@ -2368,18 +3068,21 @@ impl MapManagerApp {
         self.app_update_status = "Checking for app updates…".to_owned();
         self.app_update_error = None;
         self.app_update_up_to_date = false;
-        std::thread::spawn(move || {
-            let current = app_update::current_version_text();
-            let result = match app_update::fetch_latest_release() {
-                Ok(None) => Ok(None),
-                Ok(Some(release)) if !app_update::is_newer_version(&release.tag, &current) => {
-                    Ok(None)
-                }
-                Ok(Some(release)) => Ok(Some(release)),
-                Err(err) => Err(format!("{err:#}")),
-            };
-            let _ = tx.send(AppUpdateEvent::CheckResult(result));
-        });
+        spawn_app_update_check_worker(tx);
+    }
+
+    /// One-shot passive check at startup: when a newer release exists, the
+    /// update button gets highlighted. Fails silently — this is a highlight,
+    /// not a notification, so network errors must not disturb the user.
+    fn start_app_update_background_check(&mut self) {
+        if self.app_update_checking || self.app_update_downloading || self.app_update_installing {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.app_update_rx = Some(rx);
+        self.app_update_checking = true;
+        self.app_update_background_check = true;
+        spawn_app_update_check_worker(tx);
     }
 
     /// Manual app update: download the release, swap the exe, restart.
@@ -2464,7 +3167,9 @@ impl MapManagerApp {
                         "{} is the latest version",
                         app_update::current_version_text()
                     );
-                    self.status = self.app_update_status.clone();
+                    if !self.app_update_background_check {
+                        self.status = self.app_update_status.clone();
+                    }
                 }
                 AppUpdateEvent::CheckResult(Ok(Some(release))) => {
                     self.app_update_checking = false;
@@ -2475,13 +3180,20 @@ impl MapManagerApp {
                         app_update::current_version_text(),
                         release.tag
                     );
-                    self.status = self.app_update_status.clone();
+                    if !self.app_update_background_check {
+                        self.status = self.app_update_status.clone();
+                    }
                 }
                 AppUpdateEvent::CheckResult(Err(message)) => {
                     self.app_update_checking = false;
-                    self.app_update_error = Some(message.clone());
-                    self.app_update_status = format!("App update check failed: {message}");
-                    self.status = self.app_update_status.clone();
+                    if self.app_update_background_check {
+                        // Passive startup check: a failure just means no
+                        // highlight; keep it invisible.
+                    } else {
+                        self.app_update_error = Some(message.clone());
+                        self.app_update_status = format!("App update check failed: {message}");
+                        self.status = self.app_update_status.clone();
+                    }
                 }
                 AppUpdateEvent::DownloadProgress { done, total } => {
                     self.app_update_downloaded = done;
@@ -2514,10 +3226,8 @@ impl MapManagerApp {
         if keep_rx {
             self.app_update_rx = Some(rx);
         }
-        if self.app_update_checking || self.app_update_downloading || self.app_update_installing {
-            // Keep repainting while the worker reports progress.
-            // (The top-level `update` already repaints for other jobs; the
-            // update window requests its own repaints while open.)
+        if !self.app_update_checking {
+            self.app_update_background_check = false;
         }
     }
 
@@ -3497,6 +4207,7 @@ impl MapManagerApp {
                                         RepairLogStatus::Success => "✓",
                                         RepairLogStatus::Failed => "✗",
                                         RepairLogStatus::InProgress => "…",
+                                        RepairLogStatus::Skipped => "–",
                                     };
                                     ui.label(format!(
                                         "{dot} {}: {}",
@@ -3546,6 +4257,292 @@ impl MapManagerApp {
                         }
                     }
                 });
+            });
+    }
+
+    fn render_extras_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let content_width = ui.available_width().max(1.0);
+        egui::ScrollArea::vertical()
+            .id_source("extras_pane")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let card_item_spacing = ui.spacing().item_spacing;
+                let card_gap = 8.0;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                fix_ui_width(ui, content_width);
+
+                if self.scan.is_none() {
+                    section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = card_item_spacing;
+                        fill_tile_width(ui);
+                        ui.heading("No scan yet");
+                        muted_label(
+                            ui,
+                            "Enter your Songs folder in the sidebar, then press Scan library.",
+                        );
+                    });
+                    return;
+                }
+
+                // ── 1. Import ──
+                section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = card_item_spacing;
+                    fill_tile_width(ui);
+                    ui.heading("🖼 Background image");
+                    muted_label(
+                        ui,
+                        "Pick an image, then apply it to every beatmapset in the scan. \
+                        It is written over the background files the maps already use; \
+                        the .osu/.osb chart files themselves are never altered.",
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if self.extras_image_rx.is_some() {
+                            ui.add(egui::Spinner::new());
+                            muted_label(ui, "Importing image…");
+                        } else if ui
+                            .add_enabled(
+                                !self.extras_running,
+                                egui::Button::new("📥 Choose image…"),
+                            )
+                            .on_hover_text(
+                                "Pick a jpg, png, webp or bmp file to use as the new background",
+                            )
+                            .clicked()
+                        {
+                            self.pick_extras_image();
+                        }
+                        if let Some(name) = self.extras_image_name.as_deref() {
+                            ui.separator();
+                            ui.label(egui::RichText::new(name).strong());
+                            if let Some((width, height)) = self.extras_image_size {
+                                let bytes = self
+                                    .extras_image_bytes
+                                    .as_ref()
+                                    .map_or(0, |bytes| bytes.len());
+                                muted_label(
+                                    ui,
+                                    format!(
+                                        "{width}×{height} · {}",
+                                        shrink::human_bytes(bytes as u64)
+                                    ),
+                                );
+                            }
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Forget the imported image")
+                                .clicked()
+                                && !self.extras_running
+                            {
+                                self.clear_extras_image();
+                            }
+                        }
+                    });
+                    if let Some(texture) = self.extras_image_texture.clone() {
+                        // Contain-fit inside a fixed-height box so every
+                        // image previews at a predictable size.
+                        let source_size = texture.size_vec2();
+                        let box_size =
+                            egui::vec2(ui.available_width().max(1.0), EXTRAS_PREVIEW_HEIGHT);
+                        let (box_rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+                        if source_size.x > 0.0 && source_size.y > 0.0 {
+                            let scale = (box_rect.width() / source_size.x)
+                                .min(box_rect.height() / source_size.y);
+                            let shown_rect = egui::Rect::from_center_size(
+                                box_rect.center(),
+                                source_size * scale,
+                            );
+                            ui.painter().image(
+                                texture.id(),
+                                shown_rect,
+                                egui::Rect::from_min_max(
+                                    egui::Pos2::ZERO,
+                                    egui::Pos2::new(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                });
+                ui.add_space(card_gap);
+
+                // ── 2. Apply ──
+                section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = card_item_spacing;
+                    fill_tile_width(ui);
+                    ui.heading("🎨 Apply to every beatmap");
+                    muted_label(
+                        ui,
+                        "Writes the image over the content of every background file \
+                        the scanned charts reference, encoded to match each file's \
+                        extension, so every difficulty shows it. Close osu! before applying.",
+                    );
+                    muted_label(
+                        ui,
+                        "Guarantee: .osu and .osb files are read but never written, so map \
+                        checksums, local scores and score submission are unaffected. Maps \
+                        without a background line keep their look (adding one would need \
+                        chart edits), and storyboard art is never touched.",
+                    );
+                    ui.add_space(4.0);
+                    let (sets, maps) = self
+                        .scan
+                        .as_ref()
+                        .map(|scan| (scan.sets.len(), scan.maps.len()))
+                        .unwrap_or((0, 0));
+                    ui.horizontal_wrapped(|ui| {
+                        if self.extras_running {
+                            if ui.button("⏹ Stop after current folder").clicked() {
+                                self.stop_extras();
+                            }
+                            ui.add(egui::Spinner::new());
+                            muted_label(ui, self.extras_progress.clone());
+                        } else if ui
+                            .add_enabled(
+                                self.extras_image_bytes.is_some(),
+                                egui::Button::new(format!("🎨 Set background on {sets} set(s)")),
+                            )
+                            .on_hover_text(format!(
+                                "Asks for confirmation, then replaces the content of every \
+                                 referenced background image across {sets} set(s) / {maps} map(s) \
+                                 without touching .osu/.osb files"
+                            ))
+                            .clicked()
+                        {
+                            // Not applied directly: a modal confirmation
+                            // states the scope and rollback first.
+                            self.delete_confirmation = Some(DeleteIntent::SetBackground { sets });
+                        }
+                    });
+                    if self.extras_running {
+                        let progress = if self.extras_folders_total > 0 {
+                            self.extras_folders_done as f32 / self.extras_folders_total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .show_percentage()
+                                .text(format!(
+                                    "{}/{} folder(s)",
+                                    self.extras_folders_done, self.extras_folders_total
+                                )),
+                        );
+                    }
+                });
+                ui.add_space(card_gap);
+
+                // ── 3. Rollback ──
+                if !self.extras_last_job_loaded {
+                    self.refresh_last_extras_job();
+                }
+                section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = card_item_spacing;
+                    fill_tile_width(ui);
+                    ui.heading("↩ Rollback");
+                    match self.extras_last_job.clone() {
+                        Some(job) => {
+                            muted_label(
+                                ui,
+                                format!(
+                                    "Last apply: {} on {} — {} folder(s) recorded. \
+                                    Rollback restores the original background image \
+                                    contents and removes files the job created.",
+                                    job.image_name, job.when, job.folders
+                                ),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                if self.extras_rolling_back {
+                                    if ui.button("⏹ Stop after current folder").clicked() {
+                                        self.stop_extras_rollback();
+                                    }
+                                    ui.add(egui::Spinner::new());
+                                    muted_label(ui, self.rollback_progress.clone());
+                                } else if ui
+                                    .add_enabled(
+                                        !self.extras_running,
+                                        egui::Button::new("↩ Roll back to original backgrounds"),
+                                    )
+                                    .on_hover_text(
+                                        "Undo the last apply: every replaced background file \
+                                        gets its original content back, and files the job \
+                                        created (for missing backgrounds) are removed.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_extras_rollback();
+                                }
+                            });
+                            if self.extras_rolling_back {
+                                let progress = if self.rollback_folders_total > 0 {
+                                    self.rollback_folders_done as f32
+                                        / self.rollback_folders_total as f32
+                                } else {
+                                    0.0
+                                };
+                                ui.add(egui::ProgressBar::new(progress).show_percentage().text(
+                                    format!(
+                                        "{}/{} folder(s)",
+                                        self.rollback_folders_done, self.rollback_folders_total
+                                    ),
+                                ));
+                            }
+                        }
+                        None => {
+                            muted_label(
+                                ui,
+                                "No background apply recorded yet — nothing to roll back.",
+                            );
+                        }
+                    }
+                });
+                ui.add_space(card_gap);
+
+                // ── 4. Activity log ──
+                if !self.extras_log.is_empty() {
+                    section_frame(ctx.style().as_ref()).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = card_item_spacing;
+                        fill_tile_width(ui);
+                        ui.heading("Activity");
+                        muted_label(
+                            ui,
+                            format!(
+                                "{} folder(s) ok · {} failed · {} background file(s) replaced{}{}",
+                                self.extras_successes,
+                                self.extras_failures,
+                                self.extras_files_replaced,
+                                if self.extras_files_cached > 0 {
+                                    format!(" · {} already up to date", self.extras_files_cached)
+                                } else {
+                                    String::new()
+                                },
+                                if self.extras_files_skipped > 0 {
+                                    format!(
+                                        " · {} skipped (unsupported format)",
+                                        self.extras_files_skipped
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                            ),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_source("extras_log")
+                            .max_height(160.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for entry in self.extras_log.iter().rev().take(40) {
+                                    let dot = match entry.status {
+                                        RepairLogStatus::Success => "✓",
+                                        RepairLogStatus::Failed => "✗",
+                                        RepairLogStatus::InProgress => "…",
+                                        RepairLogStatus::Skipped => "–",
+                                    };
+                                    ui.label(format!("{dot} {}: {}", entry.label, entry.message));
+                                }
+                            });
+                    });
+                }
             });
     }
 
@@ -3888,6 +4885,18 @@ impl MapManagerApp {
                 };
                 ("Save collection?", message, "Save")
             }
+            DeleteIntent::SetBackground { sets } => (
+                "Replace every background?",
+                format!(
+                    "Write the imported image over every background file referenced \
+                     by charts in {sets} scanned set folder(s)?\n\n\
+                     Chart files (.osu/.osb) are never opened for writing, so map \
+                     checksums, local scores and score submission are unaffected. \
+                     The original images are backed up for rollback.\n\n\
+                     Close osu! first."
+                ),
+                "Replace backgrounds",
+            ),
         };
 
         let mut confirmed = false;
@@ -3918,6 +4927,7 @@ impl MapManagerApp {
                     self.collection_name = name;
                     self.save_selection_to_collection();
                 }
+                DeleteIntent::SetBackground { .. } => self.start_extras_apply(),
             }
         }
     }
@@ -4229,7 +5239,12 @@ impl eframe::App for MapManagerApp {
             || self.is_repairing
             || self.is_analyzing
             || self.is_shrinking
+            || self.extras_running
+            || self.extras_rolling_back
+            || self.rollback_rx.is_some()
+            || self.extras_image_rx.is_some()
             || self.audio_player.is_some()
+            || self.app_update_checking
             || !self.background_in_flight.is_empty()
             || self.skin_editor.needs_repaint()
         {
@@ -4252,6 +5267,7 @@ impl eframe::App for MapManagerApp {
                         AppTab::Maintenance,
                         AppTab::Shrink,
                         AppTab::SkinEditor,
+                        AppTab::Extras,
                     ] {
                         let selected = self.active_tab == tab;
                         if ui.selectable_label(selected, tab.label()).clicked() {
@@ -4267,11 +5283,30 @@ impl eframe::App for MapManagerApp {
                                 .weak(),
                         )
                         .on_hover_text("Current app version");
-                        if ui
-                            .small_button("↻ Update")
-                            .on_hover_text("Check for app updates")
-                            .clicked()
-                        {
+                        // Passive startup highlight: filled + bold once the
+                        // background check found a newer release.
+                        let (update_button, update_hover) = match &self.app_update_release {
+                            Some(release) => (
+                                egui::Button::new(
+                                    egui::RichText::new("↻ Update")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(0x2d, 0x8a, 0x4f)),
+                                format!(
+                                    "New version {} available — click to open the updater",
+                                    release.tag
+                                ),
+                            ),
+                            None => (
+                                egui::Button::new("↻ Update"),
+                                "Check for app updates".to_owned(),
+                            ),
+                        };
+                        let update_response = ui.add(update_button);
+                        let update_clicked = update_response.clicked();
+                        update_response.on_hover_text(update_hover);
+                        if update_clicked {
                             self.app_update_window_open = true;
                         }
                         if let Some(player) = self.audio_player.as_ref() {
@@ -4572,6 +5607,33 @@ impl eframe::App for MapManagerApp {
                             skin_cache.as_deref(),
                         );
                     }
+                    AppTab::Extras => {
+                        ui.heading("Extras");
+                        muted_label(ui, "Bulk tools for the whole library.");
+                        ui.separator();
+                        ui.label(egui::RichText::new("Imported background").strong());
+                        match self.extras_image_name.as_deref() {
+                            Some(name) => {
+                                ui.label(name);
+                                if let Some((width, height)) = self.extras_image_size {
+                                    muted_label(ui, format!("{width}×{height} pixels"));
+                                }
+                                if self.extras_image_bytes.is_none() {
+                                    muted_label(ui, "Still importing…");
+                                }
+                            }
+                            None => muted_label(ui, "Nothing imported yet — pick one in the main panel."),
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Library").strong());
+                        match self.scan.as_ref() {
+                            Some(scan) => {
+                                ui.label(format!("{} set(s) scanned", scan.sets.len()));
+                                ui.label(format!("{} map(s)", scan.maps.len()));
+                            }
+                            None => muted_label(ui, "Scan your library to enable Extras."),
+                        }
+                    }
                 });
             });
 
@@ -4581,8 +5643,12 @@ impl eframe::App for MapManagerApp {
         let mut repair_requested = false;
         let mut repair_single_requested: Option<i64> = None;
         let mut update_check_requested = false;
+        let mut update_check_pause_toggled = false;
+        let mut update_check_stop_requested = false;
         let mut update_all_requested = false;
         let mut update_single_requested: Option<i64> = None;
+        let mut update_pause_toggled = false;
+        let mut update_stop_requested = false;
         let mut sign_in_requested = false;
         let mut sign_out_requested = false;
         let mut delete_non_std_requested = false;
@@ -4701,6 +5767,9 @@ impl eframe::App for MapManagerApp {
                     }
                     AppTab::SkinEditor => {
                         self.skin_editor.center_page(ui, ctx);
+                    }
+                    AppTab::Extras => {
+                        self.render_extras_page(ui, ctx);
                     }
                     AppTab::Maintenance => {
                         let content_width = ui.available_width().max(1.0);
@@ -4860,6 +5929,7 @@ impl eframe::App for MapManagerApp {
                                                             "repairing",
                                                             "repaired",
                                                             "failed",
+                                                            "skipped",
                                                             entry.beatmapset_id,
                                                             &entry.message,
                                                         );
@@ -4989,11 +6059,49 @@ impl eframe::App for MapManagerApp {
                                                 update_check_requested = true;
                                             }
                                             if self.is_checking_updates || self.is_updating {
-                                                ui.add(egui::Spinner::new());
+                                                if self.is_checking_updates {
+                                                    let paused = self.update_check_paused();
+                                                    if ui
+                                                        .button(if paused {
+                                                            "▶ Resume"
+                                                        } else {
+                                                            "⏸ Pause"
+                                                        })
+                                                        .on_hover_text(
+                                                            "Pause takes effect after the current set; the in-flight request always finishes first",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        update_check_pause_toggled = true;
+                                                    }
+                                                    if ui
+                                                        .button("⏹ Stop")
+                                                        .on_hover_text(
+                                                            "Stops the check after the current request; sets already checked are kept",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        update_check_stop_requested = true;
+                                                    }
+                                                }
+                                                let paused = (self.is_checking_updates
+                                                    && self.update_check_paused())
+                                                    || (self.is_updating
+                                                        && self.update_paused());
+                                                if !paused {
+                                                    ui.add(egui::Spinner::new());
+                                                }
                                             }
                                         });
                                         if self.is_checking_updates {
-                                            wrapped_label(ui, &self.update_check_status);
+                                            wrapped_label(
+                                                ui,
+                                                if self.update_check_paused() {
+                                                    "Paused — resume to continue"
+                                                } else {
+                                                    &self.update_check_status
+                                                },
+                                            );
                                             if self.update_check_total > 0 {
                                                 ui.add(
                                                     egui::ProgressBar::new(
@@ -5019,6 +6127,17 @@ impl eframe::App for MapManagerApp {
                                                 );
                                             }
                                         }
+                                        if let Some(note) = &self.update_check_db_note {
+                                            // Own persistent row: progress messages must not be
+                                            // able to flash it away, and it stays after finish.
+                                            ui.label(
+                                                egui::RichText::new(format!("⚠ {note}"))
+                                                    .color(egui::Color32::from_rgb(
+                                                        0xd1, 0x9a, 0x4a,
+                                                    ))
+                                                    .weak(),
+                                            );
+                                        }
                                         if !self.outdated_sets.is_empty() {
                                             ui.horizontal(|ui| {
                                                 if ui
@@ -5035,11 +6154,43 @@ impl eframe::App for MapManagerApp {
                                                     update_all_requested = true;
                                                 }
                                                 if self.is_updating {
-                                                    ui.add(egui::Spinner::new());
+                                                    let paused = self.update_paused();
+                                                    if ui
+                                                        .button(if paused {
+                                                            "▶ Resume"
+                                                        } else {
+                                                            "⏸ Pause"
+                                                        })
+                                                        .on_hover_text(
+                                                            "Pause takes effect after the current set; in-flight downloads always finish first",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        update_pause_toggled = true;
+                                                    }
+                                                    if ui
+                                                        .button("⏹ Stop after current set")
+                                                        .on_hover_text(
+                                                            "Finishes the in-flight download, then stops; sets already updated are kept",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        update_stop_requested = true;
+                                                    }
+                                                    if !paused {
+                                                        ui.add(egui::Spinner::new());
+                                                    }
                                                 }
                                             });
                                             if self.is_updating {
-                                                wrapped_label(ui, &self.update_progress);
+                                                wrapped_label(
+                                                    ui,
+                                                    if self.update_paused() {
+                                                        "Paused — resume to continue"
+                                                    } else {
+                                                        &self.update_progress
+                                                    },
+                                                );
                                             }
                                             if self.update_total > 0 {
                                                 let progress = self.update_done as f32
@@ -5061,13 +6212,29 @@ impl eframe::App for MapManagerApp {
                                                 .id_source("outdated_sets")
                                                 .max_height(280.0)
                                                 .show(ui, |ui| {
-                                                    for entry in &self.update_log {
+                                                    let log_skip = self
+                                                        .update_log
+                                                        .len()
+                                                        .saturating_sub(MAX_RENDERED_REPAIR_LOG);
+                                                    if log_skip > 0 {
+                                                        muted_label(
+                                                            ui,
+                                                            format!(
+                                                                "… {} earlier log entr(ies) hidden",
+                                                                log_skip
+                                                            ),
+                                                        );
+                                                    }
+                                                    for entry in
+                                                        &self.update_log[log_skip..]
+                                                    {
                                                         status_log_label(
                                                             ui,
                                                             entry.status,
                                                             "updating",
                                                             "updated",
                                                             "failed",
+                                                            "skipped (frozen)",
                                                             entry.beatmapset_id,
                                                             &entry.message,
                                                         );
@@ -5280,11 +6447,23 @@ impl eframe::App for MapManagerApp {
         if update_check_requested {
             self.start_update_check();
         }
+        if update_check_pause_toggled {
+            self.toggle_update_check_pause();
+        }
+        if update_check_stop_requested {
+            self.stop_update_check();
+        }
         if update_all_requested {
             self.start_update_all();
         }
         if let Some(beatmapset_id) = update_single_requested {
             self.start_update_single(beatmapset_id);
+        }
+        if update_pause_toggled {
+            self.toggle_update_pause();
+        }
+        if update_stop_requested {
+            self.stop_update();
         }
         if sign_in_requested {
             self.start_oauth_login();
@@ -5366,6 +6545,41 @@ fn mode_label(mode: Option<u8>) -> &'static str {
         Some(3) => "Mania",
         _ => "Unknown",
     }
+}
+
+/// Decodes the image picked for the Extras background job on a worker
+/// thread. The decode doubles as validation — an image osu! cannot load
+/// never reaches the Apply step.
+fn load_extras_image(path: &Path) -> Result<ExtrasImage> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let decoded = image::load_from_memory(&bytes).context("decoding the image")?;
+    let size = (decoded.width(), decoded.height());
+    let preview_image = decoded.thumbnail(1200, 675).to_rgba8();
+    let preview = egui::ColorImage::from_rgba_unmultiplied(
+        [
+            preview_image.width() as usize,
+            preview_image.height() as usize,
+        ],
+        preview_image.as_raw(),
+    );
+    // The content format decides which target files can take the raw bytes
+    // unchanged, so it is sniffed from the bytes rather than the filename.
+    let ext = match image::guess_format(&bytes) {
+        Ok(image::ImageFormat::Jpeg) => "jpg".to_owned(),
+        Ok(image::ImageFormat::Png) => "png".to_owned(),
+        Ok(image::ImageFormat::WebP) => "webp".to_owned(),
+        Ok(image::ImageFormat::Bmp) => "bmp".to_owned(),
+        Ok(_) => {
+            return Err(anyhow::anyhow!("unsupported image format"));
+        }
+        Err(err) => return Err(anyhow::anyhow!("detecting image format: {err}")),
+    };
+    Ok(ExtrasImage {
+        bytes: Arc::new(bytes),
+        ext,
+        preview,
+        size,
+    })
 }
 
 fn load_background_image(path: &Path) -> Result<egui::ColorImage> {
@@ -5893,12 +7107,14 @@ fn fill_tile_width(ui: &mut egui::Ui) {
     fix_ui_width(ui, ui.available_width());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_log_label(
     ui: &mut egui::Ui,
     status: RepairLogStatus,
     in_progress: &'static str,
     success: &'static str,
     failed: &'static str,
+    skipped: &'static str,
     beatmapset_id: i64,
     message: &str,
 ) {
@@ -5906,6 +7122,7 @@ fn status_log_label(
         RepairLogStatus::InProgress => (in_progress, None),
         RepairLogStatus::Success => (success, Some(egui::Color32::from_rgb(0x7f, 0xa6, 0x86))),
         RepairLogStatus::Failed => (failed, Some(egui::Color32::from_rgb(0xc2, 0x6b, 0x72))),
+        RepairLogStatus::Skipped => (skipped, None),
     };
     let number_color = egui::Color32::from_rgb(0xb0, 0x9d, 0x7d);
 
@@ -5915,13 +7132,17 @@ fn status_log_label(
             rich = rich.color(color);
         }
         ui.label(rich);
-        ui.label("set");
-        ui.label(
-            egui::RichText::new(beatmapset_id.to_string())
-                .color(number_color)
-                .strong(),
-        );
-        ui.label("-");
+        // A zero id marks an aggregate entry that spans many sets; there is
+        // no single set number to show.
+        if beatmapset_id != 0 {
+            ui.label("set");
+            ui.label(
+                egui::RichText::new(beatmapset_id.to_string())
+                    .color(number_color)
+                    .strong(),
+            );
+            ui.label("-");
+        }
         colored_number_text(ui, message, number_color);
     });
 }
@@ -6222,7 +7443,7 @@ fn run_repair_jobs(
             index: current,
             total,
         });
-        match repair_beatmapset(&client, job, &backend_url, oauth_session.as_ref()) {
+        match repair_beatmapset(&client, job, oauth_session.as_ref()) {
             Ok(outcome) => {
                 let _ = tx.send(RepairEvent::Repaired {
                     beatmapset_id: job.beatmapset_id,
@@ -6244,6 +7465,7 @@ fn run_repair_jobs(
     let _ = tx.send(RepairEvent::Finished);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_update_check(
     targets: Vec<updates::CheckTarget>,
     uncheckable: usize,
@@ -6251,9 +7473,54 @@ fn run_update_check(
     osu_root: String,
     mut oauth_session: Option<OauthSession>,
     tx: mpsc::Sender<UpdateCheckEvent>,
+    pause: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 ) {
+    // osu!'s local database caches each map's rank status, so sets osu! will
+    // not publish updates for (ranked/approved/qualified) are dropped before
+    // any network request. A missing or unreadable osu!.db only means the
+    // online check decides — it still skips frozen statuses after the fetch.
+    // The root arrives in the portable display form (`%USERPROFILE%\...`);
+    // reading a file needs the expanded real path.
+    let osu_root_path = expand_prefilled_path(&osu_root);
+    let mut db_index_opt: Option<osu_db::OsuDbIndex> = None;
+    let mut db_error = None;
+    match osu_db::OsuDbIndex::load(&osu_root_path) {
+        Ok(db_index) => db_index_opt = Some(db_index),
+        Err(err) => db_error = Some(format!("{err:#}")),
+    }
+    let mut frozen_count = 0usize;
+    let targets: Vec<updates::CheckTarget> = targets
+        .into_iter()
+        .filter(|target| {
+            match local_frozen_status(db_index_opt.as_ref(), &target.locals) {
+                // Sets without an online id cannot be pre-filtered; the
+                // resolved ones are skipped individually in the loop below.
+                Some(_status) if target.beatmapset_id.is_some() => {
+                    frozen_count += 1;
+                    false
+                }
+                _ => true,
+            }
+        })
+        .collect();
+
     let total = targets.len();
-    let _ = tx.send(UpdateCheckEvent::Started { total, uncheckable });
+    let db_note = match db_error {
+        Some(err) => Some(format!(
+            "osu!.db unavailable: {err} — every set is checked online"
+        )),
+        None if frozen_count > 0 => Some(format!(
+            "skipped {frozen_count} ranked/approved/qualified/loved set(s) via osu!.db"
+        )),
+        None => None,
+    };
+    let _ = tx.send(UpdateCheckEvent::Started {
+        total,
+        uncheckable,
+        db_skipped: frozen_count,
+        db_note,
+    });
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -6281,6 +7548,11 @@ fn run_update_check(
 
     let mut first_request = true;
     for (position, target) in targets.iter().enumerate() {
+        // Pause and stop take effect between sets: the in-flight request
+        // always finishes first, the next set waits here.
+        if !shrink::wait_while_paused(&pause, &cancel) {
+            break;
+        }
         let done = position + 1;
         if let Some(set_id) = target.beatmapset_id {
             pace_update_requests(&mut first_request, request_delay);
@@ -6303,6 +7575,11 @@ fn run_update_check(
             ) {
                 Ok((grouped, _unresolved)) => {
                     for (set_id, resolved) in grouped {
+                        if let Some(status) = local_frozen_status(db_index_opt.as_ref(), &resolved)
+                        {
+                            send_db_skipped(&tx, set_id, status);
+                            continue;
+                        }
                         pace_update_requests(&mut first_request, request_delay);
                         check_single_set(
                             &client,
@@ -6336,6 +7613,30 @@ fn pace_update_requests(first_request: &mut bool, delay: Duration) {
     }
 }
 
+/// osu!.db rank status of the first local difficulty whose set the update
+/// check skips (ranked/approved/qualified/loved), letting the check skip
+/// the set without a network request. `None` means "check online as usual".
+fn local_frozen_status(
+    db_index: Option<&osu_db::OsuDbIndex>,
+    locals: &[updates::LocalDiffRef],
+) -> Option<u8> {
+    let db_index = db_index?;
+    locals.iter().find_map(|local| {
+        db_index
+            .get(&local.md5, &local.osu_filename)
+            .filter(|meta| !updates::db_status_can_receive_updates(meta.ranked_status))
+            .map(|meta| meta.ranked_status)
+    })
+}
+
+fn send_db_skipped(tx: &mpsc::Sender<UpdateCheckEvent>, beatmapset_id: i64, status: u8) {
+    let name = osu_db::ranked_status_name(status);
+    let _ = tx.send(UpdateCheckEvent::Skipped {
+        beatmapset_id,
+        reason: format!("{name} (osu!.db) — sets with this status are not checked"),
+    });
+}
+
 fn check_single_set(
     client: &reqwest::blocking::Client,
     backend_url: &str,
@@ -6364,6 +7665,16 @@ fn check_single_set(
             });
         }
         Ok(Some(remote)) => {
+            // Ranked, approved, qualified and loved sets are skipped by
+            // policy (see `updates::can_receive_updates`): skip the checksum
+            // comparison entirely instead of flagging local drift.
+            if !updates::can_receive_updates(&remote.status) {
+                let _ = tx.send(UpdateCheckEvent::Skipped {
+                    beatmapset_id,
+                    reason: format!("{} — sets with this status are not checked", remote.status),
+                });
+                return;
+            }
             let title = format!("{} - {}", remote.artist, remote.title);
             let set = updates::detect_outdated(
                 beatmapset_id,
@@ -6386,6 +7697,8 @@ fn run_update_jobs(
     osu_root: String,
     mut oauth_session: Option<OauthSession>,
     tx: mpsc::Sender<UpdateEvent>,
+    pause: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 ) {
     let total = jobs.len();
     let _ = tx.send(UpdateEvent::Started { total });
@@ -6405,6 +7718,11 @@ fn run_update_jobs(
         .map(|session| session.access_token.as_str());
 
     for (index, job) in jobs.iter().enumerate() {
+        // Pause and stop take effect between sets: the in-flight download
+        // always finishes first, the next set waits here.
+        if !shrink::wait_while_paused(&pause, &cancel) {
+            break;
+        }
         let current = index + 1;
         if index > 0 {
             thread::sleep(BEATMAPSET_DOWNLOAD_DELAY);
@@ -6444,13 +7762,8 @@ struct RepairOutcome {
 fn repair_beatmapset(
     client: &reqwest::blocking::Client,
     job: &RepairJob,
-    backend_url: &str,
     oauth_session: Option<&OauthSession>,
 ) -> Result<RepairOutcome> {
-    if backend_url.trim().is_empty() {
-        anyhow::bail!("backend URL is required for automatic repair downloads");
-    }
-
     let temp_path = std::env::temp_dir()
         .join("osu-map-manager-repairs")
         .join(format!("{}.osz", job.beatmapset_id));
@@ -6459,13 +7772,8 @@ fn repair_beatmapset(
     }
 
     let access_token = oauth_session.map(|session| session.access_token.as_str());
-    let download_source = updates::download_beatmapset_file(
-        client,
-        backend_url,
-        job.beatmapset_id,
-        access_token,
-        &temp_path,
-    )?;
+    let download_source =
+        updates::download_beatmapset_file(client, job.beatmapset_id, access_token, &temp_path)?;
     updates::verify_osz(&temp_path)?;
     let mut restored = BTreeSet::new();
     for folder in &job.folders {
@@ -6647,6 +7955,34 @@ fn skin_cache_path_for(osu_root: &str) -> Option<PathBuf> {
 /// Where the shrink tab persists already-shrunk files.
 fn shrink_cache_path(osu_root: &str) -> PathBuf {
     app_data_path(osu_root).join("shrink_cache.json")
+}
+
+fn extras_backup_dir(osu_root: &str) -> PathBuf {
+    app_data_path(osu_root).join("extras-backups")
+}
+
+fn extras_cache_path(osu_root: &str) -> PathBuf {
+    app_data_path(osu_root).join("extras_cache.json")
+}
+
+/// Summarizes the newest rollback manifest in the backups dir. Manifest
+/// names are timestamps, so the lexicographic maximum is the newest apply.
+fn read_last_extras_job(osu_root: &str) -> Option<LastExtrasJob> {
+    let dir = extras_backup_dir(osu_root);
+    let newest = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| entry.path())
+        .max()?;
+    let bytes = fs::read(&newest).ok()?;
+    let manifest: ExtrasManifest = serde_json::from_slice(&bytes).ok()?;
+    Some(LastExtrasJob {
+        manifest_path: newest,
+        when: manifest.when,
+        image_name: manifest.image_name,
+        folders: manifest.folders.len(),
+    })
 }
 
 fn app_data_path(osu_root: &str) -> PathBuf {

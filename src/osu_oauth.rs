@@ -207,7 +207,7 @@ pub fn check_backend_blocking(client: &reqwest::blocking::Client, backend_url: &
     let response = client
         .get(format!("{backend}/oauth/check"))
         .send()
-        .context("reaching the sign-in backend")?;
+        .map_err(|err| crate::updates::transport_error("reaching the sign-in backend", &err))?;
     let check: CheckResponse = response
         .json()
         .context("decoding the sign-in backend response")?;
@@ -262,7 +262,9 @@ pub fn exchange_code_blocking(
             ("code_verifier", code_verifier),
         ])
         .send()
-        .context("exchanging the osu! authorization code")?;
+        .map_err(|err| {
+            crate::updates::transport_error("exchanging the osu! authorization code", &err)
+        })?;
     token_session_from_response(response, "sign-in")
 }
 
@@ -300,10 +302,9 @@ pub fn refresh_blocking(
         .post(format!("{backend}/oauth/refresh"))
         .form(&[("refresh_token", refresh_token)])
         .send()
-        .context("refreshing the osu! access token")
         .map_err(|err| RefreshError {
             permanent: false,
-            err,
+            err: crate::updates::transport_error("refreshing the osu! access token", &err),
         })?;
     if response.status().is_success() {
         return response
