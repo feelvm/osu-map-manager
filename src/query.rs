@@ -69,17 +69,18 @@ fn trim_number(value: f32) -> String {
 /// Game mode picked from a dropdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ModeFilter {
-    /// osu!standard (also the default, matching previous behaviour).
+    /// The default: showing every mode means a taiko/catch/mania player's
+    /// first scan is not silently missing most of their library.
     #[default]
-    Osu,
     Any,
+    Osu,
     Taiko,
     Catch,
     Mania,
 }
 
 impl ModeFilter {
-    pub const ALL: [Self; 5] = [Self::Osu, Self::Any, Self::Taiko, Self::Catch, Self::Mania];
+    pub const ALL: [Self; 5] = [Self::Any, Self::Osu, Self::Taiko, Self::Catch, Self::Mania];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -186,44 +187,9 @@ impl BeatmapFilters {
             && self.mode.matches(map.mode)
     }
 
-    /// Number of active filters, for the sidebar badge.
-    pub fn active_count(&self) -> usize {
-        let mut count = 0;
-        for text in [
-            &self.artist,
-            &self.title,
-            &self.mapper,
-            &self.difficulty,
-            &self.tag,
-        ] {
-            if !text.trim().is_empty() {
-                count += 1;
-            }
-        }
-        for range in [
-            &self.stars,
-            &self.ar,
-            &self.cs,
-            &self.od,
-            &self.hp,
-            &self.bpm,
-        ] {
-            if range.enabled {
-                count += 1;
-            }
-        }
-        if parse_bound(&self.length_min).is_some() || parse_bound(&self.length_max).is_some() {
-            count += 1;
-        }
-        if self.mode != ModeFilter::Any {
-            count += 1;
-        }
-        count
-    }
-
     pub fn clear_all(&mut self) {
-        // Reset to defaults (standard mode), not to "Any": Clear means "start
-        // over", matching the initial filter state and the sidebar badge.
+        // Reset to defaults (any mode), not to a specific mode: Clear means
+        // "start over", matching the initial filter state.
         let fresh = Self::with_full_ranges();
         self.artist.clear();
         self.title.clear();
@@ -346,6 +312,7 @@ mod tests {
         query.artist = "Camellia".into();
         query.stars.enabled = true;
         query.stars.min = 5.5;
+        query.mode = ModeFilter::Osu;
 
         assert_eq!(query.to_osu_search(), "artist=Camellia stars>=5.5 mode=osu");
     }
@@ -357,6 +324,8 @@ mod tests {
         assert!(query.ar.enabled);
         assert!(query.cs.enabled);
         assert!(!query.od.enabled);
+        // "Any mode" is the default so non-std players see their whole library.
+        assert_eq!(query.mode, ModeFilter::Any);
 
         let map = LocalBeatmap {
             artist: "Camellia".into(),
@@ -384,7 +353,12 @@ mod tests {
             cs: Some(4.0),
             ..Default::default()
         };
-        assert!(!query.matches_local(&taiko));
+        assert!(query.matches_local(&taiko));
+
+        // Picking a mode excludes the others again.
+        let mut osu_only = filters();
+        osu_only.mode = ModeFilter::Osu;
+        assert!(!osu_only.matches_local(&taiko));
     }
 
     #[test]

@@ -20,7 +20,7 @@ star rating, length, mode, and other fields, then write the selected results int
 - Ignore missing backgrounds if you deleted them to save space.
 - Delete natively mapped taiko, catch, or mania `.osu` files you do not want.
 - Preview installed skins and remix their elements in the Skin Editor.
-- Set one image as the background of every beatmap in the library from the Extras tab,
+- Set one image as the background of every beatmap in the library from the Backgrounds tab,
   without touching any `.osu`/`.osb` file (rollback included).
 - Update the app itself from GitHub Releases.
 
@@ -55,14 +55,14 @@ executable under `target\release\` without starting it.
 ## Basic Workflow
 
 The app is organized into tabs: `Library` (scan, filter and pick maps),
-`Collections` (build and save collections), `Maintenance` (repair, update and
+`Collections` (build and save collections), `Fix maps` (repair, update and
 clean up), `Shrink` (compress audio, video and backgrounds), `Skin Editor`
-(preview, remix and save skins), and `Extras` (bulk tools for the whole
-library).
+(preview, remix and save skins), and `Backgrounds` (one background for every
+map).
 
 1. Open osu! Map Manager.
-2. Confirm the auto-detected osu! `Songs` folder.
-3. Click scan to read your installed beatmaps.
+2. Confirm the auto-detected osu! `Songs` folder (or pick a different one with `Change…`).
+3. Click `Load my maps` to read your installed beatmaps.
 4. Add one or more filters.
 5. Review the matching maps.
 6. Select the maps you want in the collection.
@@ -117,14 +117,14 @@ After writing, start osu! and check the Collections tab.
 The app can detect installed maps that reference missing required files, such as missing audio or
 background files.
 
-Open the `Maintenance` tab to fix them. Each affected beatmapset lists its missing files
+Open the `Fix maps` tab to fix them. Each affected beatmapset lists its missing files
 and has its own `Repair this set` button (or use `Repair all`). Repair redownloads the
 beatmapset through the built-in backend and restores only the missing files,
 so your local scores and edits are left untouched. The log reports where each download came from
 and which files were restored; repaired folders are rescanned automatically afterwards.
 
 If you deleted beatmap backgrounds yourself to save space, turn on `Ignore missing backgrounds`
-(sidebar `⚙ Advanced` section, or the `Maintenance` tab): missing-background findings then
+(sidebar `⚙ Advanced` section, or the `Fix maps` tab): missing-background findings then
 disappear from the issue counts, lists and repair jobs, while missing audio is still reported.
 The choice is saved per library.
 
@@ -139,7 +139,7 @@ Your osu! OAuth app must have its callback URL set to exactly
 ## Updating Outdated Maps
 
 osu! marks maps with `update to latest version` when the installed `.osu` file no longer matches
-the online version. The `Maintenance` tab has an `Update outdated beatmaps` section that
+the online version. The `Fix maps` tab has an `Update outdated beatmaps` section that
 does the same comparison in bulk:
 
 1. Click `Check for updates`. The app compares every installed difficulty that has an online
@@ -157,7 +157,7 @@ beatmap id cannot be checked.
 
 ## Cleaning up Non-Standard Modes
 
-The `Maintenance` tab has a `Clean up non-std modes` section that removes natively mapped
+The `Fix maps` tab has a `Clean up non-std modes` section that removes natively mapped
 taiko, catch, and mania `.osu` files from your library. Tick the modes you want gone, then
 click `Delete selected non-std maps` and confirm.
 
@@ -184,14 +184,14 @@ From there you can:
 
 ## Updating the App
 
-The `↻ Update` button in the sidebar opens an `App update` window that checks GitHub Releases
+The `⚙` button in the top bar opens an `App update` window that checks GitHub Releases
 for a newer version. If one is available, `Download & restart` fetches it, replaces the app
 executable, and restarts the app automatically. Checking is manual; nothing happens in the
 background.
 
 ## Exporting a Map List
 
-Use TSV export when you want a plain-text list of the selected maps before writing a collection.
+Use `Export list` when you want a plain-text (TSV) list of the selected maps before saving a collection.
 
 ## Shrinking Beatmap Assets
 
@@ -199,7 +199,7 @@ The `Shrink` tab compresses song audio, background video/images and skins to sav
 
 1. Scan your library, then open `Shrink` and click `Analyze library` (and optionally
    `Analyze skins` for `<osu root>/Skins`).
-2. Review the totals; analysis and shrinking can be stopped or paused at any time.
+2. Review the totals; checking and shrinking can be stopped or paused at any time.
 3. Click `Shrink N set(s)` to process everything analyzed.
 
 Rules that keep the library safe:
@@ -223,13 +223,13 @@ Rules that keep the library safe:
 - Skins get a pixels-exact pass only (same names, same dimensions, tighter encodes);
   `skin.ini` and skin sounds are left alone.
 
-## Extras: One Background for Every Beatmap
+## Backgrounds: One Background for Every Beatmap
 
-The `Extras` tab applies one change across the whole scanned library. Its first tool
+The `Backgrounds` tab applies one change across the whole scanned library. Its first tool
 replaces the background of every beatmap with a single image — **without ever altering
 `.osu` or `.osb` files**:
 
-1. Scan your library, then open `Extras` and click `Choose image…` (jpg, png, webp or bmp).
+1. Scan your library, then open `Backgrounds` and click `Choose image…` (jpg, png, webp or bmp).
 2. Check the preview, then click `Set background on N set(s)`. A confirmation dialog
    states the scope before anything is written. Close osu! first.
 3. For every background file the scanned charts reference, the image content is
@@ -258,10 +258,10 @@ original), the entry no longer counts and the file is replaced again.
 ### Rolling back
 
 Every apply writes a rollback manifest (plus backup copies of each replaced image)
-under `.osu-map-manager/extras-backups/`. The `Rollback` card shows the newest apply
+under `.osu-map-manager/extras-backups/`. The `Undo` card shows the newest apply
 and can undo it:
 
-1. Click `Roll back to original backgrounds`. Close osu! first.
+1. Click `↩ Undo background change`. Close osu! first.
 2. Every replaced background file gets its original content back, byte-identical.
    Backgrounds the job *created* (a chart referenced a file that was missing) are
    removed again.

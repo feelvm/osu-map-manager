@@ -1525,6 +1525,14 @@ fn split_version_suffix(name: &str) -> (&str, Option<u32>) {
     (name, None)
 }
 
+/// "1 file" / "3 files" — no "(s)" doc-speak in user-visible strings.
+fn plural_word(count: usize, singular: &str, plural_form: &str) -> String {
+    format!(
+        "{count} {}",
+        if count == 1 { singular } else { plural_form }
+    )
+}
+
 /// Next free `"<base> v<N>"` name: starts at v1, or one past the base's own
 /// version suffix, skipping versions that already exist on disk.
 pub fn next_versioned_name(base: &str, skins_dir: &Path) -> String {
@@ -1618,13 +1626,18 @@ pub fn save_skin(
     base: &SkinSummary,
     overrides: &[(String, PoolEntry)],
     resizes: &[(String, f32)],
+    target_name: Option<&str>,
 ) -> Result<SaveOutcome> {
     let skins_dir = base
         .path
         .parent()
         .with_context(|| format!("skin folder {} has no parent", base.path.display()))?
         .to_path_buf();
-    let target_name = next_versioned_name(&base.folder_name, &skins_dir);
+    let target_name = target_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| next_versioned_name(&base.folder_name, &skins_dir));
     let target = skins_dir.join(&target_name);
     fs::create_dir_all(&target)
         .with_context(|| format!("creating skin folder {}", target.display()))?;
@@ -1932,7 +1945,7 @@ fn skipped_note(skipped: &[String]) -> String {
     }
     const MAX_LISTED: usize = 5;
     let mut note = format!(
-        " Skipped {} file(s) with no matching element: {}",
+        " Skipped {} with no matching element: {}",
         skipped.len(),
         skipped
             .iter()
@@ -2091,6 +2104,11 @@ pub struct SkinEditorState {
     save_rx: Option<Receiver<Result<SaveOutcome>>>,
     save_status: Option<String>,
     save_ok: bool,
+    /// Save asks through a small dialog (name prefilled with the next free
+    /// "vN"), so "creates a copy, original untouched" is visible before it
+    /// happens instead of only in muted sidebar text.
+    save_dialog_open: bool,
+    save_dialog_name: String,
     failsound_status: Option<String>,
     failsound_ok: bool,
     /// Skin path the status message above belongs to. Without the pin,
@@ -2136,6 +2154,8 @@ impl SkinEditorState {
             save_rx: None,
             save_status: None,
             save_ok: false,
+            save_dialog_open: false,
+            save_dialog_name: String::new(),
             failsound_status: None,
             failsound_ok: false,
             failsound_status_for: None,
@@ -2283,8 +2303,10 @@ impl SkinEditorState {
                             // folder; select it once it arrives.
                             self.pending_select_folder = Some(outcome.name.clone());
                             let mut message = format!(
-                                "Saved \"{}\" — {} file(s) copied, {} element(s) replaced",
-                                outcome.name, outcome.files_copied, outcome.overrides_applied
+                                "Saved \"{}\" — {}, {} replaced",
+                                outcome.name,
+                                plural_word(outcome.files_copied, "file", "files"),
+                                plural_word(outcome.overrides_applied, "element", "elements")
                             );
                             if outcome.resizes_applied > 0 {
                                 message.push_str(&format!(", {} resized", outcome.resizes_applied));
@@ -2434,7 +2456,70 @@ impl SkinEditorState {
         assets
     }
 
-    fn start_save(&mut self) {
+    /// Opens the save dialog with the next free version name prefilled.
+    fn open_save_dialog(&mut self) {
+        if self.is_saving {
+            return;
+        }
+        let Some(base) = self.selected_skin() else {
+            return;
+        };
+        let Some(dir) = self.scanned_dir.clone() else {
+            return;
+        };
+        self.save_dialog_name = next_versioned_name(&base.folder_name, &dir);
+        self.save_dialog_open = true;
+    }
+
+    /// The save dialog itself; call every frame from the app update loop.
+    pub fn show_save_dialog(&mut self, ctx: &egui::Context) {
+        if !self.save_dialog_open {
+            return;
+        }
+        let mut close = false;
+        let mut confirm = false;
+        egui::Window::new("Save skin copy?")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("This creates a new skin folder — your original skin is not modified.");
+                ui.add_space(6.0);
+                ui.scope(|ui| {
+                    ui.visuals_mut().override_text_color = None;
+                    ui.add_sized(
+                        [ui.available_width().max(120.0), 28.0],
+                        egui::TextEdit::singleline(&mut self.save_dialog_name)
+                            .hint_text("New skin name")
+                            .vertical_align(egui::Align::Center),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.save_dialog_name.trim().is_empty(),
+                            egui::Button::new("Save copy"),
+                        )
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+            });
+        if close || confirm {
+            self.save_dialog_open = false;
+        }
+        if confirm {
+            self.start_save(self.save_dialog_name.trim().to_owned());
+        }
+    }
+
+    fn start_save(&mut self, target_name: String) {
         if self.is_saving {
             return;
         }
@@ -2456,7 +2541,7 @@ impl SkinEditorState {
         self.save_status = None;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = save_skin(&base, &overrides, &resizes);
+            let result = save_skin(&base, &overrides, &resizes, Some(&target_name));
             let _ = tx.send(result);
         });
         self.save_rx = Some(rx);
@@ -2562,10 +2647,10 @@ impl SkinEditorState {
                     muted_label(
                         ui,
                         format!(
-                            "{}/{} elements · {} file(s)",
+                            "{}/{} elements · {}",
                             skin.element_count(),
                             total_file_count(),
-                            skin.file_count
+                            plural_word(skin.file_count, "file", "files")
                         ),
                     );
                 });
@@ -2596,8 +2681,8 @@ impl SkinEditorState {
                 muted_label(
                     ui,
                     format!(
-                        "{} slot(s) replaced from the pool; the rest is copied from the base skin.",
-                        self.overrides.len()
+                        "{} replaced from the pool; the rest is copied from the base skin.",
+                        plural_word(self.overrides.len(), "slot", "slots")
                     ),
                 );
                 if (self.cursor_resize - 1.0).abs() > 1e-3 {
@@ -2622,7 +2707,7 @@ impl SkinEditorState {
                     )
                     .clicked()
                 {
-                    self.start_save();
+                    self.open_save_dialog();
                 }
             } else {
                 muted_label(ui, "No Skins folder set.");
@@ -2708,8 +2793,9 @@ impl SkinEditorState {
                                     base_path,
                                     true,
                                     format!(
-                                        "Hid {count} failsound file(s) from \"{base_label}\" — \
-                                         restore them here anytime."
+                                        "Hid {} from \"{base_label}\" — \
+                                         restore them here anytime.",
+                                        plural_word(count, "failsound file", "failsound files")
                                     ),
                                 );
                                 // Renames are mirrored into the skin summary
@@ -2750,7 +2836,10 @@ impl SkinEditorState {
                         self.set_failsound_status(
                             base_path,
                             true,
-                            format!("Restored {count} failsound file(s) to \"{base_label}\"."),
+                            format!(
+                            "Restored {} to \"{base_label}\".",
+                            plural_word(count, "failsound file", "failsound files")
+                        ),
                         );
                         self.move_failsound_entries(base_path, false);
                     }
@@ -2875,8 +2964,8 @@ impl SkinEditorState {
         self.import_ok = touched;
         self.import_status = Some(if imported_files > 0 {
             format!(
-                "Imported {} file(s) into: {} — set as the active picks.{}",
-                imported_files,
+                "Imported {} into: {} — set as the active picks.{}",
+                plural_word(imported_files, "file", "files"),
                 labels.join(", "),
                 skipped_note(&skipped),
             )
@@ -3113,9 +3202,10 @@ impl SkinEditorState {
                     let save_enabled = self.selected_skin().is_some() && !self.is_saving;
                     if ui
                         .add_enabled(save_enabled, egui::Button::new("💾 Save skin"))
+                        .on_hover_text("Opens the save dialog — the original skin is never modified")
                         .clicked()
                     {
-                        self.start_save();
+                        self.open_save_dialog();
                     }
                     if ui
                         .add_enabled(
@@ -3136,16 +3226,24 @@ impl SkinEditorState {
                 let imported_count: usize = self.imported.values().map(Vec::len).sum();
                 muted_label(ui, if imported_count > 0 {
                     format!(
-                        "{} pooled asset(s) across {} skin(s) · {} imported",
-                        self.pool.values().map(Vec::len).sum::<usize>(),
-                        self.skins.len(),
+                        "{} across {} · {} imported",
+                        plural_word(
+                            self.pool.values().map(Vec::len).sum::<usize>(),
+                            "pooled asset",
+                            "pooled assets"
+                        ),
+                        plural_word(self.skins.len(), "skin", "skins"),
                         imported_count
                     )
                 } else {
                     format!(
-                        "{} pooled asset(s) across {} skin(s)",
-                        self.pool.values().map(Vec::len).sum::<usize>(),
-                        self.skins.len()
+                        "{} across {}",
+                        plural_word(
+                            self.pool.values().map(Vec::len).sum::<usize>(),
+                            "pooled asset",
+                            "pooled assets"
+                        ),
+                        plural_word(self.skins.len(), "skin", "skins")
                     )
                 });
             });
@@ -3259,7 +3357,13 @@ impl SkinEditorState {
             if slot.files.len() == 1 {
                 muted_label(ui, slot.files[0]);
             } else {
-                muted_label(ui, format!("{} file(s) as one set", slot.files.len()));
+                muted_label(
+                    ui,
+                    format!(
+                        "{} as one set",
+                        plural_word(slot.files.len(), "file", "files")
+                    )
+                );
             }
             if let Some(entry) = &override_entry {
                 muted_label(ui, format!("← {} ({})", entry.skin, entry.files.len()));
@@ -3385,7 +3489,7 @@ impl SkinEditorState {
                                 |name| name.to_string_lossy().to_string(),
                             )
                     } else {
-                        format!("{} file(s)", entry.files.len())
+                        format!("{}", plural_word(entry.files.len(), "file", "files"))
                     };
                     let mut hover = if entry.skin == IMPORTED_SKIN {
                         format!("Imported asset — {summary}")
@@ -3397,8 +3501,9 @@ impl SkinEditorState {
                     }
                     if !entry.also_in.is_empty() {
                         hover.push_str(&format!(
-                            "\nIdentical in {} other skin(s): {}",
-                            entry.also_in.len(),
+                            "\nIdentical in {} other {}: {}",
+                            plural_word(entry.also_in.len(), "skin", "skins"),
+                            entry.also_in.join(", "),
                             entry.also_in.join(", ")
                         ));
                     }
@@ -4750,6 +4855,7 @@ mod tests {
                 },
             )],
             &[],
+            None,
         )
         .unwrap();
 
@@ -4773,7 +4879,7 @@ mod tests {
             .into_iter()
             .find(|s| s.folder_name == "Base v1")
             .unwrap();
-        assert_eq!(save_skin(&derived, &[], &[]).unwrap().name, "Base v2");
+        assert_eq!(save_skin(&derived, &[], &[], None).unwrap().name, "Base v2");
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -4982,7 +5088,7 @@ mod tests {
             .into_iter()
             .find(|skin| skin.folder_name == "Base")
             .unwrap();
-        let outcome = save_skin(&base_skin, &[], &[("cursor".to_owned(), 0.5)]).unwrap();
+        let outcome = save_skin(&base_skin, &[], &[("cursor".to_owned(), 0.5)], None).unwrap();
         assert_eq!(outcome.overrides_applied, 0);
         assert_eq!(outcome.resizes_applied, 1);
 
@@ -5046,6 +5152,7 @@ mod tests {
                 },
             )],
             &[("cursor".to_owned(), 0.5)],
+            None,
         )
         .unwrap();
         assert_eq!(outcome.overrides_applied, 1);
@@ -5133,7 +5240,7 @@ mod tests {
         assert_eq!(state.overrides["cursor"].files["cursor.png"], cursor);
         assert!(state.import_ok);
         let status = state.import_status.clone().unwrap();
-        assert!(status.contains("2 file(s)"), "{status}");
+        assert!(status.contains("2 files"), "{status}");
 
         // Re-importing identical files collapses into the existing tile and
         // keeps the pick.

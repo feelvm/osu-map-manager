@@ -358,7 +358,9 @@ pub fn fetch_beatmap_blocking(
 }
 
 /// Official osu! API download endpoint — the same one the website uses,
-/// called with the signed-in user's own token.
+/// called with the signed-in user's own token. `download_from` appends the
+/// `{id}/download` suffix; the bare `beatmapsets/{id}` endpoint is the
+/// metadata API and would return JSON instead of the archive.
 const OSU_API_DOWNLOAD_BASE_URL: &str = "https://osu.ppy.sh/api/v2/beatmapsets";
 /// Public beatmap mirror used when there is no osu! sign-in. Downloads go
 /// straight to the mirror instead of through the backend Worker.
@@ -414,7 +416,7 @@ pub fn download_beatmapset_file(
     {
         match download_from(
             client,
-            OSU_API_DOWNLOAD_BASE_URL,
+            &format!("{OSU_API_DOWNLOAD_BASE_URL}/{beatmapset_id}/download"),
             beatmapset_id,
             Some(token),
             APP_USER_AGENT,
@@ -426,7 +428,7 @@ pub fn download_beatmapset_file(
     }
     download_from(
         client,
-        MIRROR_DOWNLOAD_BASE_URL,
+        &format!("{MIRROR_DOWNLOAD_BASE_URL}/{beatmapset_id}"),
         beatmapset_id,
         None,
         MIRROR_USER_AGENT,
@@ -441,7 +443,7 @@ pub fn download_beatmapset_file(
 
 fn download_from(
     client: &reqwest::blocking::Client,
-    base_url: &str,
+    url: &str,
     beatmapset_id: i64,
     access_token: Option<&str>,
     user_agent: &str,
@@ -449,7 +451,7 @@ fn download_from(
 ) -> Result<()> {
     let context = format!("downloading beatmapset {beatmapset_id}");
     let mut request = client
-        .get(format!("{base_url}/{beatmapset_id}"))
+        .get(url)
         .header(reqwest::header::USER_AGENT, user_agent)
         .header(reqwest::header::ACCEPT, "application/octet-stream");
     if let Some(token) = access_token {
@@ -460,6 +462,24 @@ fn download_from(
         .map_err(|err| transport_error(&context, &err))?
         .error_for_status()
         .map_err(|err| transport_error(&context, &err))?;
+    // A 200 can still carry metadata or an error page (wrong endpoint, a
+    // queue/login interstitial). Refuse non-archive payloads here so the
+    // fallback source gets a chance, instead of writing a corrupt .osz that
+    // only fails later in zip validation.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.contains("json")
+        || content_type.contains("html")
+        || content_type.starts_with("text/")
+    {
+        anyhow::bail!(
+            "{context}: the server returned {content_type} instead of a beatmapset archive"
+        );
+    }
     let mut file = fs::File::create(destination)
         .with_context(|| format!("creating {}", destination.display()))?;
     // Read one byte past the cap so an over-long stream is detected instead
@@ -510,7 +530,8 @@ pub fn verify_osz(osz_path: &Path) -> Result<()> {
     let file = fs::File::open(osz_path)?;
     zip::ZipArchive::new(file).with_context(|| {
         format!(
-            "download for {} is not a valid .osz archive",
+            "download for {} is not a valid .osz archive — the download was \
+             interrupted or the server sent something other than the beatmapset",
             osz_path.display()
         )
     })?;
@@ -528,6 +549,10 @@ pub struct UpdateOutcome {
     pub written_files: Vec<String>,
     pub removed_files: Vec<String>,
     pub download_source: String,
+    /// Set when the update installed cleanly but some difficulties still
+    /// disagree with osu!web's checksums after a re-check — reported to the
+    /// user as a note on the success instead of failing the update.
+    pub checksum_note: Option<String>,
 }
 
 pub fn temp_osz_path(beatmapset_id: i64) -> PathBuf {
@@ -538,9 +563,12 @@ pub fn temp_osz_path(beatmapset_id: i64) -> PathBuf {
 
 /// Applies a full update: downloads the latest `.osz`, overwrites every file
 /// it contains, deletes local `.osu` files the new version dropped, and
-/// verifies each surviving difficulty against its online checksum. Remote
-/// metadata is fetched fresh so the verification always targets the version
-/// being installed.
+/// checks each surviving difficulty against its online checksum. Remote
+/// metadata is fetched fresh so the verification targets the version being
+/// installed; a residual checksum disagreement is reported as a note on the
+/// outcome instead of a failure, because the installed files are by then
+/// byte-identical to what the download server serves (osu!'s metadata can
+/// lag its own file store, and mirror copies can lag a fresh update).
 pub fn apply_update_blocking(
     client: &reqwest::blocking::Client,
     backend_url: &str,
@@ -557,16 +585,7 @@ pub fn apply_update_blocking(
                 job.beatmapset_id
             )
         })?;
-    let expected_checksums = remote
-        .beatmaps
-        .iter()
-        .filter_map(|beatmap| {
-            beatmap
-                .checksum
-                .clone()
-                .map(|checksum| (beatmap.id, checksum))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let expected_checksums = checksums_from_set(&remote);
 
     let temp_path = temp_osz_path(job.beatmapset_id);
     if let Some(parent) = temp_path.parent() {
@@ -594,8 +613,74 @@ pub fn apply_update_blocking(
     outcome.written_files = written.into_iter().collect();
     outcome.removed_files = removed.into_iter().collect();
 
-    verify_updated_checksums(job, &expected_checksums)?;
+    // The freshly served archive is the download server's current copy, so a
+    // checksum disagreement means the metadata and the file store disagreed
+    // mid-update (cache lag, or the set changed again during the download).
+    // Give the metadata one moment to settle, then re-check; whatever still
+    // disagrees is surfaced as a note rather than failing the whole update —
+    // the next check re-evaluates against osu!web either way.
+    let mut mismatches = match updated_checksum_mismatches(job, &expected_checksums) {
+        Ok(mismatches) => mismatches,
+        Err(err) => {
+            outcome.checksum_note = Some(format!(
+                "the updated files could not be re-checked against osu!web: {err:#}"
+            ));
+            return Ok(outcome);
+        }
+    };
+    if !mismatches.is_empty() {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if let Ok(Some(fresh)) =
+            fetch_set_meta_blocking(client, backend_url, access_token, job.beatmapset_id)
+            && let Ok(fresh_mismatches) =
+                updated_checksum_mismatches(job, &checksums_from_set(&fresh))
+        {
+            mismatches = fresh_mismatches;
+        }
+    }
+    if !mismatches.is_empty() {
+        let shown = mismatches
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if mismatches.len() > 3 {
+            format!(" (+{} more)", mismatches.len() - 3)
+        } else {
+            String::new()
+        };
+        let cause = if outcome.download_source == "mirror" {
+            "the metadata may still be catching up, or the mirror's copy is stale"
+        } else {
+            "osu!'s metadata may still be catching up"
+        };
+        outcome.checksum_note = Some(format!(
+            "{} {} osu!web's checksums ({shown}{more}; {cause}) — run Check for updates again later",
+            mismatches.len(),
+            if mismatches.len() == 1 {
+                "difficulty does not match"
+            } else {
+                "difficulties do not match"
+            },
+        ));
+    }
     Ok(outcome)
+}
+
+/// `beatmap id → checksum` for every difficulty the metadata carries a
+/// checksum for.
+fn checksums_from_set(remote: &RemoteSetMeta) -> BTreeMap<i64, String> {
+    remote
+        .beatmaps
+        .iter()
+        .filter_map(|beatmap| {
+            beatmap
+                .checksum
+                .clone()
+                .map(|checksum| (beatmap.id, checksum))
+        })
+        .collect()
 }
 
 struct FullExtractReport {
@@ -683,14 +768,15 @@ fn remove_stale_osu_files(
     Ok(removed)
 }
 
-/// Re-reads every `.osu` in the updated folders and confirms difficulties
-/// with a known online checksum match it.
-fn verify_updated_checksums(
+/// Re-reads every `.osu` in the updated folders and lists difficulties with
+/// a known online checksum whose local md5 disagrees with it. Empty means
+/// everything that can be confirmed matches.
+fn updated_checksum_mismatches(
     job: &UpdateJob,
     expected_checksums: &BTreeMap<i64, String>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     if expected_checksums.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut mismatched = Vec::new();
     for folder in &job.folders {
@@ -726,13 +812,7 @@ fn verify_updated_checksums(
             }
         }
     }
-    if mismatched.is_empty() {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "updated files do not match the online checksums (set updated again afterwards?): {}",
-        mismatched.join(", ")
-    )
+    Ok(mismatched)
 }
 
 /// Reads `BeatmapID` from raw `.osu` bytes without full parsing.

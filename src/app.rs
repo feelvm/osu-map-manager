@@ -71,7 +71,14 @@ const UPDATE_CHECK_DELAY_ANONYMOUS: Duration = Duration::from_millis(1100);
 pub struct MapManagerApp {
     active_tab: AppTab,
     filters: BeatmapFilters,
+    /// Mode filter as of the previous frame, so switching it can report how
+    /// many selected maps no longer match instead of silently dropping them.
+    last_mode_filter: ModeFilter,
     songs_dir: String,
+    /// Whether the raw Songs-folder path field is shown. Hidden behind a
+    /// "Change…" button once a folder is detected so the first screen is a
+    /// status, not a filesystem path.
+    songs_dir_editing: bool,
     /// osu! root derived from `songs_dir` (its parent when pointing at a
     /// `Songs` folder). Tracks which install the per-library state belongs to.
     loaded_root: String,
@@ -79,6 +86,7 @@ pub struct MapManagerApp {
     collections: Vec<collection::CollectionEntry>,
     selected_collection_index: Option<usize>,
     collection_missing_hashes: Vec<String>,
+    collection_notice: Option<CollectionNotice>,
     oauth_session: Option<OauthSession>,
     oauth_status: String,
     oauth_pending_url: Option<String>,
@@ -272,11 +280,36 @@ enum DeleteIntent {
         hashes: usize,
         exists: bool,
     },
+    RenameCollection {
+        old: String,
+        new: String,
+    },
     /// Bulk background replacement asks for explicit confirmation because it
     /// overwrites the background image files across the whole library.
     SetBackground {
         sets: usize,
     },
+    /// Shrink overwrites the audio/video/image contents of every analyzed
+    /// set, so it confirms just like the other whole-library writes.
+    ShrinkRun {
+        sets: usize,
+    },
+    RestoringShrinkBackup {
+        index: usize,
+        folder: String,
+    },
+    ExtrasRollback {
+        folders: usize,
+        image_name: String,
+    },
+}
+
+/// Inline result of the last collection action, shown on the Collections
+/// page itself instead of only in the bottom status bar.
+#[derive(Clone)]
+struct CollectionNotice {
+    ok: bool,
+    message: String,
 }
 
 /// What the automatic backup holds: when it was written and how many
@@ -325,10 +358,10 @@ impl AppTab {
         match self {
             Self::Library => "Library",
             Self::Collections => "Collections",
-            Self::Maintenance => "Maintenance",
+            Self::Maintenance => "Fix maps",
             Self::Shrink => "Shrink",
             Self::SkinEditor => "Skin Editor",
-            Self::Extras => "Extras",
+            Self::Extras => "Backgrounds",
         }
     }
 
@@ -339,7 +372,7 @@ impl AppTab {
             Self::Maintenance => "Repair, update and clean up",
             Self::Shrink => "Compress audio, video and backgrounds",
             Self::SkinEditor => "Preview, remix and save skins",
-            Self::Extras => "Bulk tools for the whole library",
+            Self::Extras => "Set one background for every map",
         }
     }
 }
@@ -554,6 +587,7 @@ enum UpdateEvent {
         written: usize,
         removed: usize,
         download_source: String,
+        checksum_note: Option<String>,
     },
     Failed {
         beatmapset_id: i64,
@@ -701,10 +735,10 @@ impl MapManagerApp {
             )
             .count();
             format!(
-                "Loaded cached scan: {matching_maps} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
+                "Loaded cached scan: {matching_maps} matching maps from {} scanned maps, {} sets, {}",
                 scan.maps.len(),
                 scan.sets.len(),
-                repair_issues
+                plural(repair_issues, "repair issue", "repair issues")
             )
         });
 
@@ -713,12 +747,15 @@ impl MapManagerApp {
         let mut app = Self {
             active_tab: AppTab::Library,
             filters,
+            last_mode_filter: ModeFilter::default(),
+            songs_dir_editing: songs_dir.is_empty(),
             songs_dir,
             loaded_root,
             collection_name: "osu-map-manager".to_owned(),
             collections: Vec::new(),
             selected_collection_index: None,
             collection_missing_hashes: Vec::new(),
+            collection_notice: None,
             oauth_session,
             oauth_status,
             oauth_pending_url: None,
@@ -963,11 +1000,11 @@ impl MapManagerApp {
                                 visible_problems(&scan.problems, ignore_missing_backgrounds)
                                     .count();
                             self.status = format!(
-                                "Scan complete: {} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
+                                "Scan complete: {} matching maps from {} scanned maps, {} sets, {}",
                                 matching_maps,
                                 scan.maps.len(),
                                 scan.sets.len(),
-                                repair_issues
+                                plural(repair_issues, "repair issue", "repair issues")
                             );
                             if let Err(err) = save_scan_cache(&cache_root, scan) {
                                 self.status =
@@ -995,11 +1032,11 @@ impl MapManagerApp {
                                 visible_problems(&scan.problems, ignore_missing_backgrounds)
                                     .count();
                             self.status = format!(
-                                "Scan stopped: {} matching maps from {} scanned maps, {} sets, {} repair issue(s)",
+                                "Scan stopped: {} matching maps from {} scanned maps, {} sets, {}",
                                 matching_maps,
                                 scan.maps.len(),
                                 scan.sets.len(),
-                                repair_issues
+                                plural(repair_issues, "repair issue", "repair issues")
                             );
                         } else {
                             self.status = "Scan stopped".to_owned();
@@ -1047,7 +1084,8 @@ impl MapManagerApp {
                         self.repair_failures = 0;
                         self.repair_log.clear();
                         self.repair_touched_folders.clear();
-                        self.repair_progress = format!("Preparing to repair {total} beatmapset(s)");
+                        self.repair_progress =
+                            format!("Preparing to repair {}", plural(total, "beatmapset", "beatmapsets"));
                         self.status = self.repair_progress.clone();
                     }
                     RepairEvent::Opening {
@@ -1085,11 +1123,16 @@ impl MapManagerApp {
                             beatmapset_id,
                             RepairLogStatus::Success,
                             format!(
-                                "Repaired {folder_count} folder(s) via {download_source}; {restored}; ignored {ignored_count} missing background issue(s)"
+                                "Repaired {} via {download_source}; {restored}; ignored {}",
+                                plural(folder_count, "folder", "folders"),
+                                plural(ignored_count, "missing background issue", "missing background issues")
                             ),
                         );
                         self.repair_progress =
-                            format!("Repaired set {beatmapset_id} in {folder_count} folder(s)");
+                            format!(
+                                "Repaired set {beatmapset_id} in {}",
+                                plural(folder_count, "folder", "folders")
+                            );
                         self.status = self.repair_progress.clone();
                     }
                     RepairEvent::Failed {
@@ -1152,14 +1195,15 @@ impl MapManagerApp {
                     ShrinkAnalysisEvent::Started { sets } => {
                         self.analysis_total = sets;
                         self.analysis_done = 0;
-                        self.status = format!("Analyzing {sets} set folder(s)…");
+                        self.status = format!("Checking {}…", plural(sets, "set folder", "set folders"));
                     }
                     ShrinkAnalysisEvent::Report { report } => {
                         self.analysis_done += 1;
                         self.shrink_reports.push(report);
                         self.status = format!(
-                            "Analyzed {}/{} set folder(s)…",
-                            self.analysis_done, self.analysis_total
+                            "Checked {}/{}…",
+                            self.analysis_done,
+                            plural(self.analysis_total, "set folder", "set folders")
                         );
                     }
                     ShrinkAnalysisEvent::Finished { cache } => {
@@ -1175,14 +1219,14 @@ impl MapManagerApp {
                         let (total_in, total_est, items) = shrink::summarize(&self.shrink_reports);
                         let saved = total_in.saturating_sub(total_est);
                         self.status = format!(
-                            "Analysis {}: {} set(s), {} file(s) shrinkable, est. {} → {} (save ~{})",
+                            "Analysis {}: {}, {} shrinkable, est. {} → {} (saves ~{})",
                             if stopped {
                                 "stopped (partial results)"
                             } else {
                                 "done"
                             },
-                            self.shrink_reports.len(),
-                            items,
+                            plural(self.shrink_reports.len(), "set", "sets"),
+                            plural(items, "file", "files"),
                             shrink::human_bytes(total_in),
                             shrink::human_bytes(total_est),
                             shrink::human_bytes(saved),
@@ -1224,7 +1268,11 @@ impl MapManagerApp {
                         self.shrink_log.clear();
                         self.shrink_touched_folders.clear();
                         self.shrink_progress =
-                            format!("Shrinking {assets} file(s) in {sets} set(s)");
+                            format!(
+                            "Shrinking {} in {}",
+                            plural(assets, "file", "files"),
+                            plural(sets, "set", "sets")
+                        );
                         self.status = self.shrink_progress.clone();
                     }
                     ShrinkEvent::SetStarted { label } => {
@@ -1278,11 +1326,11 @@ impl MapManagerApp {
                             .as_ref()
                             .is_some_and(|flag| flag.load(Ordering::Relaxed));
                         self.status = format!(
-                            "Shrink {} in {:.0}s: {} set(s) ok, {} failed, saved {} — rescanning",
+                            "Shrink {} in {:.0}s: {} ok, {} failed, saved {} — rescanning",
                             if cancelled { "cancelled" } else { "finished" },
                             elapsed_s,
-                            self.shrink_successes,
-                            self.shrink_failures,
+                            plural(self.shrink_successes, "set", "sets"),
+                            plural(self.shrink_failures, "set", "sets"),
                             shrink::human_bytes(saved),
                         );
                         let touched = std::mem::take(&mut self.shrink_touched_folders);
@@ -1376,19 +1424,23 @@ impl MapManagerApp {
                                 beatmapset_id: 0,
                                 status: RepairLogStatus::Skipped,
                                 message: format!(
-                                    "{db_skipped} ranked/approved/qualified/loved set(s) \
-                                     skipped locally via osu!.db"
+                                    "{} ranked/approved/qualified/loved sets \
+                                     skipped locally via osu!.db",
+                                    db_skipped
                                 ),
                             });
                         }
                         self.update_check_status =
-                            format!("Checking {total} beatmapset(s) against osu!web");
+                            format!(
+                            "Checking {} against osu!web",
+                            plural(total, "beatmapset", "beatmapsets")
+                        );
                         self.status = self.update_check_status.clone();
                     }
                     UpdateCheckEvent::Checked { done, total } => {
                         self.update_check_done = done;
                         self.update_check_status = format!(
-                            "Checked {done}/{total} beatmapset(s), {} outdated",
+                            "Checked {done}/{total}, {} outdated",
                             self.outdated_sets.len()
                         );
                         self.status = self.update_check_status.clone();
@@ -1478,7 +1530,8 @@ impl MapManagerApp {
                         self.update_successes = 0;
                         self.update_failures = 0;
                         self.update_touched_folders.clear();
-                        self.update_progress = format!("Preparing to update {total} beatmapset(s)");
+                        self.update_progress =
+                            format!("Preparing to update {}", plural(total, "beatmapset", "beatmapsets"));
                         self.status = self.update_progress.clone();
                     }
                     UpdateEvent::Opening {
@@ -1502,17 +1555,28 @@ impl MapManagerApp {
                         written,
                         removed,
                         download_source,
+                        checksum_note,
                     } => {
                         self.update_done += 1;
                         self.update_successes += 1;
                         self.update_touched_folders.extend(folders.clone());
+                        // A checksum note means the set installed cleanly but
+                        // some difficulties still disagree with osu!web — the
+                        // user should re-check later rather than see a hard
+                        // failure for content the server itself served.
+                        let mut message = format!(
+                            "Updated via {download_source}: {} written, {} removed upstream",
+                            plural(written, "file", "files"),
+                            removed
+                        );
+                        if let Some(note) = &checksum_note {
+                            message.push_str(&format!(" — {note}"));
+                        }
                         upsert_log(
                             &mut self.update_log,
                             beatmapset_id,
                             RepairLogStatus::Success,
-                            format!(
-                                "Updated via {download_source}: {written} file(s) written, {removed} removed upstream"
-                            ),
+                            message,
                         );
                         self.update_progress = format!("Updated set {beatmapset_id}");
                         self.status = self.update_progress.clone();
@@ -1665,32 +1729,97 @@ impl MapManagerApp {
         }
     }
 
+    /// Records a collection action's outcome so it can be shown as an inline
+    /// card on the Collections page (the bottom status bar alone was too easy
+    /// to miss for the app's most important feedback).
+    fn set_collection_notice(&mut self, ok: bool, message: String) {
+        self.status = message.clone();
+        self.collection_notice = Some(CollectionNotice { ok, message });
+    }
+
+    /// Renames a stored collection in place, keeping its maps. Distinct from
+    /// "Save collection", which always writes the *current selection*.
+    fn rename_collection(&mut self, old: &str, new: &str) {
+        let new = new.trim();
+        if new.is_empty() || new == old {
+            return;
+        }
+        let Some(path) = self.collection_db_path() else {
+            self.set_collection_notice(false, "Set your Songs folder first".to_owned());
+            return;
+        };
+        let mut db = match collection::load_collection_db(&path) {
+            Ok(db) => db,
+            Err(err) => {
+                self.set_collection_notice(
+                    false,
+                    format!("Rename failed: could not read collection.db ({err:#})"),
+                );
+                return;
+            }
+        };
+        if db.collections.iter().any(|collection| collection.name == new) {
+            self.set_collection_notice(
+                false,
+                format!("A collection named \"{new}\" already exists"),
+            );
+            return;
+        }
+        let Some(entry) = db
+            .collections
+            .iter_mut()
+            .find(|collection| collection.name == old)
+        else {
+            self.set_collection_notice(false, format!("Collection not found: {old}"));
+            return;
+        };
+        entry.name = new.to_owned();
+        match collection::write_db(&path, &db) {
+            Ok(()) => {
+                self.set_collection_notice(true, format!("Renamed \"{old}\" to \"{new}\""));
+                self.load_collections();
+                self.selected_collection_index = self
+                    .collections
+                    .iter()
+                    .position(|collection| collection.name == new);
+                self.collection_name = new.to_owned();
+            }
+            Err(err) => self.set_collection_notice(false, format!("Rename failed: {err:#}")),
+        }
+    }
+
     fn create_collection(&mut self, name: &str) {
         let Some(path) = self.collection_db_path() else {
-            self.status = "Set your Songs folder first".to_owned();
+            self.set_collection_notice(false, "Set your Songs folder first".to_owned());
             return;
         };
         match collection::create_collection(&path, name) {
             Ok(()) => {
-                self.status = format!("Created collection \"{name}\" in {}", path.display());
+                self.set_collection_notice(
+                    true,
+                    format!("Created empty collection \"{name}\""),
+                );
                 self.load_collections();
                 self.selected_collection_index = self
                     .collections
                     .iter()
                     .position(|collection| collection.name == name);
             }
-            Err(err) => self.status = format!("Create collection failed: {err:#}"),
+            Err(err) => self.set_collection_notice(false, format!("Create collection failed: {err:#}")),
         }
     }
 
     fn add_selected_to_collection(&mut self, name: &str) {
         if self.selected_maps.is_empty() && self.selected_md5s.is_empty() {
-            self.status = "Select at least one map before adding to a collection".to_owned();
+            self.set_collection_notice(
+                false,
+                "Select at least one map before adding to a collection".to_owned(),
+            );
             return;
         }
 
         let Some(path) = self.collection_db_path() else {
-            self.status = "Set your Songs folder first".to_owned();
+            self.set_collection_notice(false, "Set your Songs folder first".to_owned());
             return;
         };
         let mut hashes = self
@@ -1706,10 +1835,17 @@ impl MapManagerApp {
 
         match collection::add_to_collection(&path, name, &hashes) {
             Ok(()) => {
-                self.status = format!("Added {} map(s) to collection \"{name}\"", hashes.len());
+                self.set_collection_notice(
+                    true,
+                    format!(
+                        "Added {} {} to \"{name}\"",
+                        hashes.len(),
+                        if hashes.len() == 1 { "map" } else { "maps" }
+                    ),
+                );
                 self.load_collections();
             }
-            Err(err) => self.status = format!("Add to collection failed: {err:#}"),
+            Err(err) => self.set_collection_notice(false, format!("Add to collection failed: {err:#}")),
         }
     }
 
@@ -1720,31 +1856,35 @@ impl MapManagerApp {
         if let Some(parent) = path.parent()
             && fs::create_dir_all(parent).is_err()
         {
-            self.status = format!("Manifest export failed: cannot create {}", parent.display());
+            self.set_collection_notice(
+                false,
+                format!("Export failed: cannot create {}", parent.display()),
+            );
             return;
         }
         match collection::write_manifest(&path, &self.selected_maps) {
-            Ok(()) => self.status = format!("Wrote {}", path.display()),
-            Err(err) => self.status = format!("Manifest export failed: {err:#}"),
+            Ok(()) => {
+                self.set_collection_notice(true, format!("Exported the selected maps to {}", path.display()))
+            }
+            Err(err) => self.set_collection_notice(false, format!("Export failed: {err:#}")),
         }
     }
 
     fn restore_collection_backup(&mut self) {
         let Some(path) = self.collection_db_path() else {
-            self.status = "Set your Songs folder first".to_owned();
+            self.set_collection_notice(false, "Set your Songs folder first".to_owned());
             return;
         };
 
         match collection::restore_collection_backup(&path) {
             Ok(()) => {
-                self.status = format!(
-                    "Restored {} from {}",
-                    path.display(),
-                    path.with_extension("db.bak").display()
+                self.set_collection_notice(
+                    true,
+                    format!("Restored the backup into {}", path.display()),
                 );
                 self.load_collections();
             }
-            Err(err) => self.status = format!("Collection restore failed: {err:#}"),
+            Err(err) => self.set_collection_notice(false, format!("Restore failed: {err:#}")),
         }
     }
 
@@ -1813,7 +1953,11 @@ impl MapManagerApp {
                     .selected_collection_index
                     .filter(|&index| index < self.collections.len());
                 self.collection_missing_hashes.clear();
-                self.status = format!("Loaded {count} collection(s) from {}", path.display());
+                self.status = format!(
+                "Loaded {} from {}",
+                plural(count, "collection", "collections"),
+                path.display()
+            );
             }
             Err(err) => {
                 self.collections.clear();
@@ -1852,18 +1996,34 @@ impl MapManagerApp {
                     self.collection_missing_hashes.push(hash.clone());
                 }
             }
-            self.status = format!(
-                "Loaded {} scanned map(s) from {}; {} hash(es) were not found in the current scan",
-                self.selected_maps.len(),
-                collection.name,
-                self.collection_missing_hashes.len()
+            let missing = self.collection_missing_hashes.len();
+            self.set_collection_notice(
+                true,
+                if missing > 0 {
+                    format!(
+                        "Opened \"{picked}\" — {} maps. {missing} in the collection {} not installed locally and {} kept.",
+                        self.selected_maps.len(),
+                        if missing == 1 { "is" } else { "are" },
+                        if missing == 1 { "is" } else { "are" },
+                        picked = collection.name,
+                    )
+                } else {
+                    format!(
+                        "Opened \"{picked}\" — {} maps.",
+                        self.selected_maps.len(),
+                        picked = collection.name
+                    )
+                },
             );
         } else {
             self.collection_missing_hashes = collection.hashes.clone();
-            self.status = format!(
-                "Loaded {} hash(es) from {}; scan Songs to match them to local maps",
-                collection.hashes.len(),
-                collection.name
+            self.set_collection_notice(
+                true,
+                format!(
+                    "Opened \"{picked}\" — load your maps in the Library tab to match its {} entries.",
+                    collection.hashes.len(),
+                    picked = collection.name
+                ),
             );
         }
     }
@@ -1909,13 +2069,17 @@ impl MapManagerApp {
             }
         }
 
+        let saved_count = hashes.len();
         collection::upsert_collection_hashes(&mut db, &self.collection_name, hashes);
         match collection::write_db(&path, &db) {
             Ok(()) => {
-                self.status = format!(
-                    "Saved collection {} to {}",
-                    self.collection_name,
-                    path.display()
+                self.set_collection_notice(
+                    true,
+                    format!(
+                        "Saved collection \"{}\" — {}",
+                        self.collection_name,
+                        plural(saved_count, "map", "maps")
+                    ),
                 );
                 self.load_collections();
                 self.selected_collection_index = self
@@ -1923,7 +2087,7 @@ impl MapManagerApp {
                     .iter()
                     .position(|collection| collection.name == self.collection_name);
             }
-            Err(err) => self.status = format!("Collection save failed: {err:#}"),
+            Err(err) => self.set_collection_notice(false, format!("Collection save failed: {err:#}")),
         }
     }
 
@@ -1956,12 +2120,15 @@ impl MapManagerApp {
 
         match collection::write_db(&path, &db) {
             Ok(()) => {
-                self.status = format!("Deleted collection {collection_name}");
+                self.set_collection_notice(
+                    true,
+                    format!("Deleted collection \"{collection_name}\""),
+                );
                 self.selected_collection_index = None;
                 self.collection_missing_hashes.clear();
                 self.load_collections();
             }
-            Err(err) => self.status = format!("Collection delete failed: {err:#}"),
+            Err(err) => self.set_collection_notice(false, format!("Collection delete failed: {err:#}")),
         }
     }
 
@@ -2025,17 +2192,21 @@ impl MapManagerApp {
 
         self.status = if failures.is_empty() {
             format!(
-                "Deleted {} non-std .osu file(s){}",
+                "Deleted {} non-std {}{}",
                 deleted.len(),
+                if deleted.len() == 1 { "difficulty file" } else { "difficulty files" },
                 if removed_folders > 0 {
-                    format!(", removed {removed_folders} empty folder(s)")
+                    format!(
+                        ", removed {removed_folders} empty {}",
+                        if removed_folders == 1 { "folder" } else { "folders" }
+                    )
                 } else {
                     String::new()
                 }
             )
         } else {
             format!(
-                "Deleted {} non-std .osu file(s); {} deletion(s) failed: {}",
+                "Deleted {} non-std difficulty files; {} failed: {}",
                 deleted.len(),
                 failures.len(),
                 failures.join("; ")
@@ -2086,7 +2257,7 @@ impl MapManagerApp {
 
     fn spawn_repair_jobs(&mut self, jobs: Vec<RepairJob>) {
         let (tx, rx) = mpsc::channel();
-        self.status = format!("Starting repair for {} beatmapset(s)", jobs.len());
+        self.status = format!("Starting repair for {}", plural(jobs.len(), "beatmapset", "beatmapsets"));
         let backend_url = osu_oauth::backend_url();
         let osu_root = self.osu_root();
         let oauth_session = self.oauth_session.clone();
@@ -2149,13 +2320,13 @@ impl MapManagerApp {
         } else {
             self.shrink_reports.clear();
         }
-        self.status = format!("Analyzing {} set folder(s)…", targets.len());
+        self.status = format!("Checking {}…", plural(targets.len(), "set folder", "set folders"));
         // Already-shrunk files are skipped via the on-disk shrink cache,
         // loaded once here and shared read-only by every worker.
         let shrink_cache = shrink::ShrinkCache::load(&shrink_cache_path(&self.osu_root()));
         if shrink_cache.len() > 0 {
             self.status = format!(
-                "Analyzing set folders ({} file(s) remembered as shrunk)…",
+                "Checking set folders ({} remembered as already shrunk)…",
                 shrink_cache.len()
             );
         }
@@ -2284,7 +2455,7 @@ impl MapManagerApp {
         self.is_analyzing = true;
         self.analysis_done = 0;
         self.analysis_total = targets.len();
-        self.status = format!("Analyzing {} skin(s)…", targets.len());
+        self.status = format!("Checking {}…", plural(targets.len(), "skin", "skins"));
         std::thread::spawn(move || {
             let _ = tx.send(ShrinkAnalysisEvent::Started {
                 sets: targets.len(),
@@ -2342,7 +2513,7 @@ impl MapManagerApp {
         let (tx, rx) = mpsc::channel();
         self.shrink_rx = Some(rx);
         self.is_shrinking = true;
-        self.status = format!("Starting shrink for {} set(s)", jobs.len());
+        self.status = format!("Starting shrink for {}", plural(jobs.len(), "set", "sets"));
         std::thread::spawn(move || {
             shrink::run_shrink_jobs(
                 jobs,
@@ -2583,8 +2754,8 @@ impl MapManagerApp {
         self.extras_rx = Some(rx);
         self.extras_running = true;
         self.status = format!(
-            "Starting background replacement for {} folder(s)",
-            folders.len()
+            "Starting background replacement for {}",
+            plural(folders.len(), "set folder", "set folders")
         );
         std::thread::spawn(move || {
             extras::run_background_jobs(
@@ -2618,7 +2789,7 @@ impl MapManagerApp {
             return;
         }
         let Some(job) = self.extras_last_job.clone() else {
-            self.status = "No background apply to roll back".to_owned();
+            self.status = "No background change to undo".to_owned();
             return;
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2626,7 +2797,7 @@ impl MapManagerApp {
         let (tx, rx) = mpsc::channel();
         self.rollback_rx = Some(rx);
         self.extras_rolling_back = true;
-        self.status = format!("Rolling back the apply from {}…", job.when);
+        self.status = format!("Undoing the background change from {}…", job.when);
         std::thread::spawn(move || {
             extras::run_rollback_job(job.manifest_path, cancel, tx);
         });
@@ -2698,7 +2869,10 @@ impl MapManagerApp {
                         self.extras_log.clear();
                         self.extras_touched_folders.clear();
                         self.extras_progress =
-                            format!("Applying background to {folders} folder(s)…");
+                            format!(
+                            "Applying background to {}…",
+                            plural(folders, "set folder", "set folders")
+                        );
                         self.status = self.extras_progress.clone();
                     }
                     ExtrasEvent::FolderDone {
@@ -2718,7 +2892,10 @@ impl MapManagerApp {
                             .and_then(|name| name.to_str())
                             .unwrap_or("set")
                             .to_owned();
-                        let mut message = format!("{files} background file(s) replaced");
+                        let mut message = format!(
+                            "{} replaced",
+                            plural(files, "background file", "background files")
+                        );
                         if cached > 0 {
                             message.push_str(&format!(" · {cached} already up to date"));
                         }
@@ -2727,8 +2904,9 @@ impl MapManagerApp {
                         }
                         self.upsert_extras_log(label, RepairLogStatus::Success, message);
                         self.extras_progress = format!(
-                            "Applying background… {}/{} folder(s)",
-                            self.extras_folders_done, self.extras_folders_total
+                            "Applying background… {}/{}",
+                            self.extras_folders_done,
+                            plural(self.extras_folders_total, "folder", "folders")
                         );
                     }
                     ExtrasEvent::FolderFailed { folder, message } => {
@@ -2742,8 +2920,9 @@ impl MapManagerApp {
                             .to_owned();
                         self.upsert_extras_log(label, RepairLogStatus::Failed, message.clone());
                         self.extras_progress = format!(
-                            "Applying background… {}/{} folder(s) — last failed: {message}",
-                            self.extras_folders_done, self.extras_folders_total
+                            "Applying background… {}/{} — last failed: {message}",
+                            self.extras_folders_done,
+                            plural(self.extras_folders_total, "folder", "folders")
                         );
                     }
                     ExtrasEvent::Failed { message } => {
@@ -2758,8 +2937,8 @@ impl MapManagerApp {
                             .is_some_and(|flag| flag.load(Ordering::Relaxed));
                         let skipped_note = if self.extras_files_skipped > 0 {
                             format!(
-                                ", {} file(s) skipped (unsupported format)",
-                                self.extras_files_skipped
+                                ", {} skipped (unsupported format)",
+                                plural(self.extras_files_skipped, "file", "files")
                             )
                         } else {
                             String::new()
@@ -2770,12 +2949,12 @@ impl MapManagerApp {
                             String::new()
                         };
                         self.status = format!(
-                            "Backgrounds {} in {:.0}s: {} folder(s) ok, {} failed, {} image file(s) replaced{}{} — rescanning",
+                            "Backgrounds {} in {:.0}s: {} ok, {} failed, {} replaced{}{} — rescanning",
                             if cancelled { "cancelled" } else { "replaced" },
                             elapsed_s,
-                            self.extras_successes,
-                            self.extras_failures,
-                            files,
+                            plural(self.extras_successes, "folder", "folders"),
+                            plural(self.extras_failures, "folder", "folders"),
+                            plural(files, "image file", "image files"),
                             cached_note,
                             skipped_note,
                         );
@@ -2826,7 +3005,10 @@ impl MapManagerApp {
                     self.rollback_failures = 0;
                     self.extras_log.clear();
                     self.rollback_touched_folders.clear();
-                    self.rollback_progress = format!("Rolling back {folders} folder(s)…");
+                    self.rollback_progress = format!(
+                        "Undoing backgrounds… {}",
+                        plural(folders, "set folder", "set folders")
+                    );
                     self.status = self.rollback_progress.clone();
                 }
                 RollbackEvent::FolderDone { folder, restored } => {
@@ -2842,11 +3024,15 @@ impl MapManagerApp {
                     self.upsert_extras_log(
                         label,
                         RepairLogStatus::Success,
-                        format!("{restored} background file(s) restored"),
+                        format!(
+                            "{} restored",
+                            plural(restored, "background file", "background files")
+                        ),
                     );
                     self.rollback_progress = format!(
-                        "Rolling back… {}/{} folder(s)",
-                        self.rollback_folders_done, self.rollback_folders_total
+                        "Undoing backgrounds… {}/{}",
+                        self.rollback_folders_done,
+                        plural(self.rollback_folders_total, "folder", "folders")
                     );
                 }
                 RollbackEvent::FolderFailed { folder, message } => {
@@ -2860,8 +3046,9 @@ impl MapManagerApp {
                         .to_owned();
                     self.upsert_extras_log(label, RepairLogStatus::Failed, message.clone());
                     self.rollback_progress = format!(
-                        "Rolling back… {}/{} folder(s) — last failed: {message}",
-                        self.rollback_folders_done, self.rollback_folders_total
+                        "Undoing backgrounds… {}/{} — last failed: {message}",
+                        self.rollback_folders_done,
+                        plural(self.rollback_folders_total, "folder", "folders")
                     );
                 }
                 RollbackEvent::Failed { message } => {
@@ -2881,15 +3068,15 @@ impl MapManagerApp {
                     let kept_note = if cleaned {
                         String::new()
                     } else {
-                        " — rollback data kept".to_owned()
+                        " — undo data kept".to_owned()
                     };
                     self.status = format!(
-                        "Rollback {} in {:.0}s: {} folder(s) ok, {} failed, {} background file(s) restored{} — rescanning",
+                        "Undo {} in {:.0}s: {} ok, {} failed, {} restored{} — rescanning",
                         if cancelled { "cancelled" } else { "finished" },
                         elapsed_s,
-                        self.rollback_successes,
-                        self.rollback_failures,
-                        restored,
+                        plural(self.rollback_successes, "folder", "folders"),
+                        plural(self.rollback_failures, "folder", "folders"),
+                        plural(restored, "background file", "background files"),
                         kept_note,
                     );
                     let touched = std::mem::take(&mut self.rollback_touched_folders);
@@ -2930,7 +3117,11 @@ impl MapManagerApp {
         };
         match shrink::restore_backup(&record.zip, &record.folder) {
             Ok(count) => {
-                self.status = format!("Restored {} file(s) to {}", count, record.folder.display());
+                self.status = format!(
+            "Restored {} to {}",
+            plural(count, "file", "files"),
+            record.folder.display()
+        );
                 let folder = record.folder.clone();
                 let mut touched = BTreeSet::new();
                 touched.insert(folder.clone());
@@ -2972,7 +3163,10 @@ impl MapManagerApp {
         self.update_check_cancel = Some(cancel.clone());
         self.update_check_db_note = None;
         self.update_log.clear();
-        self.status = format!("Starting update check for {} beatmapset(s)", targets.len());
+        self.status = format!(
+            "Starting update check for {}",
+            plural(targets.len(), "beatmapset", "beatmapsets")
+        );
         let backend_url = osu_oauth::backend_url();
         let osu_root = self.osu_root();
         let oauth_session = self.oauth_session.clone();
@@ -3040,7 +3234,10 @@ impl MapManagerApp {
         self.update_pause = Some(pause.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         self.update_cancel = Some(cancel.clone());
-        self.status = format!("Starting update for {} beatmapset(s)", jobs.len());
+        self.status = format!(
+            "Starting update for {}",
+            plural(jobs.len(), "beatmapset", "beatmapsets")
+        );
         let backend_url = osu_oauth::backend_url();
         let osu_root = self.osu_root();
         let oauth_session = self.oauth_session.clone();
@@ -3619,6 +3816,19 @@ impl MapManagerApp {
                 );
                 let clip_rect = ui.clip_rect();
 
+                // An empty result is a state to act on, not a blank void.
+                if row_count == 0 {
+                    ui.set_min_height(max_height.max(120.0) - 8.0);
+                    ui.centered_and_justified(|ui| {
+                        muted_label(ui, "No maps match your filters");
+                        ui.add_space(4.0);
+                        if ui.button("Clear filters").clicked() {
+                            self.filters.clear_all();
+                        }
+                    });
+                    return;
+                }
+
                 for row in 0..row_count {
                     let row_top = list_rect.top() + row as f32 * HEADER_HEIGHT;
                     let is_inspected = inspected_row == Some(row);
@@ -3657,11 +3867,23 @@ impl MapManagerApp {
                     let fill = if is_inspected {
                         egui::Color32::from_rgb(0x30, 0x2e, 0x2a)
                     } else if selected {
-                        egui::Color32::from_rgb(0x2d, 0x2b, 0x27)
+                        egui::Color32::from_rgb(0x35, 0x2c, 0x33)
                     } else {
                         egui::Color32::from_rgb(0x23, 0x24, 0x27)
                     };
                     ui.painter().rect_filled(header_rect, 0.0, fill);
+                    if selected {
+                        // Accent rail: a checkbox tick alone is too faint a
+                        // selection signal on dark rows.
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                header_rect.min,
+                                egui::vec2(3.0, HEADER_HEIGHT),
+                            ),
+                            0.0,
+                            egui::Color32::from_rgb(0xd8, 0x9a, 0xb0),
+                        );
+                    }
                     ui.painter().line_segment(
                         [header_rect.left_bottom(), header_rect.right_bottom()],
                         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x36, 0x37, 0x3b)),
@@ -3967,17 +4189,17 @@ impl MapManagerApp {
                         ui.heading("No scan yet");
                         muted_label(
                             ui,
-                            "Enter your Songs folder in the sidebar, then press Scan library.",
+                            "Enter your Songs folder in the sidebar, then press Load my maps.",
                         );
                     });
                     return;
                 }
 
-                // ── 1. Analyze ──
+                // ── 1. Find ──
                 section_frame(ctx.style().as_ref()).show(ui, |ui| {
                     ui.spacing_mut().item_spacing = card_item_spacing;
                     fill_tile_width(ui);
-                    ui.heading("🗜 Analyze");
+                    ui.heading("🗜 Find files to shrink");
                     muted_label(
                         ui,
                         "Finds shrinkable song audio, background video and images. \
@@ -4008,8 +4230,9 @@ impl MapManagerApp {
                                     "Paused — resume to continue".to_owned()
                                 } else {
                                     format!(
-                                        "Analyzing {}/{} folder(s)…",
-                                        self.analysis_done, self.analysis_total
+                                        "Checking {}/{}…",
+                                        self.analysis_done,
+                                        plural(self.analysis_total, "set", "sets")
                                     )
                                 },
                             );
@@ -4017,8 +4240,9 @@ impl MapManagerApp {
                             if ui
                                 .add_enabled(
                                     !self.is_shrinking,
-                                    egui::Button::new("🔍 Analyze library"),
+                                    egui::Button::new("🔍 Check library"),
                                 )
+                                .on_hover_text("Find which files can be made smaller")
                                 .clicked()
                             {
                                 self.start_shrink_analysis();
@@ -4026,7 +4250,7 @@ impl MapManagerApp {
                             if ui
                                 .add_enabled(
                                     !self.is_shrinking,
-                                    egui::Button::new("🎨 Analyze skins"),
+                                    egui::Button::new("🎨 Check skins"),
                                 )
                                 .on_hover_text(
                                     "Lossless-ish image pass over <osu root>/Skins: same pixels, \
@@ -4037,10 +4261,10 @@ impl MapManagerApp {
                                 self.start_skin_analysis();
                             }
                             if ui
-                                .small_button("Clear shrink cache")
+                                .small_button("Re-check everything")
                                 .on_hover_text(
                                     "Forget which files were already shrunk, so the next \
-                                    analysis plans everything again.",
+                                    check plans everything again.",
                                 )
                                 .clicked()
                             {
@@ -4048,16 +4272,17 @@ impl MapManagerApp {
                                 match std::fs::remove_file(&path) {
                                     Ok(()) => {
                                         self.status =
-                                            "Shrink cache cleared — next analysis plans everything again"
+                                            "Cleared — the next check plans everything again"
                                                 .to_owned()
                                     }
                                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                                         self.status =
-                                            "Shrink cache is already empty".to_owned()
+                                            "Nothing to re-check — everything is already planned"
+                                                .to_owned()
                                     }
                                     Err(err) => {
                                         self.status =
-                                            format!("Could not clear shrink cache: {err}")
+                                            format!("Could not reset the shrink list: {err}")
                                     }
                                 }
                             }
@@ -4067,17 +4292,6 @@ impl MapManagerApp {
                                 "Zips the set folder before touching it. Restore from the Backups section.",
                             );
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.shrink_options.jobs)
-                                .clamp_range(1..=4)
-                                .prefix("Parallel sets: "),
-                        )
-                        .on_hover_text(
-                            "How many set folders to shrink at once. x264 is CPU-heavy; \
-                            2 suits most machines, 1 is the most disk-friendly.",
-                        );
-                    });
                     muted_label(
                         ui,
                         "Guarantee: filenames never change and .osu/.osb files are never \
@@ -4086,10 +4300,10 @@ impl MapManagerApp {
                     ui.horizontal_wrapped(|ui| {
                         let mut orphans = self.shrink_options.delete_orphans;
                         if ui
-                            .checkbox(&mut orphans, "Delete unreferenced media")
+                            .checkbox(&mut orphans, "Delete unused files")
                             .on_hover_text(
                                 "Also delete media files nothing references. Off by default; \
-                                re-analyzes when changed.",
+                                re-checks when changed.",
                             )
                             .changed()
                         {
@@ -4107,7 +4321,7 @@ impl MapManagerApp {
                             .on_hover_text(
                                 "Delete referenced background videos instead of compressing \
                                 them. The game shows the background image instead, and \
-                                .osu files are untouched. Off by default; re-analyzes \
+                                .osu files are untouched. Off by default; re-checks \
                                 when changed. Backups recommended.",
                             )
                             .changed()
@@ -4121,6 +4335,21 @@ impl MapManagerApp {
                             }
                         }
                     });
+                    // A CPU-scheduling knob has no business on the main card;
+                    // the default (2) is right for almost everyone.
+                    egui::CollapsingHeader::new("⚙ Advanced")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.shrink_options.jobs)
+                                    .clamp_range(1..=4)
+                                    .prefix("Parallel sets: "),
+                            )
+                            .on_hover_text(
+                                "How many set folders to shrink at once. x264 is CPU-heavy; \
+                                2 suits most machines, 1 is the most disk-friendly.",
+                            );
+                        });
                     if !self.shrink_reports.is_empty() {
                         let (total_in, total_est, items) =
                             shrink::summarize(&self.shrink_reports);
@@ -4129,11 +4358,11 @@ impl MapManagerApp {
                         muted_label(
                             ui,
                             format!(
-                                "{} folder(s) · {} file(s) shrinkable{} · {} → ~{} (save ~{})",
-                                self.shrink_reports.len(),
-                                items,
+                                "{} · {} shrinkable{} · {} → ~{} (saves ~{})",
+                                plural(self.shrink_reports.len(), "set", "sets"),
+                                plural(items, "file", "files"),
                                 if cached > 0 {
-                                    format!(" · {cached} already shrunk")
+                                    format!(" · {} already done", cached)
                                 } else {
                                     String::new()
                                 },
@@ -4158,7 +4387,13 @@ impl MapManagerApp {
                         .count();
                     ui.horizontal_wrapped(|ui| {
                         if self.is_shrinking {
-                            if ui.button("⏹ Stop after current file").clicked() {
+                            if ui
+                                .button("⏹ Stop")
+                                .on_hover_text(
+                                    "Finishes the current file, then stops; files already shrunk are kept",
+                                )
+                                .clicked()
+                            {
                                 self.stop_shrink();
                             }
                             let paused = self.shrink_paused();
@@ -4189,11 +4424,14 @@ impl MapManagerApp {
                         } else if ui
                             .add_enabled(
                                 ready > 0,
-                                egui::Button::new(format!("Shrink {ready} set(s)")),
+                                egui::Button::new(format!("Shrink {}", plural(ready, "set", "sets"))),
                             )
+                            .on_hover_text("Asks for confirmation, then compresses every analyzed set")
                             .clicked()
                         {
-                            self.start_shrink_run();
+                            // Same scope as the background replacement: a
+                            // whole-library write, so it confirms first.
+                            self.delete_confirmation = Some(DeleteIntent::ShrinkRun { sets: ready });
                         }
                     });
                     if !self.shrink_log.is_empty() {
@@ -4250,8 +4488,17 @@ impl MapManagerApp {
                             };
                             ui.horizontal(|ui| {
                                 ui.label(format!("{folder_name} ({zip_name})"));
-                                if ui.small_button("Restore").clicked() {
-                                    self.restore_shrink_backup(index);
+                                if ui
+                                    .small_button("Restore")
+                                    .on_hover_text("Puts the backed-up folder back, replacing what is there now")
+                                    .clicked()
+                                {
+                                    // Overwrites the whole set folder: confirm.
+                                    self.delete_confirmation =
+                                        Some(DeleteIntent::RestoringShrinkBackup {
+                                            index,
+                                            folder: folder_name.clone(),
+                                        });
                                 }
                             });
                         }
@@ -4278,7 +4525,7 @@ impl MapManagerApp {
                         ui.heading("No scan yet");
                         muted_label(
                             ui,
-                            "Enter your Songs folder in the sidebar, then press Scan library.",
+                            "Enter your Songs folder in the sidebar, then press Load my maps.",
                         );
                     });
                     return;
@@ -4392,7 +4639,11 @@ impl MapManagerApp {
                         .unwrap_or((0, 0));
                     ui.horizontal_wrapped(|ui| {
                         if self.extras_running {
-                            if ui.button("⏹ Stop after current folder").clicked() {
+                            if ui
+                                .button("⏹ Stop")
+                                .on_hover_text("Finishes the current folder, then stops; folders already done are kept")
+                                .clicked()
+                            {
                                 self.stop_extras();
                             }
                             ui.add(egui::Spinner::new());
@@ -4400,17 +4651,22 @@ impl MapManagerApp {
                         } else if ui
                             .add_enabled(
                                 self.extras_image_bytes.is_some(),
-                                egui::Button::new(format!("🎨 Set background on {sets} set(s)")),
+                                egui::Button::new(format!(
+                                    "🎨 Set background on {}",
+                                    plural(sets, "set", "sets")
+                                )),
                             )
                             .on_hover_text(format!(
                                 "Asks for confirmation, then replaces the content of every \
-                                 referenced background image across {sets} set(s) / {maps} map(s) \
-                                 without touching .osu/.osb files"
+                                 referenced background image across {} / {} \
+                                 without touching .osu/.osb files",
+                                plural(sets, "set folder", "set folders"),
+                                plural(maps, "map", "maps")
                             ))
                             .clicked()
                         {
                             // Not applied directly: a modal confirmation
-                            // states the scope and rollback first.
+                            // states the scope and undo first.
                             self.delete_confirmation = Some(DeleteIntent::SetBackground { sets });
                         }
                     });
@@ -4424,36 +4680,43 @@ impl MapManagerApp {
                             egui::ProgressBar::new(progress)
                                 .show_percentage()
                                 .text(format!(
-                                    "{}/{} folder(s)",
-                                    self.extras_folders_done, self.extras_folders_total
+                                    "{}/{}",
+                                    self.extras_folders_done,
+                                    plural(self.extras_folders_total, "folder", "folders")
                                 )),
                         );
                     }
                 });
                 ui.add_space(card_gap);
 
-                // ── 3. Rollback ──
+                // ── 3. Undo ──
                 if !self.extras_last_job_loaded {
                     self.refresh_last_extras_job();
                 }
                 section_frame(ctx.style().as_ref()).show(ui, |ui| {
                     ui.spacing_mut().item_spacing = card_item_spacing;
                     fill_tile_width(ui);
-                    ui.heading("↩ Rollback");
+                    ui.heading("↩ Undo");
                     match self.extras_last_job.clone() {
                         Some(job) => {
                             muted_label(
                                 ui,
                                 format!(
-                                    "Last apply: {} on {} — {} folder(s) recorded. \
-                                    Rollback restores the original background image \
-                                    contents and removes files the job created.",
-                                    job.image_name, job.when, job.folders
+                                    "Last change: {} on {} — {} recorded. \
+                                    Undo restores the original background image \
+                                    contents and removes files the change created.",
+                                    job.image_name,
+                                    job.when,
+                                    plural(job.folders, "set folder", "set folders")
                                 ),
                             );
                             ui.horizontal_wrapped(|ui| {
                                 if self.extras_rolling_back {
-                                    if ui.button("⏹ Stop after current folder").clicked() {
+                                    if ui
+                                        .button("⏹ Stop")
+                                        .on_hover_text("Finishes the current folder, then stops; folders already restored are kept")
+                                        .clicked()
+                                    {
                                         self.stop_extras_rollback();
                                     }
                                     ui.add(egui::Spinner::new());
@@ -4461,16 +4724,22 @@ impl MapManagerApp {
                                 } else if ui
                                     .add_enabled(
                                         !self.extras_running,
-                                        egui::Button::new("↩ Roll back to original backgrounds"),
+                                        egui::Button::new("↩ Undo background change"),
                                     )
                                     .on_hover_text(
-                                        "Undo the last apply: every replaced background file \
-                                        gets its original content back, and files the job \
+                                        "Asks for confirmation, then every replaced background file \
+                                        gets its original content back, and files the change \
                                         created (for missing backgrounds) are removed.",
                                     )
                                     .clicked()
                                 {
-                                    self.start_extras_rollback();
+                                    // Overwrites every background file again,
+                                    // so it confirms like the apply does.
+                                    self.delete_confirmation =
+                                        Some(DeleteIntent::ExtrasRollback {
+                                            folders: job.folders,
+                                            image_name: job.image_name.clone(),
+                                        });
                                 }
                             });
                             if self.extras_rolling_back {
@@ -4482,8 +4751,9 @@ impl MapManagerApp {
                                 };
                                 ui.add(egui::ProgressBar::new(progress).show_percentage().text(
                                     format!(
-                                        "{}/{} folder(s)",
-                                        self.rollback_folders_done, self.rollback_folders_total
+                                        "{}/{}",
+                                        self.rollback_folders_done,
+                                        plural(self.rollback_folders_total, "folder", "folders")
                                     ),
                                 ));
                             }
@@ -4491,7 +4761,7 @@ impl MapManagerApp {
                         None => {
                             muted_label(
                                 ui,
-                                "No background apply recorded yet — nothing to roll back.",
+                                "No background change to undo yet.",
                             );
                         }
                     }
@@ -4507,10 +4777,10 @@ impl MapManagerApp {
                         muted_label(
                             ui,
                             format!(
-                                "{} folder(s) ok · {} failed · {} background file(s) replaced{}{}",
-                                self.extras_successes,
-                                self.extras_failures,
-                                self.extras_files_replaced,
+                                "{} ok · {} failed · {} replaced{}{}",
+                                plural(self.extras_successes, "folder", "folders"),
+                                plural(self.extras_failures, "folder", "folders"),
+                                plural(self.extras_files_replaced, "background file", "background files"),
                                 if self.extras_files_cached > 0 {
                                     format!(" · {} already up to date", self.extras_files_cached)
                                 } else {
@@ -4552,6 +4822,21 @@ impl MapManagerApp {
         let mut new_collection = false;
         let mut add_to_collection = false;
         let mut selected_collection_name: Option<String> = None;
+        let mut rename_to: Option<String> = None;
+
+        let picked_collection = self
+            .selected_collection_index
+            .and_then(|i| self.collections.get(i))
+            .map(|c| c.name.clone());
+        // Typing a different name while a collection is picked used to turn
+        // "Save" into a hidden delete-and-recreate; that intent is now an
+        // explicit Rename action and Save steps aside.
+        let name_differs_from_picked = picked_collection
+            .as_deref()
+            .is_some_and(|picked| {
+                !self.collection_name.trim().is_empty()
+                    && picked != self.collection_name.trim()
+            });
 
         let content_width = ui.available_width().max(1.0);
         egui::ScrollArea::vertical()
@@ -4563,10 +4848,7 @@ impl MapManagerApp {
                     fill_tile_width(ui);
                     ui.horizontal(|ui| {
                         ui.heading("Collections");
-                        ui.label(format!(
-                            "{} selected",
-                            self.selected_maps.len()
-                        ));
+                        ui.label(plural(self.selected_maps.len(), "selected map", "selected maps"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Reload from disk").clicked() {
                                 self.load_collections();
@@ -4575,28 +4857,54 @@ impl MapManagerApp {
                     });
                     muted_label(
                         ui,
-                        "Pick maps in Library, then save them here. Close osu! before writing.",
+                        "Pick maps in Library, then save them here. Close osu! before saving.",
                     );
                     ui.add_space(4.0);
 
-                    // Single collection picker — the only one on this page.
+                    // Inline result of the last action, at the point of the
+                    // buttons that caused it — not only in the status bar.
+                    if let Some(notice) = &self.collection_notice {
+                        let (fill, stroke, text) = if notice.ok {
+                            (
+                                egui::Color32::from_rgb(0x1f, 0x2e, 0x24),
+                                egui::Color32::from_rgb(0x2d, 0x8a, 0x4f),
+                                egui::Color32::from_rgb(0x9d, 0xd0, 0xaa),
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_rgb(0x33, 0x20, 0x23),
+                                egui::Color32::from_rgb(0xc2, 0x6b, 0x72),
+                                egui::Color32::from_rgb(0xe0, 0xa5, 0xab),
+                            )
+                        };
+                        egui::Frame::none()
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0_f32, stroke))
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                fill_tile_width(ui);
+                                ui.label(egui::RichText::new(&notice.message).color(text));
+                            });
+                        ui.add_space(4.0);
+                    }
+
+                    // Single collection picker — the only one on this page,
+                    // with this collection's own actions beside it.
                     ui.label(egui::RichText::new("Collection").strong());
                     ui.horizontal(|ui| {
-                        let selected_name = self
-                            .selected_collection_index
-                            .and_then(|i| self.collections.get(i))
-                            .map(|c| c.name.as_str())
+                        let selected_name = picked_collection
+                            .as_deref()
                             .unwrap_or("Choose collection");
                         egui::ComboBox::from_id_source("collections_picker")
                             .selected_text(selected_name)
-                            .width((ui.available_width() - 220.0).max(160.0))
+                            .width((ui.available_width() - 250.0).max(160.0))
                             .show_ui(ui, |ui| {
                                 for (i, collection) in self.collections.iter().enumerate() {
                                     let label = format!(
-                                        "{} ({} map{})",
+                                        "{} ({})",
                                         collection.name,
-                                        collection.hashes.len(),
-                                        if collection.hashes.len() == 1 { "" } else { "s" }
+                                        plural(collection.hashes.len(), "map", "maps")
                                     );
                                     ui.selectable_value(
                                         &mut self.selected_collection_index,
@@ -4608,11 +4916,23 @@ impl MapManagerApp {
                         if ui
                             .add_enabled(
                                 self.selected_collection_index.is_some(),
-                                egui::Button::new("Load into selection"),
+                                egui::Button::new("Open collection"),
                             )
+                            .on_hover_text("Show the picked collection's maps and load them into the selection")
                             .clicked()
                         {
                             load_selected = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_collection_index.is_some(),
+                                egui::Button::new("🗑"),
+                            )
+                            .on_hover_text("Delete the picked collection")
+                            .clicked()
+                            && let Some(name) = picked_collection.clone()
+                        {
+                            self.delete_confirmation = Some(DeleteIntent::Collection(name));
                         }
                     });
 
@@ -4634,12 +4954,25 @@ impl MapManagerApp {
                         );
                     });
                     ui.horizontal_wrapped(|ui| {
+                        // The one filled button on the page: this is the
+                        // app's whole purpose.
+                        let save_hover = if name_differs_from_picked {
+                            "The name differs from the picked collection — use Rename to rename it, or pick no collection to save as a new one".to_owned()
+                        } else {
+                            "Overwrite the named collection with the current selection".to_owned()
+                        };
                         if ui
                             .add_enabled(
-                                !self.collection_name.trim().is_empty(),
-                                egui::Button::new("Save"),
+                                !self.collection_name.trim().is_empty()
+                                    && !name_differs_from_picked,
+                                egui::Button::new(
+                                    egui::RichText::new("Save collection")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(0x1c, 0x1d, 0x21)),
+                                )
+                                .fill(egui::Color32::from_rgb(0xd8, 0x9a, 0xb0)),
                             )
-                            .on_hover_text("Overwrite the named collection with the current selection")
+                            .on_hover_text(save_hover)
                             .clicked()
                         {
                             save_selection = true;
@@ -4647,39 +4980,66 @@ impl MapManagerApp {
                         if ui
                             .add_enabled(
                                 !self.collection_name.trim().is_empty(),
-                                egui::Button::new("New"),
+                                egui::Button::new("Create empty"),
                             )
                             .on_hover_text("Create an empty collection with this name")
                             .clicked()
                         {
                             new_collection = true;
                         }
+                        let add_label = match picked_collection.as_deref() {
+                            Some(picked) => {
+                                let shown: String = picked.chars().take(24).collect();
+                                let shown =
+                                    if picked.chars().count() > 24 { format!("{shown}…") } else { shown };
+                                format!("Add maps to “{shown}”")
+                            }
+                            None => "Add maps to a collection".to_owned(),
+                        };
                         if ui
                             .add_enabled(
                                 self.selected_collection_index.is_some(),
-                                egui::Button::new("Add to selected"),
+                                egui::Button::new(add_label),
                             )
                             .on_hover_text("Append the current selection to the picked collection")
                             .clicked()
                         {
-                            selected_collection_name = self
-                                .selected_collection_index
-                                .and_then(|i| self.collections.get(i))
-                                .map(|c| c.name.clone());
+                            selected_collection_name = picked_collection.clone();
                             add_to_collection = true;
+                        }
+                        if name_differs_from_picked {
+                            let picked = picked_collection.as_deref().unwrap_or_default();
+                            let new_name = self.collection_name.trim();
+                            let shown: String = new_name.chars().take(24).collect();
+                            let shown = if new_name.chars().count() > 24 {
+                                format!("{shown}…")
+                            } else {
+                                shown
+                            };
+                            if ui
+                                .button(format!("Rename to “{shown}”"))
+                                .on_hover_text(format!(
+                                    "Rename “{picked}” to “{new_name}”, keeping its maps"
+                                ))
+                                .clicked()
+                            {
+                                rename_to = Some(new_name.to_owned());
+                            }
                         }
                     });
 
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Export list (.tsv)").on_hover_text("Write the selected maps to a plain-text spreadsheet list (TSV = tab-separated values, opens in Excel or Google Sheets) in the app data folder").clicked() {
+                        if ui.button("Export list").on_hover_text("Write the selected maps to a plain-text spreadsheet list (TSV — opens in Excel or Google Sheets) in the app data folder").clicked() {
                             self.export_manifest();
                         }
                         let backup = self.cached_collection_backup_info();
                         let undo_hover = match &backup {
                             Some(info) => format!(
-                                "Undo the last save: restore the backup from {} ({} collection(s), {} map(s))",
-                                info.when, info.collections, info.maps
+                                "Undo the last save: restore the backup from {} ({}, {})",
+                                info.when,
+                                plural(info.collections, "collection", "collections"),
+                                plural(info.maps, "map", "maps")
                             ),
                             None => "No backup yet — one is created automatically on the first save".to_owned(),
                         };
@@ -4690,24 +5050,12 @@ impl MapManagerApp {
                         {
                             self.delete_confirmation = Some(DeleteIntent::RestoreBackup);
                         }
-                        if ui
-                            .add_enabled(
-                                self.selected_collection_index.is_some(),
-                                egui::Button::new("Delete collection"),
-                            )
-                            .clicked()
-                        {
-                            self.delete_confirmation = self
-                                .selected_collection_index
-                                .and_then(|i| self.collections.get(i))
-                                .map(|c| DeleteIntent::Collection(c.name.clone()));
-                        }
                     });
 
                     ui.separator();
                     ui.label(egui::RichText::new("Contents").strong());
                     if self.collections.is_empty() {
-                        muted_label(ui, "No collections loaded. Pick maps in Library, name the collection above, and press Save.");
+                        muted_label(ui, "No collections loaded. Pick maps in Library, name the collection above, and press Save collection.");
                     } else if self.selected_collection_index.is_none() {
                         muted_label(ui, "Choose a collection above to review its maps.");
                     } else if self.selected_collection_index.is_some() {
@@ -4726,7 +5074,11 @@ impl MapManagerApp {
                             .map_or(0, |collection| collection.hashes.len());
                         muted_label(
                             ui,
-                            format!("{hash_count} map(s), {matched} matched in the current scan"),
+                            format!(
+                                "{}, {} in your scanned library",
+                                plural(hash_count, "map", "maps"),
+                                matched
+                            ),
                         );
                         egui::ScrollArea::vertical()
                             .id_source("collections_page_maps")
@@ -4766,10 +5118,8 @@ impl MapManagerApp {
                                         ui.horizontal(|ui| {
                                             let changed =
                                                 ui.checkbox(&mut selected, "").changed();
-                                            muted_label(
-                                                ui,
-                                                format!("Missing locally: {hash}"),
-                                            );
+                                            ui.label(egui::RichText::new("Not installed").weak())
+                                                .on_hover_text(format!("Map hash {hash}"));
                                             changed
                                         })
                                         .inner
@@ -4782,7 +5132,7 @@ impl MapManagerApp {
                                 if hash_count > shown {
                                     muted_label(
                                         ui,
-                                        format!("{} more map(s)", hash_count - shown),
+                                        format!("{} more", plural(hash_count - shown, "map", "maps")),
                                     );
                                 }
                             });
@@ -4805,8 +5155,18 @@ impl MapManagerApp {
                         muted_label(
                             ui,
                             format!(
-                                "{} loaded hash(es) are not present in the current scan and will be preserved while selected.",
-                                self.collection_missing_hashes.len()
+                                "{} {} not installed locally — {} kept when you save.",
+                                self.collection_missing_hashes.len(),
+                                if self.collection_missing_hashes.len() == 1 {
+                                    "map in this collection is"
+                                } else {
+                                    "maps in this collection are"
+                                },
+                                if self.collection_missing_hashes.len() == 1 {
+                                    "it is"
+                                } else {
+                                    "they are"
+                                },
                             ),
                         );
                     }
@@ -4835,6 +5195,14 @@ impl MapManagerApp {
         if add_to_collection && let Some(name) = selected_collection_name.as_deref() {
             self.add_selected_to_collection(name);
         }
+        if let Some(new_name) = rename_to
+            && let Some(old_name) = picked_collection
+        {
+            self.delete_confirmation = Some(DeleteIntent::RenameCollection {
+                old: old_name,
+                new: new_name,
+            });
+        }
     }
 
     fn maybe_show_delete_confirmation(&mut self, ctx: &egui::Context) {
@@ -4851,18 +5219,28 @@ impl MapManagerApp {
             DeleteIntent::NonStdModes(count) => (
                 "Delete non-std maps?",
                 format!(
-                    "Permanently delete {count} .osu file(s) from disk? \
-                     This cannot be undone."
+                    "Permanently delete {} from disk? \
+                     This cannot be undone.",
+                    plural(*count, "difficulty", "difficulties")
                 ),
                 "Delete files",
+            ),
+            DeleteIntent::RenameCollection { old, new } => (
+                "Rename collection?",
+                format!("Rename collection \"{old}\" to \"{new}\"?\n\nThe collection's maps are kept."),
+                "Rename",
             ),
             DeleteIntent::RestoreBackup => {
                 let current_collections = self.collections.len();
                 let current_maps: usize = self.collections.iter().map(|c| c.hashes.len()).sum();
                 let message = match self.cached_collection_backup_info() {
                     Some(info) => format!(
-                        "Undo the last save and return to the backup from {}?\n\nBackup: {} collection(s), {} map(s).\nCurrent: {current_collections} collection(s), {current_maps} map(s).\n\nAnything saved since the backup will be lost.",
-                        info.when, info.collections, info.maps
+                        "Undo the last save and return to the backup from {}?\n\nBackup: {}, {}.\nCurrent: {}, {}.\n\nAnything saved since the backup will be lost.",
+                        info.when,
+                        plural(info.collections, "collection", "collections"),
+                        plural(info.maps, "map", "maps"),
+                        plural(current_collections, "collection", "collections"),
+                        plural(current_maps, "map", "maps")
                     ),
                     None => "No backup is available.".to_owned(),
                 };
@@ -4876,11 +5254,15 @@ impl MapManagerApp {
             } => {
                 let message = if *exists {
                     format!(
-                        "Overwrite collection \"{name}\" with the current selection?\n\n{maps} scanned map(s), {hashes} selected hash(es).\nThe previous contents will be replaced (a backup is kept for undo)."
+                        "Overwrite collection \"{name}\" with the current selection?\n\n{} will be written ({} in total, including entries not installed locally).\nThe previous contents will be replaced (a backup is kept for undo).",
+                        plural(*maps, "scanned map", "scanned maps"),
+                        hashes
                     )
                 } else {
                     format!(
-                        "Create collection \"{name}\" with the current selection?\n\n{maps} scanned map(s), {hashes} selected hash(es)."
+                        "Create collection \"{name}\" with the current selection?\n\n{} will be written ({} in total).",
+                        plural(*maps, "scanned map", "scanned maps"),
+                        hashes
                     )
                 };
                 ("Save collection?", message, "Save")
@@ -4889,13 +5271,46 @@ impl MapManagerApp {
                 "Replace every background?",
                 format!(
                     "Write the imported image over every background file referenced \
-                     by charts in {sets} scanned set folder(s)?\n\n\
+                     by charts in {}?\n\n\
                      Chart files (.osu/.osb) are never opened for writing, so map \
                      checksums, local scores and score submission are unaffected. \
-                     The original images are backed up for rollback.\n\n\
-                     Close osu! first."
+                     The original images are backed up for undo.\n\n\
+                     Close osu! first.",
+                    plural(*sets, "scanned set folder", "scanned set folders")
                 ),
                 "Replace backgrounds",
+            ),
+            DeleteIntent::ShrinkRun { sets } => (
+                "Shrink now?",
+                format!(
+                    "Compress song audio, background videos and images in {}?\n\n\
+                     Each set is backed up first when “Back up each set” is on. \
+                     Close osu! first.",
+                    plural(*sets, "analyzed set", "analyzed sets")
+                ),
+                "Shrink",
+            ),
+            DeleteIntent::RestoringShrinkBackup { folder, .. } => (
+                "Restore this backup?",
+                format!(
+                    "Replace the current contents of \"{folder}\" with the backup \
+                     made before shrinking?\n\n\
+                     Changes made after the backup will be lost."
+                ),
+                "Restore",
+            ),
+            DeleteIntent::ExtrasRollback {
+                folders,
+                image_name,
+            } => (
+                "Undo background change?",
+                format!(
+                    "Undo the last background apply of \"{image_name}\" ({})?\n\n\
+                     Every replaced background file gets its original content back, \
+                     and files the apply created are removed again.",
+                    plural(*folders, "set folder", "set folders")
+                ),
+                "Undo",
             ),
         };
 
@@ -4923,11 +5338,17 @@ impl MapManagerApp {
                 DeleteIntent::Collection(_) => self.delete_selected_collection(),
                 DeleteIntent::NonStdModes(_) => self.delete_selected_non_std_modes(),
                 DeleteIntent::RestoreBackup => self.restore_collection_backup(),
+                DeleteIntent::RenameCollection { old, new } => self.rename_collection(&old, &new),
                 DeleteIntent::SaveCollection { name, .. } => {
                     self.collection_name = name;
                     self.save_selection_to_collection();
                 }
                 DeleteIntent::SetBackground { .. } => self.start_extras_apply(),
+                DeleteIntent::ShrinkRun { .. } => self.start_shrink_run(),
+                DeleteIntent::RestoringShrinkBackup { index, .. } => {
+                    self.restore_shrink_backup(index)
+                }
+                DeleteIntent::ExtrasRollback { .. } => self.start_extras_rollback(),
             }
         }
     }
@@ -4945,10 +5366,13 @@ impl MapManagerApp {
             app_update::current_version_text()
         ))
         .collapsible(false)
-        .resizable(true)
+        // The app's common dialog pattern: centered on open and fixed in
+        // place — an anchored window cannot be dragged around or resized.
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .resizable(false)
         .default_width(420.0)
         .show(ctx, |ui| {
-            ui.label("Checks GitHub Releases. Downloading replaces the app exe and restarts.");
+            ui.label("Checks GitHub for a newer version. Downloading replaces the app and restarts it.");
             ui.add_space(4.0);
             if !self.app_update_status.is_empty() {
                 ui.label(self.app_update_status.clone());
@@ -5234,6 +5658,7 @@ impl eframe::App for MapManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
         self.skin_editor.poll(ctx);
+        self.skin_editor.show_save_dialog(ctx);
         self.poll_audio_playback();
         if self.is_scanning
             || self.is_repairing
@@ -5254,6 +5679,9 @@ impl eframe::App for MapManagerApp {
         // Set from both checkbox sites (sidebar Advanced section and the
         // Maintenance card); persistence happens after the panels below.
         let mut ignore_backgrounds_toggled = false;
+        // Sign-in from the top bar: switching to the Fix maps tab as well, so
+        // the sign-in status and manual-URL fallback are visible.
+        let mut topbar_sign_in_requested = false;
 
         egui::TopBottomPanel::top("top")
             .frame(panel_frame(ctx.style().as_ref()))
@@ -5270,12 +5698,19 @@ impl eframe::App for MapManagerApp {
                         AppTab::Extras,
                     ] {
                         let selected = self.active_tab == tab;
-                        if ui.selectable_label(selected, tab.label()).clicked() {
+                        let text = if selected {
+                            egui::RichText::new(tab.label()).strong()
+                        } else {
+                            egui::RichText::new(tab.label())
+                        };
+                        if ui
+                            .selectable_label(selected, text)
+                            .on_hover_text(tab.subtitle())
+                            .clicked()
+                        {
                             self.active_tab = tab;
                         }
                     }
-                    ui.separator();
-                    muted_label(ui, self.active_tab.subtitle());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(app_update::current_version_text())
@@ -5283,23 +5718,27 @@ impl eframe::App for MapManagerApp {
                                 .weak(),
                         )
                         .on_hover_text("Current app version");
-                        // Passive startup highlight: filled + bold once the
-                        // background check found a newer release.
+                        // Gear, not "Update": the word collided with the map
+                        // update actions on the Fix maps tab. The passive
+                        // green highlight keeps an available release visible.
                         let (update_button, update_hover) = match &self.app_update_release {
                             Some(release) => (
                                 egui::Button::new(
-                                    egui::RichText::new("↻ Update")
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
+                                    egui::RichText::new(format!(
+                                        "⚙ {} available",
+                                        release.tag
+                                    ))
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
                                 )
                                 .fill(egui::Color32::from_rgb(0x2d, 0x8a, 0x4f)),
                                 format!(
-                                    "New version {} available — click to open the updater",
+                                    "New app version {} available — click to open the updater",
                                     release.tag
                                 ),
                             ),
                             None => (
-                                egui::Button::new("↻ Update"),
+                                egui::Button::new("⚙"),
                                 "Check for app updates".to_owned(),
                             ),
                         };
@@ -5338,13 +5777,18 @@ impl eframe::App for MapManagerApp {
                                 egui::RichText::new("● signed in")
                                     .small()
                                     .color(egui::Color32::from_rgb(0x7f, 0xa6, 0x86)),
+                            )
+                            .on_hover_text(
+                                "Signed in — downloads use the official osu! API",
                             );
-                        } else {
-                            ui.label(
-                                egui::RichText::new("○ not signed in")
-                                    .small()
-                                    .color(egui::Color32::from_rgb(0xb3, 0xad, 0xa5)),
-                            );
+                        } else if ui
+                            .small_button("Sign in with osu!")
+                            .on_hover_text(
+                                "Sign in so downloads use the official osu! API instead of the mirror",
+                            )
+                            .clicked()
+                        {
+                            topbar_sign_in_requested = true;
                         }
                     });
                 });
@@ -5362,22 +5806,57 @@ impl eframe::App for MapManagerApp {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.active_tab {
                     AppTab::Library => {
                     ui.heading("Library");
-                    muted_label(ui, "Point at Songs, scan, then filter.");
+                    muted_label(ui, "Point at your Songs folder and load your maps.");
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Songs folder").strong());
-                    ui.add_sized(
-                        [ui.available_width().max(80.0), 28.0],
-                        egui::TextEdit::singleline(&mut self.songs_dir)
-                            .hint_text(r"C:\...\osu!\Songs")
-                            .vertical_align(egui::Align::Center),
-                    );
+                    if self.songs_dir_editing {
+                        ui.add_sized(
+                            [ui.available_width().max(80.0), 28.0],
+                            egui::TextEdit::singleline(&mut self.songs_dir)
+                                .hint_text(r"C:\...\osu!\Songs")
+                                .vertical_align(egui::Align::Center),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Done").clicked() {
+                                self.songs_dir_editing = false;
+                            }
+                            muted_label(ui, "Folder containing your osu! Songs.");
+                        });
+                    } else if self.songs_dir.trim().is_empty() {
+                        muted_label(ui, "Not set yet.");
+                        if ui.button("Choose folder…").clicked() {
+                            self.songs_dir_editing = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("✓")
+                                    .color(egui::Color32::from_rgb(0x7f, 0xa6, 0x86)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Change…").clicked() {
+                                        self.songs_dir_editing = true;
+                                    }
+                                    ui.add_sized(
+                                        [ui.available_width().max(60.0), 20.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(self.songs_dir.clone()).small(),
+                                        )
+                                        .truncate(true),
+                                    );
+                                },
+                            );
+                        });
+                    }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if self.is_scanning {
                             if ui.button("⏹ Stop scan").clicked() {
                                 self.stop_scan();
                             }
-                        } else if ui.button("⟳ Scan library").clicked() {
+                        } else if ui.button("⟳ Load my maps").clicked() {
                             self.start_scan();
                         }
                     });
@@ -5396,17 +5875,31 @@ impl eframe::App for MapManagerApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.heading("Filters");
-                        let active = self.filters.active_count();
-                        if active > 0 {
-                            ui.label(egui::RichText::new(format!("{active} active")).small().strong());
-                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Clear").clicked() {
                                 self.filters.clear_all();
                             }
                         });
                     });
-                    muted_label(ui, "A map must pass every active filter.");
+                    // Active filters as readable chips, so a filter inside a
+                    // collapsed group can never be invisible.
+                    let chips = filter_chips(&self.filters);
+                    if chips.is_empty() {
+                        muted_label(ui, "A map must pass every active filter.");
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                            for chip in chips {
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgb(0x3a, 0x2b, 0x33))
+                                    .rounding(4.0)
+                                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new(chip).small());
+                                    });
+                            }
+                        });
+                    }
                     ui.add_space(6.0);
 
                     egui::CollapsingHeader::new("⭐ Difficulty")
@@ -5486,57 +5979,71 @@ impl eframe::App for MapManagerApp {
                                     .hint_text("No filters — matches everything"),
                             );
                         });
-                    if self.filters.mode != ModeFilter::Any {
-                        let mode = self.filters.mode;
-                        self.retain_selected_maps(|map| mode.matches(map.mode));
+                    if self.filters.mode != self.last_mode_filter {
+                        self.last_mode_filter = self.filters.mode;
+                        let before = self.selected_maps.len();
+                        if self.filters.mode != ModeFilter::Any {
+                            let mode = self.filters.mode;
+                            self.retain_selected_maps(|map| mode.matches(map.mode));
+                        }
+                        let removed = before - self.selected_maps.len();
+                        if removed > 0 {
+                            self.status = format!(
+                                "Mode filter changed: {removed} selected {} no longer match and {} removed from the selection",
+                                if removed == 1 { "map" } else { "maps" },
+                                if removed == 1 { "was" } else { "were" },
+                            );
+                        }
                     }
                     }
                     AppTab::Collections => {
                         ui.heading("Collections");
-                        muted_label(ui, "1. Pick maps in Library → 2. Review here → 3. Save.");
+                        muted_label(ui, "Your selected maps, ready to save.");
                         ui.separator();
                         ui.label(egui::RichText::new("Current selection").strong());
-                        ui.label(format!(
-                            "{} map(s) · {} hash(es)",
-                            self.selected_maps.len(),
-                            self.selected_md5s.len()
-                        ));
+                        if self.selected_maps.is_empty() {
+                            muted_label(ui, "Nothing picked yet — tick maps in the Library tab.");
+                        } else {
+                            ui.label(plural(self.selected_maps.len(), "map", "maps"));
+                            // Peek at what is in the selection so "the
+                            // selection" stays a concrete list, not a concept.
+                            for map in self.selected_maps.iter().take(5) {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(self.map_result_label(map)).small(),
+                                    )
+                                    .truncate(true),
+                                );
+                            }
+                            if self.selected_maps.len() > 5 {
+                                muted_label(
+                                    ui,
+                                    format!("…and {} more", self.selected_maps.len() - 5),
+                                );
+                            }
+                        }
                         if !self.collection_missing_hashes.is_empty() {
+                            ui.add_space(4.0);
                             muted_label(
                                 ui,
                                 format!(
-                                    "{} hash(es) not in the current scan — kept while selected.",
-                                    self.collection_missing_hashes.len()
+                                    "{} {} not installed locally — kept while selected.",
+                                    self.collection_missing_hashes.len(),
+                                    if self.collection_missing_hashes.len() == 1 {
+                                        "map is"
+                                    } else {
+                                        "maps are"
+                                    },
                                 ),
                             );
                         }
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new("How saving works").strong());
-                        muted_label(
-                            ui,
-                            "• “Save” overwrites the named collection with the selection.\n• “Add to” appends the selection.\n• Close osu! before writing collection.db.",
-                        );
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new("Undo").strong());
                         match self.cached_collection_backup_info() {
-                            Some(info) => muted_label(
-                                ui,
-                                format!(
-                                    "“Undo last save” returns to the backup from {} ({} collection(s), {} map(s)). A fresh backup is written on every save.",
-                                    info.when, info.collections, info.maps
-                                ),
-                            ),
-                            None => muted_label(
-                                ui,
-                                "No backup yet — one is written on the first save.",
-                            ),
+                            Some(info) => muted_label(ui, format!("Last backup: {}", info.when)),
+                            None => muted_label(ui, "A backup is written on the first save."),
                         }
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new("Export").strong());
-                        muted_label(
-                            ui,
-                            "“Export list (.tsv)” writes the selection as a plain-text spreadsheet list (tab-separated values — opens in Excel or Google Sheets).",
-                        );
+                        muted_label(ui, "Close osu! before saving.");
                     }
                     AppTab::Shrink => {
                         ui.heading("Shrink");
@@ -5545,20 +6052,31 @@ impl eframe::App for MapManagerApp {
                         if self.scan.is_some() {
                             ui.label(egui::RichText::new("Library").strong());
                             ui.label(format!(
-                                "{} set(s) scanned",
-                                self.scan.as_ref().map(|s| s.sets.len()).unwrap_or(0)
+                                "{} scanned",
+                                plural(
+                                    self.scan.as_ref().map(|s| s.sets.len()).unwrap_or(0),
+                                    "set",
+                                    "sets"
+                                )
                             ));
                             ui.label(format!(
-                                "{} folder(s) analyzed · {} file(s) shrinkable",
-                                self.shrink_reports.len(),
-                                self.shrink_reports.iter().map(|r| r.work_items()).sum::<usize>()
+                                "{} analyzed · {} shrinkable",
+                                plural(self.shrink_reports.len(), "set", "sets"),
+                                plural(
+                                    self.shrink_reports
+                                        .iter()
+                                        .map(|r| r.work_items())
+                                        .sum::<usize>(),
+                                    "file",
+                                    "files"
+                                )
                             ));
                         } else {
-                            muted_label(ui, "Scan your library to enable shrinking.");
+                            muted_label(ui, "Load your maps first (Library tab).");
                         }
                     }
                     AppTab::Maintenance => {
-                        ui.heading("Maintenance");
+                        ui.heading("Fix maps");
                         muted_label(ui, "Keep your library healthy.");
                         ui.separator();
                         ui.label(egui::RichText::new("osu! account").strong());
@@ -5582,11 +6100,15 @@ impl eframe::App for MapManagerApp {
                             .count();
                             ui.label(egui::RichText::new("Library health").strong());
                             ui.label(format!(
-                                "{} maps · {} sets · {} issue(s)",
-                                scan.maps.len(),
-                                scan.sets.len(),
-                                visible_problems(&scan.problems, ignore_missing_backgrounds)
-                                    .count()
+                                "{} · {} · {}",
+                                plural(scan.maps.len(), "map", "maps"),
+                                plural(scan.sets.len(), "set", "sets"),
+                                plural(
+                                    visible_problems(&scan.problems, ignore_missing_backgrounds)
+                                        .count(),
+                                    "issue",
+                                    "issues"
+                                )
                             ));
                             ui.label(format!(
                                 "{} missing-file · {} outdated",
@@ -5594,7 +6116,7 @@ impl eframe::App for MapManagerApp {
                                 self.outdated_sets.len()
                             ));
                         } else {
-                            muted_label(ui, "Scan your library to see health stats.");
+                            muted_label(ui, "Load your maps first to see health stats.");
                         }
                     }
                     AppTab::SkinEditor => {
@@ -5608,8 +6130,8 @@ impl eframe::App for MapManagerApp {
                         );
                     }
                     AppTab::Extras => {
-                        ui.heading("Extras");
-                        muted_label(ui, "Bulk tools for the whole library.");
+                        ui.heading("Backgrounds");
+                        muted_label(ui, "Set one background for every map.");
                         ui.separator();
                         ui.label(egui::RichText::new("Imported background").strong());
                         match self.extras_image_name.as_deref() {
@@ -5628,10 +6150,10 @@ impl eframe::App for MapManagerApp {
                         ui.label(egui::RichText::new("Library").strong());
                         match self.scan.as_ref() {
                             Some(scan) => {
-                                ui.label(format!("{} set(s) scanned", scan.sets.len()));
-                                ui.label(format!("{} map(s)", scan.maps.len()));
+                                ui.label(plural(scan.sets.len(), "set", "sets"));
+                                ui.label(plural(scan.maps.len(), "map", "maps"));
                             }
-                            None => muted_label(ui, "Scan your library to enable Extras."),
+                            None => muted_label(ui, "Load your maps first (Library tab)."),
                         }
                     }
                 });
@@ -5680,7 +6202,13 @@ impl eframe::App for MapManagerApp {
                                     muted_label(ui, "Scanning library…");
                                 });
                                 if let Some(err) = &self.star_parse_error {
-                                    scan_status_label(ui, "osu!.db", err);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Couldn't read star ratings for some maps.",
+                                        )
+                                        .weak(),
+                                    )
+                                    .on_hover_text(err);
                                 }
                             });
                             ui.add_space(card_gap);
@@ -5693,7 +6221,7 @@ impl eframe::App for MapManagerApp {
                                 ui.heading("No scan yet");
                                 muted_label(
                                     ui,
-                                    "Enter your Songs folder in the sidebar, then press Scan library.",
+                                    "Enter your Songs folder in the sidebar, then press Load my maps.",
                                 );
                             });
                         } else {
@@ -5725,7 +6253,17 @@ impl eframe::App for MapManagerApp {
                                             if ui.button("Clear selection").clicked() {
                                                 self.clear_selection();
                                             }
-                                            if ui.button("Select all").clicked() {
+                                            let matching = self.filtered_map_indexes.len();
+                                            if ui
+                                                .add_enabled(
+                                                    matching > 0,
+                                                    egui::Button::new(format!(
+                                                        "Select all {}",
+                                                        plural(matching, "map", "maps")
+                                                    )),
+                                                )
+                                                .clicked()
+                                            {
                                                 let maps = self
                                                     .scan
                                                     .as_ref()
@@ -5742,14 +6280,32 @@ impl eframe::App for MapManagerApp {
                                                     self.select_map(map);
                                                 }
                                             }
+                                            // The visible next step after picking
+                                            // maps — switches to the Collections tab.
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("Save as collection →")
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(
+                                                        0x3a, 0x2b, 0x33,
+                                                    )),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.active_tab = AppTab::Collections;
+                                            }
                                         },
                                     );
                                 });
                                 muted_label(
                                     ui,
                                     format!(
-                                        "{} scanned · {} sets · {} issue(s) — manage collections in the Collections tab",
-                                        scanned_maps, scanned_sets, repair_issues
+                                        "{} · {} · {}",
+                                        plural(scanned_maps, "map", "maps"),
+                                        plural(scanned_sets, "set", "sets"),
+                                        plural(repair_issues, "issue", "issues"),
                                     ),
                                 );
                                 // Bounded: the central panel is not inside a scroll
@@ -5801,9 +6357,9 @@ impl eframe::App for MapManagerApp {
                                         muted_label(
                                             ui,
                                             format!(
-                                                "{} issue(s) · {} set(s) ready to repair",
-                                                missing_file_issues,
-                                                jobs.len()
+                                                "{}, {} ready to repair",
+                                                plural(missing_file_issues, "issue", "issues"),
+                                                plural(jobs.len(), "set", "sets")
                                             ),
                                         );
                                         muted_label(
@@ -5847,23 +6403,23 @@ impl eframe::App for MapManagerApp {
                                                     ui,
                                                     "If no browser tab opened, paste this URL into your browser manually:",
                                                 );
-                                                ui.horizontal(|ui| {
-                                                    let input_width =
-                                                        (ui.available_width() - 60.0).max(120.0);
-                                                    ui.add_sized(
-                                                        [input_width, 24.0],
-                                                        egui::TextEdit::singleline(&mut pending_url)
-                                                            .interactive(false),
-                                                    );
-                                                    if ui.button("Copy").clicked() {
-                                                        ui.ctx().copy_text(pending_url);
-                                                    }
-                                                });
-                                                muted_label(
-                                                    ui,
-                                                    "If osu! shows 401 invalid_client instead of an approve page, the OAuth app's callback URL is misregistered: open it at osu.ppy.sh/home/account/edit#oauth and set it to exactly http://127.0.0.1:3000/callback, then sign in again.",
-                                                );
-                                            }
+                                                    ui.horizontal(|ui| {
+                                                        let input_width =
+                                                            (ui.available_width() - 60.0).max(120.0);
+                                                        ui.add_sized(
+                                                            [input_width, 24.0],
+                                                            egui::TextEdit::singleline(&mut pending_url)
+                                                                .interactive(false),
+                                                        );
+                                                        if ui.button("Copy").clicked() {
+                                                            ui.ctx().copy_text(pending_url);
+                                                        }
+                                                    });
+                                                    // A 401 here means the OAuth app's own
+                                                    // callback registration is wrong — a
+                                                    // setup problem, not something the
+                                                    // player can fix from this screen.
+                                                }
                                         } else if self.oauth_session.is_none() {
                                             muted_label(
                                                 ui,
@@ -5915,7 +6471,7 @@ impl eframe::App for MapManagerApp {
                                                         muted_label(
                                                             ui,
                                                             format!(
-                                                                "… {} earlier log entr(ies) hidden",
+                                                                "… {} earlier log lines hidden",
                                                                 log_skip
                                                             ),
                                                         );
@@ -5940,12 +6496,12 @@ impl eframe::App for MapManagerApp {
                                                         nested_frame(ui.style()).show(ui, |ui| {
                                                             fill_tile_width(ui);
                                                             ui.horizontal(|ui| {
+                                                                // "Artist - Title" reads far
+                                                                // better than a bare set id.
                                                                 wrapped_label(
                                                                     ui,
-                                                                    format!(
-                                                                        "Set {}: {} corrupted map(s)",
-                                                                        beatmapset_id,
-                                                                        job.labels.len()
+                                                                    job.title.clone().unwrap_or_else(
+                                                                        || format!("Set {beatmapset_id}"),
                                                                     ),
                                                                 );
                                                                 if ui
@@ -5961,6 +6517,18 @@ impl eframe::App for MapManagerApp {
                                                                         Some(beatmapset_id);
                                                                 }
                                                             });
+                                                            muted_label(
+                                                                ui,
+                                                                format!(
+                                                                    "set {} · {} with missing files",
+                                                                    beatmapset_id,
+                                                                    plural(
+                                                                        job.labels.len(),
+                                                                        "map",
+                                                                        "maps"
+                                                                    )
+                                                                ),
+                                                            );
                                                             if !job.missing_files.is_empty() {
                                                                 wrapped_label(
                                                                     ui,
@@ -5979,7 +6547,7 @@ impl eframe::App for MapManagerApp {
                                                         muted_label(
                                                             ui,
                                                             format!(
-                                                                "… {} more set(s) hidden — “Repair all” still covers them",
+                                                                "… {} more sets hidden — “Repair all” still covers them",
                                                                 jobs.len() - MAX_RENDERED_REPAIR_JOBS
                                                             ),
                                                         );
@@ -6027,9 +6595,10 @@ impl eframe::App for MapManagerApp {
                                                         muted_label(
                                                             ui,
                                                             format!(
-                                                                "… {} more issue(s) hidden",
+                                                                "… {} more {} hidden",
                                                                 visible_issues.len()
-                                                                    - MAX_RENDERED_REPAIR_ISSUES
+                                                                    - MAX_RENDERED_REPAIR_ISSUES,
+                                                                if visible_issues.len() - MAX_RENDERED_REPAIR_ISSUES == 1 { "issue" } else { "issues" }
                                                             ),
                                                         );
                                                     }
@@ -6121,8 +6690,9 @@ impl eframe::App for MapManagerApp {
                                                 muted_label(
                                                     ui,
                                                     format!(
-                                                        "{} set(s) are no longer available online and were skipped",
-                                                        self.update_unavailable
+                                                        "{} {} no longer available online and were skipped",
+                                                        self.update_unavailable,
+                                                        if self.update_unavailable == 1 { "set is" } else { "sets are" }
                                                     ),
                                                 );
                                             }
@@ -6220,7 +6790,7 @@ impl eframe::App for MapManagerApp {
                                                         muted_label(
                                                             ui,
                                                             format!(
-                                                                "… {} earlier log entr(ies) hidden",
+                                                                "… {} earlier log lines hidden",
                                                                 log_skip
                                                             ),
                                                         );
@@ -6234,7 +6804,7 @@ impl eframe::App for MapManagerApp {
                                                             "updating",
                                                             "updated",
                                                             "failed",
-                                                            "skipped (frozen)",
+                                                            "no longer online",
                                                             entry.beatmapset_id,
                                                             &entry.message,
                                                         );
@@ -6291,8 +6861,8 @@ impl eframe::App for MapManagerApp {
                                                                     muted_label(
                                                                         ui,
                                                                         format!(
-                                                                            "  {} diff(s) without an online id could not be checked",
-                                                                            set.unchecked
+                                                                            "  {} without an online id could not be checked",
+                                                                            plural(set.unchecked, "difficulty", "difficulties")
                                                                         ),
                                                                     );
                                                                 }
@@ -6330,8 +6900,8 @@ impl eframe::App for MapManagerApp {
                                         muted_label(
                                             ui,
                                             format!(
-                                                "Library modes: {} std · {} taiko · {} catch · {} mania{}",
-                                                mode_counts.std,
+                                                "Library: {} · {} taiko · {} catch · {} mania{}",
+                                                plural(mode_counts.std, "std map", "std maps"),
                                                 mode_counts.taiko,
                                                 mode_counts.catch,
                                                 mode_counts.mania,
@@ -6345,13 +6915,6 @@ impl eframe::App for MapManagerApp {
                                                 },
                                             ),
                                         );
-                                        muted_label(
-                                            ui,
-                                            format!(
-                                                "{} of {} scanned .osu files declare a Mode field",
-                                                mode_counts.with_mode_field, mode_counts.total
-                                            ),
-                                        );
                                         if mode_counts.taiko
                                             + mode_counts.catch
                                             + mode_counts.mania
@@ -6359,7 +6922,7 @@ impl eframe::App for MapManagerApp {
                                         {
                                             muted_label(
                                                 ui,
-                                                "No non-std .osu files were detected. Converted maps share the original std file, so only natively mapped taiko/catch/mania files can appear here — rescan if you added some.",
+                                                "No non-std difficulties were detected. Converted maps share the original std file, so only natively mapped taiko/catch/mania files can appear here — rescan if you added some.",
                                             );
                                         }
                                         ui.horizontal_wrapped(|ui| {
@@ -6367,11 +6930,36 @@ impl eframe::App for MapManagerApp {
                                             ui.checkbox(&mut self.delete_catch, "Catch");
                                             ui.checkbox(&mut self.delete_mania, "Mania");
                                         });
+                                        // Say what will happen per mode, in outcome terms.
+                                        let mut selected_modes: Vec<String> = Vec::new();
+                                        if self.delete_taiko && mode_counts.taiko > 0 {
+                                            selected_modes.push(format!(
+                                                "{} taiko",
+                                                mode_counts.taiko
+                                            ));
+                                        }
+                                        if self.delete_catch && mode_counts.catch > 0 {
+                                            selected_modes.push(format!(
+                                                "{} catch",
+                                                mode_counts.catch
+                                            ));
+                                        }
+                                        if self.delete_mania && mode_counts.mania > 0 {
+                                            selected_modes.push(format!(
+                                                "{} mania",
+                                                mode_counts.mania
+                                            ));
+                                        }
                                         muted_label(
                                             ui,
-                                            format!(
-                                                "{delete_count} scanned .osu file(s) match selected mode(s)"
-                                            ),
+                                            if selected_modes.is_empty() {
+                                                "Tick the modes to delete.".to_owned()
+                                            } else {
+                                                format!(
+                                                    "{} will be deleted permanently",
+                                                    selected_modes.join(", ")
+                                                )
+                                            },
                                         );
                                         if ui
                                             .add_enabled(
@@ -6380,6 +6968,7 @@ impl eframe::App for MapManagerApp {
                                                     && delete_count > 0,
                                                 egui::Button::new("Delete selected non-std maps"),
                                             )
+                                            .on_hover_text("A confirmation dialog states the count before anything is deleted")
                                             .clicked()
                                         {
                                             delete_non_std_requested = true;
@@ -6390,7 +6979,7 @@ impl eframe::App for MapManagerApp {
                                         ui.spacing_mut().item_spacing = card_item_spacing;
                                         fill_tile_width(ui);
                                         ui.heading("Maintenance");
-                                        muted_label(ui, "Scan your library first — repairs, updates and cleanup appear here.");
+                                        muted_label(ui, "Load your maps first — repairs, updates and cleanup appear here.");
                                     });
                                 }
                             });
@@ -6466,6 +7055,10 @@ impl eframe::App for MapManagerApp {
             self.stop_update();
         }
         if sign_in_requested {
+            self.start_oauth_login();
+        }
+        if topbar_sign_in_requested {
+            self.active_tab = AppTab::Maintenance;
             self.start_oauth_login();
         }
         if sign_out_requested {
@@ -6713,19 +7306,11 @@ struct ModeCounts {
     catch: usize,
     mania: usize,
     unknown: usize,
-    with_mode_field: usize,
-    total: usize,
 }
 
 fn count_modes(maps: &[LocalBeatmap]) -> ModeCounts {
-    let mut counts = ModeCounts {
-        total: maps.len(),
-        ..ModeCounts::default()
-    };
+    let mut counts = ModeCounts::default();
     for map in maps {
-        if map.has_mode_field {
-            counts.with_mode_field += 1;
-        }
         match map.mode {
             None | Some(0) => counts.std += 1,
             Some(1) => counts.taiko += 1,
@@ -6762,6 +7347,9 @@ impl DeleteModeSelection {
 #[derive(Debug, Clone)]
 struct RepairJob {
     beatmapset_id: i64,
+    /// "Artist - Title" of the set, from the scan — shown instead of a bare
+    /// numeric set id.
+    title: Option<String>,
     labels: Vec<String>,
     folders: Vec<PathBuf>,
     issues: Vec<String>,
@@ -6769,6 +7357,78 @@ struct RepairJob {
     /// missing on disk. The repair restores exactly these from the download.
     missing_files: Vec<String>,
     ignore_after_success: Vec<IgnoredRepairIssue>,
+}
+
+/// Short chip labels for the active filters, shown under the Filters heading
+/// so nothing active can hide inside a collapsed group. Full-range sliders
+/// (the defaults) are omitted — they constrain nothing worth announcing.
+fn filter_chips(filters: &BeatmapFilters) -> Vec<String> {
+    fn narrowed(range: &RangeFilter, full: (f32, f32)) -> bool {
+        range.enabled && (range.min > full.0 || range.max < full.1)
+    }
+    let mut chips = Vec::new();
+    if filters.mode != ModeFilter::Any {
+        let mode = match filters.mode {
+            ModeFilter::Osu => "osu!",
+            ModeFilter::Taiko => "taiko",
+            ModeFilter::Catch => "catch",
+            ModeFilter::Mania => "mania",
+            ModeFilter::Any => "any",
+        };
+        chips.push(format!("mode: {mode}"));
+    }
+    for (name, range, full) in [
+        ("★", &filters.stars, STARS_RANGE),
+        ("AR", &filters.ar, AR_RANGE),
+        ("CS", &filters.cs, CS_RANGE),
+        ("OD", &filters.od, OD_RANGE),
+        ("HP", &filters.hp, HP_RANGE),
+        ("BPM", &filters.bpm, BPM_RANGE),
+    ] {
+        if narrowed(range, full) {
+            chips.push(format!(
+                "{name} {}–{}",
+                format_number(range.min),
+                format_number(range.max)
+            ));
+        }
+    }
+    let min = filters.length_min.trim().parse::<f32>().ok();
+    let max = filters.length_max.trim().parse::<f32>().ok();
+    if min.is_some() || max.is_some() {
+        chips.push(format!(
+            "length {}–{}s",
+            min.map(format_number).unwrap_or_else(|| "…".to_owned()),
+            max.map(format_number).unwrap_or_else(|| "…".to_owned()),
+        ));
+    }
+    for (name, value) in [
+        ("artist", &filters.artist),
+        ("title", &filters.title),
+        ("mapper", &filters.mapper),
+        ("difficulty", &filters.difficulty),
+        ("tag", &filters.tag),
+    ] {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let shown = if value.chars().count() > 14 {
+            format!("{}…", value.chars().take(13).collect::<String>())
+        } else {
+            value.to_owned()
+        };
+        chips.push(format!("{name}: {shown}"));
+    }
+    chips
+}
+
+/// "1 map" / "3 maps" — no "(s)" doc-speak in user-visible strings.
+fn plural(count: usize, singular: &str, plural_form: &str) -> String {
+    format!(
+        "{count} {}",
+        if count == 1 { singular } else { plural_form }
+    )
 }
 
 /// Human-readable values of the enabled numeric filters, shown next to each
@@ -7350,12 +8010,23 @@ fn repair_jobs(scan: &LibraryScan, ignore_missing_backgrounds: bool) -> Vec<Repa
         }
     }
 
+    let set_titles: std::collections::HashMap<i64, String> = scan
+        .sets
+        .iter()
+        .filter_map(|set| {
+            let id = set.beatmapset_id?;
+            let first = set.maps.first()?;
+            Some((id, format!("{} - {}", first.artist, first.title)))
+        })
+        .collect();
+
     grouped
         .into_iter()
         .map(
             |(beatmapset_id, (labels, folders, issues, missing_files, ignore_after_success))| {
                 RepairJob {
                     beatmapset_id,
+                    title: set_titles.get(&beatmapset_id).cloned(),
                     labels,
                     folders: folders.into_iter().collect(),
                     issues,
@@ -7511,7 +8182,8 @@ fn run_update_check(
             "osu!.db unavailable: {err} — every set is checked online"
         )),
         None if frozen_count > 0 => Some(format!(
-            "skipped {frozen_count} ranked/approved/qualified/loved set(s) via osu!.db"
+            "skipped {} ranked/approved/qualified/loved sets via osu!.db",
+            frozen_count
         )),
         None => None,
     };
@@ -7740,6 +8412,7 @@ fn run_update_jobs(
                     written: outcome.written_files.len(),
                     removed: outcome.removed_files.len(),
                     download_source: outcome.download_source,
+                    checksum_note: outcome.checksum_note,
                 });
             }
             Err(err) => {
@@ -7874,7 +8547,8 @@ fn verify_repair(job: &RepairJob, restored_files: &[String]) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "download did not contain the missing file(s): {}",
+        "download did not contain the missing {}: {}",
+        if still_missing.len() == 1 { "file" } else { "files" },
         still_missing.join(", ")
     )
 }
@@ -8375,6 +9049,7 @@ mod tests {
         fs::create_dir_all(&folder).unwrap();
         let job = RepairJob {
             beatmapset_id: 42,
+            title: None,
             labels: Vec::new(),
             folders: vec![folder],
             issues: Vec::new(),
