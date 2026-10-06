@@ -2837,9 +2837,9 @@ impl SkinEditorState {
                             base_path,
                             true,
                             format!(
-                            "Restored {} to \"{base_label}\".",
-                            plural_word(count, "failsound file", "failsound files")
-                        ),
+                                "Restored {} to \"{base_label}\".",
+                                plural_word(count, "failsound file", "failsound files")
+                            ),
                         );
                         self.move_failsound_entries(base_path, false);
                     }
@@ -3362,7 +3362,7 @@ impl SkinEditorState {
                     format!(
                         "{} as one set",
                         plural_word(slot.files.len(), "file", "files")
-                    )
+                    ),
                 );
             }
             if let Some(entry) = &override_entry {

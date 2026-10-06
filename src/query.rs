@@ -18,7 +18,7 @@ pub const HP_RANGE: (f32, f32) = (0.0, 10.0);
 pub const BPM_RANGE: (f32, f32) = (0.0, 350.0);
 
 /// Closed numeric range picked with min/max sliders. Disabled means "any".
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RangeFilter {
     pub enabled: bool,
     pub min: f32,
@@ -117,7 +117,7 @@ impl ModeFilter {
 /// All collection filters. Text is matched case-insensitively when non-empty;
 /// the song length bounds are typed in seconds and ignored when blank or
 /// invalid.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BeatmapFilters {
     pub artist: String,
     pub title: String,

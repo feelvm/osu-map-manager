@@ -1,8 +1,11 @@
 use crate::local::LocalBeatmap;
+use crate::query::BeatmapFilters;
 use anyhow::{Context, Result};
-use std::{fs, io::Write, path::Path};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, fs, io::Write, path::Path};
 
 const DEFAULT_COLLECTION_DB_VERSION: i32 = 20250107;
+const AUTO_COLLECTIONS_VERSION: i32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct CollectionEntry {
@@ -101,6 +104,54 @@ pub fn delete_collection(db: &mut CollectionDb, collection_name: &str) -> bool {
     db.collections
         .retain(|collection| collection.name != collection_name);
     db.collections.len() != original_len
+}
+
+/// Auto-add settings for one collection: when enabled, difficulties newly
+/// discovered by a library scan are evaluated against `filters` (per
+/// difficulty) and appended to the collection when they match.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutoCollectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub filters: BeatmapFilters,
+}
+
+/// Sidecar settings keyed by collection name. Lives in its own JSON file
+/// because `collection.db` is osu!'s native format and cannot carry
+/// map-manager-specific fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutoCollectionStore {
+    #[serde(default = "default_auto_collections_version")]
+    pub version: i32,
+    #[serde(default)]
+    pub collections: BTreeMap<String, AutoCollectionConfig>,
+}
+
+fn default_auto_collections_version() -> i32 {
+    AUTO_COLLECTIONS_VERSION
+}
+
+impl AutoCollectionStore {
+    /// A missing or corrupt file yields an empty store — the feature simply
+    /// reads as "nothing auto-adds" instead of taking the app down over a
+    /// settings file.
+    pub fn load(path: &Path) -> Self {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(self)?;
+        write_atomic(path, &bytes).with_context(|| format!("writing {}", path.display()))
+    }
 }
 
 pub fn write_db(path: &Path, db: &CollectionDb) -> Result<()> {
@@ -413,6 +464,62 @@ mod tests {
 
         // Atomic write leaves no temp file behind.
         assert!(!path.with_extension("tmp").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_collection_store_round_trips_and_tolerates_bad_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-map-manager-auto-collections-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auto_collections.json");
+
+        // Missing file reads as an empty store.
+        assert_eq!(
+            AutoCollectionStore::load(&path),
+            AutoCollectionStore::default()
+        );
+
+        let mut filters = BeatmapFilters::default();
+        filters.stars = crate::query::RangeFilter {
+            enabled: true,
+            min: 6.0,
+            max: 7.0,
+        };
+        filters.ar = crate::query::RangeFilter {
+            enabled: true,
+            min: 0.0,
+            max: 9.6,
+        };
+        let mut store = AutoCollectionStore::default();
+        // serde's `default = ...` only applies when loading; Default::default()
+        // starts at 0, so set the version explicitly like a real save would.
+        store.version = AUTO_COLLECTIONS_VERSION;
+        store.collections.insert(
+            "Six to Seven".to_owned(),
+            AutoCollectionConfig {
+                enabled: true,
+                filters: filters.clone(),
+            },
+        );
+        store.save(&path).unwrap();
+
+        let loaded = AutoCollectionStore::load(&path);
+        assert_eq!(loaded.version, AUTO_COLLECTIONS_VERSION);
+        assert_eq!(loaded.collections.len(), 1);
+        let config = loaded.collections.get("Six to Seven").unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.filters, filters);
+
+        // Corrupt file degrades to an empty store rather than failing.
+        fs::write(&path, b"{not json").unwrap();
+        assert_eq!(
+            AutoCollectionStore::load(&path),
+            AutoCollectionStore::default()
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
