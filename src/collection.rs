@@ -483,21 +483,25 @@ mod tests {
             AutoCollectionStore::default()
         );
 
-        let mut filters = BeatmapFilters::default();
-        filters.stars = crate::query::RangeFilter {
-            enabled: true,
-            min: 6.0,
-            max: 7.0,
+        let filters = BeatmapFilters {
+            stars: crate::query::RangeFilter {
+                enabled: true,
+                min: 6.0,
+                max: 7.0,
+            },
+            ar: crate::query::RangeFilter {
+                enabled: true,
+                min: 0.0,
+                max: 9.6,
+            },
+            ..BeatmapFilters::default()
         };
-        filters.ar = crate::query::RangeFilter {
-            enabled: true,
-            min: 0.0,
-            max: 9.6,
-        };
-        let mut store = AutoCollectionStore::default();
         // serde's `default = ...` only applies when loading; Default::default()
         // starts at 0, so set the version explicitly like a real save would.
-        store.version = AUTO_COLLECTIONS_VERSION;
+        let mut store = AutoCollectionStore {
+            version: AUTO_COLLECTIONS_VERSION,
+            ..AutoCollectionStore::default()
+        };
         store.collections.insert(
             "Six to Seven".to_owned(),
             AutoCollectionConfig {

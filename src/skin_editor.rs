@@ -3489,7 +3489,7 @@ impl SkinEditorState {
                                 |name| name.to_string_lossy().to_string(),
                             )
                     } else {
-                        format!("{}", plural_word(entry.files.len(), "file", "files"))
+                        plural_word(entry.files.len(), "file", "files").to_string()
                     };
                     let mut hover = if entry.skin == IMPORTED_SKIN {
                         format!("Imported asset — {summary}")
