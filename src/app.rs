@@ -1036,7 +1036,11 @@ impl MapManagerApp {
                         // Auto-add freshly discovered maps to every enabled
                         // collection, then refresh the "seen" baseline so the
                         // next scan diffs against this one.
-                        if self.auto_collections.collections.values().any(|config| config.enabled)
+                        if self
+                            .auto_collections
+                            .collections
+                            .values()
+                            .any(|config| config.enabled)
                         {
                             let new_maps = self
                                 .scan
@@ -2005,7 +2009,9 @@ impl MapManagerApp {
                 );
                 self.load_collections();
             }
-            Err(err) => self.set_collection_notice(false, format!("Add to collection failed: {err:#}")),
+            Err(err) => {
+                self.set_collection_notice(false, format!("Add to collection failed: {err:#}"))
+            }
         }
     }
 
