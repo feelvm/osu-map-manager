@@ -6664,6 +6664,8 @@ impl eframe::App for MapManagerApp {
         let mut sign_out_requested = false;
         let mut delete_non_std_requested = false;
 
+        bug_report_footer(ctx);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ctx.style().as_ref()))
             .show(ctx, |ui| {
@@ -8021,6 +8023,50 @@ fn panel_frame(style: &egui::Style) -> egui::Frame {
             1.0_f32,
             egui::Color32::from_rgb(0x32, 0x33, 0x37),
         ))
+}
+
+/// Thin footer along the bottom edge with bug-report contacts. Deliberately
+/// tiny and right-aligned so it never competes with the panels above.
+fn bug_report_footer(ctx: &egui::Context) {
+    egui::TopBottomPanel::bottom("bug_report_footer")
+        .frame(
+            egui::Frame::side_top_panel(ctx.style().as_ref())
+                .inner_margin(egui::Margin::symmetric(14.0, 3.0))
+                .fill(egui::Color32::from_rgb(0x18, 0x19, 0x1c)),
+        )
+        .show(ctx, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                // Right-to-left layout lays items out right to left, so the
+                // pieces are added in reverse reading order.
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new("feel@neuronotes.dev")
+                                .small()
+                                .underline(),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Click to copy the maintainer's email")
+                    .clicked()
+                {
+                    ui.output_mut(|o| o.copied_text = "feel@neuronotes.dev".to_owned());
+                }
+                ui.label(egui::RichText::new("·").small().weak());
+                if ui
+                    .add(
+                        egui::Label::new(egui::RichText::new("GitHub").small().underline())
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Open the GitHub repository to file an issue")
+                    .clicked()
+                {
+                    let _ = webbrowser::open("https://github.com/feelvm/osu-map-manager");
+                }
+                ui.label(egui::RichText::new("Report a bug:").small().weak());
+            });
+        });
 }
 
 pub(crate) fn section_frame(style: &egui::Style) -> egui::Frame {
