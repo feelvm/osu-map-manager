@@ -1548,16 +1548,25 @@ pub fn next_versioned_name(base: &str, skins_dir: &Path) -> String {
 /// Rewrites `Name:`/`Author:` inside `[General]`, keeping everything else
 /// verbatim; a missing file or section gets a minimal header prepended.
 fn patch_skin_ini(original: Option<&str>, name: &str, author: Option<&str>) -> String {
-    let author = author.unwrap_or("");
+    patch_skin_ini_fields(original, name, Some(author.unwrap_or("")))
+}
+
+/// Rewrites `Name:` (and `Author:` when `author` is `Some`) inside `[General]`,
+/// keeping everything else verbatim; a missing file or section gets a minimal
+/// header prepended. `author: None` leaves every `Author:` line untouched and
+/// inserts none — used when the skin never had an author to begin with.
+fn patch_skin_ini_fields(original: Option<&str>, name: &str, author: Option<&str>) -> String {
     let mut lines: Vec<String> = original.unwrap_or("").lines().map(str::to_owned).collect();
     let Some(general_pos) = lines
         .iter()
         .position(|line| line.trim().eq_ignore_ascii_case("[general]"))
     else {
-        return format!(
-            "[General]\nName: {name}\nAuthor: {author}\n\n{}",
-            original.unwrap_or("")
-        );
+        let mut header = format!("[General]\nName: {name}\n");
+        if let Some(author) = author {
+            header.push_str(&format!("Author: {author}\n"));
+        }
+        header.push('\n');
+        return format!("{header}{}", original.unwrap_or(""));
     };
 
     let section_end = lines[general_pos + 1..]
@@ -1575,8 +1584,8 @@ fn patch_skin_ini(original: Option<&str>, name: &str, author: Option<&str>) -> S
             if key.trim().eq_ignore_ascii_case("name") {
                 *line = format!("Name: {name}");
                 replaced_name = true;
-            } else if key.trim().eq_ignore_ascii_case("author") {
-                *line = format!("Author: {author}");
+            } else if author.is_some() && key.trim().eq_ignore_ascii_case("author") {
+                *line = format!("Author: {}", author.unwrap_or(""));
                 replaced_author = true;
             }
         }
@@ -1585,7 +1594,9 @@ fn patch_skin_ini(original: Option<&str>, name: &str, author: Option<&str>) -> S
     if !replaced_name {
         missing.push(format!("Name: {name}"));
     }
-    if !replaced_author {
+    if let Some(author) = author
+        && !replaced_author
+    {
         missing.push(format!("Author: {author}"));
     }
     for (offset, line) in missing.iter().enumerate() {
@@ -1731,6 +1742,79 @@ pub fn save_skin(
         overrides_applied,
         resizes_applied,
     })
+}
+
+/// Windows forbids these characters in folder names; the game would never see
+/// such a skin anyway, so reject the name up front.
+const INVALID_FOLDER_CHARS: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Windows device names, reserved as folder names with any extension.
+const RESERVED_FOLDER_NAMES: [&str; 22] = [
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Rejects names the skin folder cannot take: empty, path-shaped (`.`/`..`),
+/// containing Windows-invalid characters, a reserved device name, or ending
+/// in a dot (Windows silently drops trailing dots, which would desync the
+/// folder from the skin.ini `Name:` rename is supposed to keep in step).
+fn validate_skin_folder_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("The skin name is empty.");
+    }
+    if name == "." || name == ".." {
+        anyhow::bail!("\"{name}\" is not a usable skin name.");
+    }
+    if let Some(char) = name
+        .chars()
+        .find(|char| INVALID_FOLDER_CHARS.contains(char))
+    {
+        anyhow::bail!(
+            "The skin name contains a character that cannot be used in a folder name: \"{char}\""
+        );
+    }
+    if RESERVED_FOLDER_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        anyhow::bail!("\"{name}\" is a reserved device name on Windows.");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        anyhow::bail!("The skin name cannot end with a dot or a space.");
+    }
+    Ok(())
+}
+
+/// Renames a skin in place: the folder becomes `new_name` — stable lists skins
+/// by folder name — and the skin.ini `Name:` is rewritten to match, which is
+/// what lazer shows. An existing `Author:` line is preserved; a skin without a
+/// skin.ini gets a minimal one, so the new name is visible in lazer too.
+/// Returns the renamed folder path.
+pub fn rename_skin(skin_path: &Path, new_name: &str) -> Result<PathBuf> {
+    let new_name = new_name.trim();
+    validate_skin_folder_name(new_name)
+        .with_context(|| format!("renaming {}", skin_path.display()))?;
+    let parent = skin_path
+        .parent()
+        .with_context(|| format!("skin folder {} has no parent", skin_path.display()))?
+        .to_path_buf();
+    let target = parent.join(new_name);
+    if target.exists() {
+        anyhow::bail!("A skin folder \"{new_name}\" already exists.");
+    }
+
+    // Read before the rename: the metadata picks out the author line to keep.
+    let ini_path = skin_path.join("skin.ini");
+    let original = read_skin_text(&ini_path);
+    let author = read_skin_meta(&ini_path).author;
+
+    fs::rename(skin_path, &target)
+        .with_context(|| format!("renaming folder to {}", target.display()))?;
+
+    let ini_path = target.join("skin.ini");
+    fs::write(
+        &ini_path,
+        patch_skin_ini_fields(original.as_deref(), new_name, author.as_deref()),
+    )
+    .with_context(|| format!("writing {}", ini_path.display()))?;
+    Ok(target)
 }
 
 /// The editor slot table entry for a slot key.
@@ -2119,6 +2203,16 @@ pub struct SkinEditorState {
     /// clicks (arm, then confirm); pinning the arm to the skin path disarms
     /// it as soon as another skin is selected.
     failsound_armed_for: Option<PathBuf>,
+    /// Rename edit buffer, prefilled with the selected skin's folder name.
+    rename_edit: String,
+    /// Skin folder the rename buffer was prefilled for; selecting another
+    /// skin refills the buffer with that skin's folder name.
+    rename_edit_for: Option<PathBuf>,
+    rename_status: Option<String>,
+    rename_ok: bool,
+    /// Skin path the rename status belongs to (same pin rationale as the
+    /// failsound status above).
+    rename_status_for: Option<PathBuf>,
     /// Skin folder to select once the in-flight scan lands (used after
     /// saving, which creates a new versioned folder the old index can't
     /// point at).
@@ -2160,6 +2254,11 @@ impl SkinEditorState {
             failsound_ok: false,
             failsound_status_for: None,
             failsound_armed_for: None,
+            rename_edit: String::new(),
+            rename_edit_for: None,
+            rename_status: None,
+            rename_ok: false,
+            rename_status_for: None,
             pending_select_folder: None,
             imported: BTreeMap::new(),
             import_status: None,
@@ -2876,6 +2975,86 @@ impl SkinEditorState {
         self.failsound_status_for = Some(base_path.to_path_buf());
     }
 
+    /// "Rename skin" row: renames the selected skin's folder and rewrites its
+    /// skin.ini `Name:` to match — stable picks the skin up under the new
+    /// folder name, lazer shows the new `Name:`. One deliberate click (the
+    /// field is prefilled, so an accidental click renames to the same name
+    /// and changes nothing).
+    fn rename_section(&mut self, ui: &mut egui::Ui, base_label: &str, base_path: &Path) {
+        ui.label(egui::RichText::new("Rename skin").strong());
+        // Refill the buffer whenever a different skin is selected; after a
+        // successful rename the buffer is re-pinned to the new folder below,
+        // so the field shows the new name while the rescan is in flight.
+        if self.rename_edit_for.as_deref() != Some(base_path) {
+            self.rename_edit = base_label.to_owned();
+            self.rename_edit_for = Some(base_path.to_path_buf());
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.rename_edit)
+                .hint_text("Skin name")
+                .desired_width(f32::INFINITY),
+        );
+        let changed = self.rename_edit.trim() != base_label;
+        if changed
+            && ui
+                .add_enabled(!self.scan_in_flight, egui::Button::new("✏️ Rename skin"))
+                .on_hover_text(
+                    "Renames the skin folder and the Name line in skin.ini, so both the \
+                     game (folder name) and lazer (skin.ini Name) show the new name. The \
+                     skin stays selected after the rescan.",
+                )
+                .clicked()
+        {
+            match rename_skin(base_path, &self.rename_edit) {
+                Ok(new_path) => {
+                    let new_name = new_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    // Paths in the armed failsound confirmation are stale now.
+                    self.failsound_armed_for = None;
+                    // Rescan picks up the new folder and re-selects it.
+                    self.force_rescan = true;
+                    self.pending_select_folder = Some(new_name.clone());
+                    self.rename_edit = new_name.clone();
+                    self.rename_edit_for = Some(new_path.clone());
+                    self.set_rename_status(
+                        &new_path,
+                        true,
+                        format!(
+                            "Renamed \"{base_label}\" to \"{new_name}\" — folder and skin.ini \
+                             Name both updated."
+                        ),
+                    );
+                }
+                Err(err) => {
+                    self.set_rename_status(base_path, false, format!("Rename failed: {err:#}"));
+                }
+            }
+        }
+        // Pinned to the skin the message belongs to (after a rename the pin
+        // follows the new path, so the message survives the rescan).
+        if self.rename_status_for.as_deref() == Some(base_path)
+            && let Some(status) = &self.rename_status
+        {
+            ui.label(
+                egui::RichText::new(status)
+                    .small()
+                    .color(if self.rename_ok {
+                        egui::Color32::from_rgb(0x7f, 0xa6, 0x86)
+                    } else {
+                        egui::Color32::from_rgb(0xc2, 0x6b, 0x72)
+                    }),
+            );
+        }
+    }
+
+    fn set_rename_status(&mut self, base_path: &Path, ok: bool, message: String) {
+        self.rename_ok = ok;
+        self.rename_status = Some(message);
+        self.rename_status_for = Some(base_path.to_path_buf());
+    }
+
     /// Mirrors a successful hide (`to_hidden`) or restore into the skin
     /// summary with the same renames `hide`/`restore_failsound_files`
     /// perform, so the lists update without a rescan.
@@ -3310,6 +3489,7 @@ impl SkinEditorState {
                         self.import_section(ui);
                         match &failsound {
                             Some((label, path, live, hidden)) => {
+                                self.rename_section(ui, label, path);
                                 self.failsound_section(ui, label, path, live, hidden);
                             }
                             None => muted_label(ui, "Select a base skin in the sidebar."),
@@ -3322,6 +3502,7 @@ impl SkinEditorState {
                 self.cursor_size_section(ui);
                 self.import_section(ui);
                 if let Some((label, path, live, hidden)) = &failsound {
+                    self.rename_section(ui, label, path);
                     self.failsound_section(ui, label, path, live, hidden);
                 }
             }
@@ -4199,6 +4380,85 @@ mod tests {
         // No [General]: a minimal header is prepended.
         let bare = patch_skin_ini(None, "New", None);
         assert!(bare.starts_with("[General]\nName: New\nAuthor: \n"));
+    }
+
+    #[test]
+    fn skin_ini_name_only_patch_leaves_author_lines_alone() {
+        // author: None means "no author to write" — existing lines stay and
+        // none is inserted, unlike patch_skin_ini's always-write behaviour.
+        let original = "[General]\nName: Old\nAuthor: Someone\n";
+        let patched = patch_skin_ini_fields(Some(original), "New", None);
+        assert!(patched.contains("Name: New"));
+        assert!(patched.contains("Author: Someone"));
+
+        let sectionless = patch_skin_ini_fields(None, "New", None);
+        assert!(sectionless.starts_with("[General]\nName: New\n\n"));
+        assert!(!sectionless.contains("Author"));
+    }
+
+    #[test]
+    fn rename_skin_updates_folder_and_ini_name() {
+        let dir = unique_temp_dir("osu-skin-rename");
+        let skins = dir.join("Skins");
+        let skin = skins.join("Old Name");
+        fs::create_dir_all(&skin).unwrap();
+        fs::write(
+            skin.join("skin.ini"),
+            "[General]\nName: Old Name\nAuthor: Me\nCursorSize: 1\n\n[Colours]\nCombo1: 255,128,0\n",
+        )
+        .unwrap();
+
+        let renamed = rename_skin(&skin, "  New Name  ").unwrap();
+        assert_eq!(renamed, skins.join("New Name"));
+        assert!(renamed.is_dir());
+        assert!(!skin.exists());
+        let ini = fs::read_to_string(renamed.join("skin.ini")).unwrap();
+        assert!(ini.contains("Name: New Name"));
+        assert!(ini.contains("Author: Me"));
+        assert!(ini.contains("CursorSize: 1"));
+        assert!(ini.contains("Combo1: 255,128,0"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_skin_without_ini_creates_minimal_one() {
+        let dir = unique_temp_dir("osu-skin-rename-bare");
+        let skins = dir.join("Skins");
+        let skin = skins.join("Bare");
+        fs::create_dir_all(&skin).unwrap();
+
+        let renamed = rename_skin(&skin, "Named").unwrap();
+        let ini = fs::read_to_string(renamed.join("skin.ini")).unwrap();
+        assert!(ini.contains("Name: Named"));
+        // No author existed, so none is invented.
+        assert!(!ini.contains("Author"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_skin_rejects_unusable_names() {
+        let dir = unique_temp_dir("osu-skin-rename-invalid");
+        let skins = dir.join("Skins");
+        let skin = skins.join("Skin");
+        fs::create_dir_all(&skin).unwrap();
+        fs::write(skin.join("skin.ini"), "[General]\nName: Skin\n").unwrap();
+
+        for bad in ["", "a/b", "a\\b", "CON", "trailing."] {
+            assert!(
+                rename_skin(&skin, bad).is_err(),
+                "expected \"{bad}\" to be rejected"
+            );
+        }
+        // An existing sibling folder blocks the rename.
+        fs::create_dir_all(skins.join("Taken")).unwrap();
+        assert!(rename_skin(&skin, "Taken").is_err());
+        // Nothing was renamed or rewritten by the failed attempts.
+        assert!(skin.is_dir());
+        assert_eq!(
+            fs::read_to_string(skin.join("skin.ini")).unwrap(),
+            "[General]\nName: Skin\n"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
