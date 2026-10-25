@@ -37,7 +37,12 @@ jobs:
           }
           (Get-Content Cargo.toml -Raw) -replace '(?m)^version\s*=\s*"[^"]*"', "version = `"$version`"" | Set-Content Cargo.toml -NoNewline
           cargo update -p osu-map-manager
+      # Embeds the shared backend client token when the secret exists; when it
+      # is unset the build proceeds without one and the Worker keeps accepting
+      # tokenless clients until `wrangler secret put CLIENT_TOKEN` runs.
       - run: cargo build --release --locked
+        env:
+          OSU_MAP_MANAGER_CLIENT_TOKEN: ${{ secrets.WORKER_CLIENT_TOKEN }}
       - name: Package exe
         shell: pwsh
         run: |

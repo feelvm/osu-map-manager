@@ -3,7 +3,19 @@ export interface Env {
   OSU_CLIENT_SECRET: string;
   OSU_TOKEN_URL: string;
   OSU_API_BASE_URL: string;
-  BEATMAP_MIRROR_DOWNLOAD_BASE_URL: string;
+  /// Optional shared secret. While it is set, API routes additionally require
+  /// the `X-Client-Token` header to match, so only builds of the desktop app
+  /// that embed the token can use the Worker. `/health` and `/oauth/authorize`
+  /// (the one route the user's browser opens) stay exempt.
+  CLIENT_TOKEN?: string;
+  /// Per-IP rate limiters (Cloudflare rate-limiting bindings). Missing in
+  /// local dev: the gates degrade to no-op instead of failing requests.
+  RATE_LIMIT_AUTH?: RateLimiter;
+  RATE_LIMIT_METADATA?: RateLimiter;
+}
+
+interface RateLimiter {
+  limit(input: { key: string }): Promise<{ success: boolean }>;
 }
 
 type CachedToken = {
@@ -36,6 +48,33 @@ export default {
       return authorizeOsu(url, env);
     }
 
+    // Abuse gates for everything below: /oauth/authorize is the only route a
+    // browser legitimately opens (top-level navigation), and /health answers
+    // nothing sensitive. All other routes are for the desktop app alone.
+    // 1. Browsers always attach Origin (fetch/XHR) and Sec-Fetch-Site; plain
+    //    HTTP clients like the app send neither. Rejecting them stops any
+    //    website from driving the Worker through visitors' browsers.
+    // 2. Per-IP rate limits absorb scripted floods before they reach osu!.
+    // 3. When the CLIENT_TOKEN secret is set, requests must prove they come
+    //    from a build embedding that token.
+    if (isBrowserRequest(request)) {
+      return json({ error: "forbidden", message: "browser clients are not supported" }, 403);
+    }
+
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    const isAuthRoute =
+      url.pathname === "/oauth/check"
+      || url.pathname === "/oauth/token"
+      || url.pathname === "/oauth/refresh";
+    const limiter = isAuthRoute ? env.RATE_LIMIT_AUTH : env.RATE_LIMIT_METADATA;
+    if (!(await enforceRateLimit(limiter, ip))) {
+      return json({ error: "rate_limited" }, 429, { "Retry-After": "60" });
+    }
+
+    if (!(await isValidClientToken(request, env))) {
+      return json({ error: "unauthorized", message: "missing or invalid X-Client-Token" }, 401);
+    }
+
     if (request.method === "GET" && url.pathname === "/oauth/check") {
       return checkOAuth(env);
     }
@@ -46,11 +85,6 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/oauth/refresh") {
       return refreshUserToken(request, env);
-    }
-
-    const downloadMatch = url.pathname.match(/^\/beatmapsets\/(\d+)\/download$/);
-    if (request.method === "GET" && downloadMatch) {
-      return downloadBeatmapset(Number(downloadMatch[1]), env, request);
     }
 
     const beatmapsetMatch = url.pathname.match(/^\/beatmapsets\/(\d+)$/);
@@ -386,63 +420,10 @@ async function getBeatmap(beatmapId: number, env: Env, request: Request, ctx: Ex
   }
 }
 
-async function downloadBeatmapset(beatmapsetId: number, env: Env, request: Request): Promise<Response> {
-  if (!Number.isSafeInteger(beatmapsetId) || beatmapsetId <= 0) {
-    return json({ error: "invalid_beatmapset_id" }, 400);
-  }
-
-  // When the desktop app is signed in with osu! OAuth, prefer the official
-  // osu! API download endpoint. The user's bearer token is forwarded as-is
-  // and never logged or stored. Falls back to the mirror below when there is
-  // no token or the official download fails.
-  const authorization = request.headers.get("Authorization");
-  if (authorization && /^bearer\s+\S+$/i.test(authorization.trim())) {
-    try {
-      const official = await fetch(`${env.OSU_API_BASE_URL}/beatmapsets/${beatmapsetId}/download`, {
-        headers: {
-          "Accept": "application/octet-stream",
-          "Authorization": authorization.trim(),
-          "User-Agent": "osu-map-manager/0.1"
-        }
-      });
-      if (official.ok && official.body) {
-        return proxiedDownload(official, beatmapsetId, "osu-api");
-      }
-      // Fall through to the mirror on auth/availability failures so repair
-      // still works (e.g. expired token, missing supporter status).
-    } catch {
-      // Fall through to the mirror.
-    }
-  }
-
-  const upstream = await fetch(`${env.BEATMAP_MIRROR_DOWNLOAD_BASE_URL}/${beatmapsetId}`, {
-    headers: {
-      "Accept": "application/octet-stream",
-      // catboy.best rejects user agents it cannot classify as a browser,
-      // so present one (a plain app UA gets a 403).
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    }
-  });
-
-  if (!upstream.ok || !upstream.body) {
-    const body = await safeText(upstream);
-    return json({ error: "mirror_download_failed", status: upstream.status, body }, upstream.status);
-  }
-
-  return proxiedDownload(upstream, beatmapsetId, "mirror");
-}
-
-function proxiedDownload(upstream: Response, beatmapsetId: number, source: string): Response {
-  const headers = new Headers(upstream.headers);
-  headers.set("Content-Disposition", `attachment; filename="${beatmapsetId}.osz"`);
-  headers.set("Cache-Control", "no-store");
-  headers.set("X-Download-Source", source);
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers
-  });
-}
+// Beatmapset downloads were removed from the Worker on purpose: the desktop
+// app downloads directly from the official osu! API (user token) or the
+// mirror, so a proxied download route served no client — only third parties
+// looking for free bandwidth.
 
 async function getAccessToken(env: Env): Promise<string> {
   const secrets = getOAuthSecrets(env);
@@ -488,14 +469,66 @@ async function getAccessToken(env: Env): Promise<string> {
   return cachedToken.value;
 }
 
-function json(value: unknown, status = 200): Response {
+function json(value: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store"
+      "Cache-Control": "no-store",
+      ...extraHeaders
     }
   });
+}
+
+/// Browsers attach `Origin` to every cross-origin fetch/XHR and
+/// `Sec-Fetch-Site` to (nearly) every request; both are forbidden headers no
+/// page can strip. Plain HTTP clients like the desktop app send neither, so
+/// presence of either marks a browser caller.
+function isBrowserRequest(request: Request): boolean {
+  const site = request.headers.get("Sec-Fetch-Site");
+  if (site && site !== "none") {
+    return true;
+  }
+  return request.headers.has("Origin");
+}
+
+/// Fail open on limiter errors: the gates are abuse mitigation, and a
+/// binding hiccup must not take sign-in down for everyone.
+async function enforceRateLimit(limiter: RateLimiter | undefined, ip: string): Promise<boolean> {
+  if (!limiter) {
+    return true;
+  }
+  try {
+    return (await limiter.limit({ key: ip })).success;
+  } catch {
+    return true;
+  }
+}
+
+/// Constant-time token check (digest-then-XOR). No-op gate while
+/// `CLIENT_TOKEN` is unset so the Worker keeps working before a token-carrying
+/// app release exists.
+async function isValidClientToken(request: Request, env: Env): Promise<boolean> {
+  const expected = normalizeSecret(env.CLIENT_TOKEN);
+  if (!expected) {
+    return true;
+  }
+  const provided = request.headers.get("X-Client-Token")?.trim() ?? "";
+  if (!provided) {
+    return false;
+  }
+  const encoder = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+    crypto.subtle.digest("SHA-256", encoder.encode(provided))
+  ]);
+  const va = new Uint8Array(a);
+  const vb = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < va.length; i += 1) {
+    diff |= va[i] ^ vb[i];
+  }
+  return diff === 0;
 }
 
 async function safeText(response: Response): Promise<string> {

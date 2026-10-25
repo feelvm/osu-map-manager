@@ -91,6 +91,48 @@ pub fn backend_url() -> String {
     from_env.unwrap_or_else(|| BACKEND_URL.to_owned())
 }
 
+/// Shared client token for the backend Worker's abuse gate: the runtime env
+/// var wins over the build-time value, and blank values mean "no token" so a
+/// missing secret never breaks the app.
+fn resolve_client_token(
+    env_value: Option<String>,
+    compiled: Option<&'static str>,
+) -> Option<String> {
+    env_value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            compiled
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+/// Token the Worker expects in `X-Client-Token` while its `CLIENT_TOKEN`
+/// secret is set. Compiled in from `OSU_MAP_MANAGER_CLIENT_TOKEN` at build
+/// time (the release workflow injects the `WORKER_CLIENT_TOKEN` secret); the
+/// same env var overrides at runtime for local dev. `None` sends no header,
+/// which the Worker accepts until enforcement is switched on.
+pub fn backend_client_token() -> Option<String> {
+    resolve_client_token(
+        std::env::var("OSU_MAP_MANAGER_CLIENT_TOKEN").ok(),
+        option_env!("OSU_MAP_MANAGER_CLIENT_TOKEN"),
+    )
+}
+
+/// Adds the backend client token header to a Worker request when one is
+/// configured ([`backend_client_token`]); otherwise returns the request
+/// unchanged.
+pub fn with_backend_client_token(
+    request: reqwest::blocking::RequestBuilder,
+) -> reqwest::blocking::RequestBuilder {
+    match backend_client_token() {
+        Some(token) => request.header("X-Client-Token", token),
+        None => request,
+    }
+}
+
 pub fn authorize_url(backend_url: &str, state: &str, code_challenge: &str) -> String {
     format!(
         "{}/oauth/authorize?redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
@@ -204,8 +246,7 @@ pub fn login_with_state_blocking(
 /// by osu! before starting the interactive flow.
 pub fn check_backend_blocking(client: &reqwest::blocking::Client, backend_url: &str) -> Result<()> {
     let backend = validated_backend_base_url(backend_url)?;
-    let response = client
-        .get(format!("{backend}/oauth/check"))
+    let response = with_backend_client_token(client.get(format!("{backend}/oauth/check")))
         .send()
         .map_err(|err| crate::updates::transport_error("reaching the sign-in backend", &err))?;
     let check: CheckResponse = response
@@ -254,8 +295,7 @@ pub fn exchange_code_blocking(
     code_verifier: &str,
 ) -> Result<OauthSession> {
     let backend = backend_base_url(backend_url);
-    let response = client
-        .post(format!("{backend}/oauth/token"))
+    let response = with_backend_client_token(client.post(format!("{backend}/oauth/token")))
         .form(&[
             ("code", code),
             ("redirect_uri", OAUTH_REDIRECT_URI),
@@ -298,8 +338,7 @@ pub fn refresh_blocking(
     refresh_token: &str,
 ) -> std::result::Result<OauthSession, RefreshError> {
     let backend = backend_base_url(backend_url);
-    let response = client
-        .post(format!("{backend}/oauth/refresh"))
+    let response = with_backend_client_token(client.post(format!("{backend}/oauth/refresh")))
         .form(&[("refresh_token", refresh_token)])
         .send()
         .map_err(|err| RefreshError {
@@ -639,6 +678,20 @@ pub fn clear_oauth_session(osu_root: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_token_prefers_runtime_env_and_treats_blank_as_absent() {
+        assert_eq!(
+            resolve_client_token(Some("  from-env ".to_owned()), Some("compiled")),
+            Some("from-env".to_owned())
+        );
+        assert_eq!(
+            resolve_client_token(Some("   ".to_owned()), Some(" compiled ")),
+            Some("compiled".to_owned())
+        );
+        assert_eq!(resolve_client_token(Some(String::new()), Some("")), None);
+        assert_eq!(resolve_client_token(None, None), None);
+    }
 
     #[test]
     fn authorize_url_points_at_worker_with_redirect_state_and_pkce() {

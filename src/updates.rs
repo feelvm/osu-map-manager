@@ -303,7 +303,7 @@ pub fn fetch_set_meta_blocking(
         "{}/beatmapsets/{beatmapset_id}",
         backend_url.trim().trim_end_matches('/')
     );
-    let mut request = client.get(&url);
+    let mut request = crate::osu_oauth::with_backend_client_token(client.get(&url));
     if let Some(token) = access_token
         && !token.trim().is_empty()
     {
@@ -336,7 +336,7 @@ pub fn fetch_beatmap_blocking(
         "{}/beatmaps/{beatmap_id}",
         backend_url.trim().trim_end_matches('/')
     );
-    let mut request = client.get(&url);
+    let mut request = crate::osu_oauth::with_backend_client_token(client.get(&url));
     if let Some(token) = access_token
         && !token.trim().is_empty()
     {

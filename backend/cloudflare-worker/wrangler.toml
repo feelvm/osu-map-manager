@@ -6,7 +6,23 @@ workers_dev = true
 [vars]
 OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
 OSU_API_BASE_URL = "https://osu.ppy.sh/api/v2"
-BEATMAP_MIRROR_DOWNLOAD_BASE_URL = "https://catboy.best/d"
+
+# Per-IP abuse limits (keyed on CF-Connecting-IP at the edge). Auth routes do
+# at most a handful of calls per user per session; metadata bursts during a
+# big library repair stay well under 10 req/s for a single desktop client.
+[[unsafe.bindings]]
+name = "RATE_LIMIT_AUTH"
+type = "ratelimit"
+
+[unsafe.bindings.options]
+simple = { limit = 30, period = 60 }
+
+[[unsafe.bindings]]
+name = "RATE_LIMIT_METADATA"
+type = "ratelimit"
+
+[unsafe.bindings.options]
+simple = { limit = 600, period = 60 }
 
 [observability]
 enabled = true

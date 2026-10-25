@@ -1,10 +1,20 @@
 # osu! Map Manager Worker
 
-Cloudflare Worker backend for repair downloads. The desktop app calls this Worker endpoint:
+Cloudflare Worker backend for osu! sign-in and metadata lookups. The desktop
+app calls these Worker endpoints:
 
 ```text
-https://YOUR-WORKER.workers.dev/beatmapsets/{beatmapset_id}/download
+GET  /oauth/authorize          (opened in the user's browser; top-level navigation)
+GET  /oauth/check
+POST /oauth/token
+POST /oauth/refresh
+GET  /beatmapsets/{beatmapset_id}
+GET  /beatmaps/{beatmap_id}
 ```
+
+There is no download route: the desktop app downloads beatmapsets directly
+from the official osu! API (with the signed-in user's token) or from the
+public mirror, so a proxied download endpoint would only serve third parties.
 
 ## Setup
 
@@ -79,33 +89,39 @@ its own.
 
 Metadata routes (`GET /beatmapsets/:id`, `GET /beatmaps/:id`) prefer the
 caller's own osu! token when an `Authorization: Bearer` header is present and
-fall back to the Worker's app token otherwise. The Worker sends no CORS
-headers on purpose: the only client is the desktop app, so browsers are denied
-by default.
+fall back to the Worker's app token otherwise.
 
-The download route prefers the official osu! API when the app sends the
-user's token:
+## Abuse gates
 
-```text
-GET /beatmapsets/{beatmapset_id}/download
-Authorization: Bearer <osu! user token>
-```
+Every route except `/health` and `/oauth/authorize` (the one route the user's
+browser legitimately opens) is restricted to the desktop app:
 
-Without a token (or when the official download fails), the Worker falls back
-to the configured mirror base URL:
+- **Browser requests are rejected.** Browsers attach `Origin` and
+  `Sec-Fetch-Site` to requests; plain HTTP clients like the app send neither,
+  so any request carrying them gets HTTP 403. This stops websites from
+  driving the Worker through visitors' browsers.
+- **Per-IP rate limits** (Cloudflare rate-limiting bindings, keyed on
+  `CF-Connecting-IP` at the edge): 30 req/min on the OAuth routes, 600 req/min
+  on the metadata routes. A limiter error fails open so a binding hiccup
+  cannot take sign-in down.
+- **Optional shared client token.** While the `CLIENT_TOKEN` secret is set,
+  API routes additionally require `X-Client-Token` to match:
 
-```text
-BEATMAP_MIRROR_DOWNLOAD_BASE_URL = "https://catboy.best/d"
-```
+  ```powershell
+  npx wrangler secret put CLIENT_TOKEN
+  npx wrangler deploy
+  ```
 
-For public distribution, add Cloudflare rate limiting or WAF rules on:
+  Set it to the same value as the repository secret
+  `WORKER_CLIENT_TOKEN`, which the release workflow compiles into the app
+  (`OSU_MAP_MANAGER_CLIENT_TOKEN`). Until the secret is set the Worker accepts
+  tokenless clients, so enforcement can be switched on after a token-carrying
+  release exists. A token embedded in a public EXE can be extracted by a
+  determined attacker — it raises the bar against casual abuse, it is not a
+  secret in the strong sense.
 
-```text
-/beatmapsets/*/download
-```
-
-The Worker also caches the osu! access token in memory until close to expiry to avoid
-requesting a new token per download.
+The Worker also caches the osu! access token in memory until close to expiry
+to avoid requesting a new token per metadata burst.
 
 ## Rate posture
 
