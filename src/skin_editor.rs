@@ -2175,7 +2175,8 @@ pub struct SkinEditorState {
     overrides: BTreeMap<&'static str, PoolEntry>,
     /// Artwork scale for the whole cursor (`CURSOR_SLOT_KEYS` assets are
     /// resized together): the art is scaled inside each file's original
-    /// canvas on save. 1.0 = unchanged.
+    /// canvas on save. 1.0 = unchanged. Editor-level, not a per-skin pick:
+    /// reset to 1.0 when another skin is focused or picks are reset.
     cursor_resize: f32,
     force_rescan: bool,
     tex: HashMap<TexKey, LoadedTexture>,
@@ -2726,8 +2727,11 @@ impl SkinEditorState {
                 }
             }
 
-            if response.clicked() {
+            if response.clicked() && self.selected != Some(index) {
                 self.selected = Some(index);
+                // The cursor scale is an editor-level control (applied on
+                // save), so it must not leak from one skin into the next.
+                self.cursor_resize = 1.0;
             }
             let skin = &self.skins[index];
             ui.horizontal(|ui| {
@@ -3388,13 +3392,17 @@ impl SkinEditorState {
                     }
                     if ui
                         .add_enabled(
-                            !self.overrides.is_empty(),
+                            !self.overrides.is_empty() || self.cursor_resize != 1.0,
                             egui::Button::new("↺ Reset picks"),
                         )
-                        .on_hover_text("Drop every pooled pick and show the base skin again")
+                        .on_hover_text(
+                            "Drop every pooled pick, reset the cursor size and show the base \
+                             skin again",
+                        )
                         .clicked()
                     {
                         self.overrides.clear();
+                        self.cursor_resize = 1.0;
                     }
                 });
             });
