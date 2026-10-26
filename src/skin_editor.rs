@@ -5,7 +5,13 @@
 //! elements from the pooled assets of every installed skin. Saving writes a
 //! complete copy of the base skin as `<skin name> v<N>` (`v1`, then `v2`, …
 //! skipping versions that already exist), with every picked pool asset copied
-//! in under its canonical element name.
+//! in under its canonical element name, keeping the source's `@2x` marker so
+//! the art keeps the size it has in its donor skin.
+//!
+//! The cursor group additionally offers "Whole cursor" tiles: each skin's
+//! cursor, trail and middle pooled as one set (deduplicated like the slots),
+//! picked with a single click so the mixed skin keeps the donor's whole
+//! cursor — sizes and pairings included — instead of per-slot pieces.
 //!
 //! The cursor additionally gets a "Cursor size" control in the Skin extras
 //! panel: one scale for all cursor assets (cursor, trail, middle), scaled
@@ -114,6 +120,17 @@ const HUD_ENABLED: bool = false;
 /// Groups currently shown in the editor and fed into the scan/pool.
 fn active_groups() -> impl Iterator<Item = &'static Group> {
     GROUPS.iter().filter(|group| HUD_ENABLED || !group.hud)
+}
+
+/// Is this the Cursor group — the one the "Whole cursor" set picker belongs
+/// to? Matched by slot keys so reordering the table can't silently strand the
+/// picker.
+fn is_cursor_group(group: &Group) -> bool {
+    group.slots.len() == CURSOR_SLOT_KEYS.len()
+        && CURSOR_SLOT_KEYS
+            .iter()
+            .zip(group.slots)
+            .all(|(key, slot)| slot.key == *key)
 }
 
 static CIRCLE_NUMBERS: &[&str] = &[
@@ -783,6 +800,7 @@ fn scan_single_skin(skin_root: &Path, folder_name: String) -> SkinSummary {
 /// `PoolEntry::also_in`), and fully-transparent placeholders (the blank
 /// `cursortrail.png` many skins ship) collapse into one blank tile sorted
 /// last — so identical art never repeats down the pool strip.
+#[cfg(test)]
 pub fn build_pool(skins: &[SkinSummary]) -> BTreeMap<&'static str, Vec<PoolEntry>> {
     let mut key_cache = VisualKeyCache::new();
     build_pool_with_keys(skins, &mut key_cache)
@@ -931,6 +949,91 @@ fn entry_dedup_key_cached(
         parts.push(format!("{member}={sub_key}"));
     }
     (parts.join("|"), all_blank)
+}
+
+/// Whole-cursor sets: every skin's cursor assets ([`CURSOR_SLOT_KEYS`]) pooled
+/// as one combined entry, so the "Whole cursor" picker can swap the complete
+/// cursor — art, trail and middle together, in the sizes the donor skin pairs
+/// them — with a single click. Deduplicated by visual content like the
+/// per-slot pool: skins whose combined set is pixel-identical collapse into
+/// one tile, and a skin with only some cursor assets contributes exactly what
+/// it has (a set is never padded with members it lacks).
+fn build_cursor_sets_with_keys(
+    skins: &[SkinSummary],
+    key_cache: &mut VisualKeyCache,
+) -> Vec<PoolEntry> {
+    let mut sets: Vec<PoolEntry> = Vec::new();
+    // Dedup key → index into `sets`.
+    let mut key_index: HashMap<String, usize> = HashMap::new();
+    for skin in skins {
+        let mut files: BTreeMap<&'static str, PathBuf> = BTreeMap::new();
+        for slot_key in CURSOR_SLOT_KEYS {
+            let Some(slot) = find_slot(slot_key) else {
+                continue;
+            };
+            for file in slot.files {
+                if let Some(path) = skin.elements.get(file) {
+                    files.insert(*file, path.clone());
+                }
+            }
+        }
+        if files.is_empty() {
+            continue;
+        }
+        let thumb = files
+            .get("cursor.png")
+            .or_else(|| files.values().next())
+            .cloned()
+            .expect("cursor set has at least one file");
+        let (dedup_key, is_blank) = entry_dedup_key_cached(&files, key_cache);
+        if let Some(&index) = key_index.get(&dedup_key) {
+            // Identical whole-cursor set seen before — fold this skin in.
+            let existing = &mut sets[index];
+            if existing.skin != skin.folder_name && !existing.also_in.contains(&skin.folder_name) {
+                existing.also_in.push(skin.folder_name.clone());
+            }
+        } else {
+            key_index.insert(dedup_key, sets.len());
+            sets.push(PoolEntry {
+                skin: skin.folder_name.clone(),
+                files,
+                thumb,
+                also_in: Vec::new(),
+                is_blank,
+            });
+        }
+    }
+    sets.sort_by_key(|entry| (entry.is_blank, entry.skin.to_lowercase()));
+    sets
+}
+
+/// The per-slot pick a whole-cursor set contributes: the set's files that
+/// belong to `slot_key`, or `None` when the donor skin has no asset there
+/// (the slot then keeps the base skin's own file, matching the game's
+/// fallback).
+fn cursor_set_slot_entry(set: &PoolEntry, slot_key: &str) -> Option<PoolEntry> {
+    let slot = find_slot(slot_key)?;
+    let files: BTreeMap<&'static str, PathBuf> = set
+        .files
+        .iter()
+        .filter(|(file, _)| slot.files.contains(file))
+        .map(|(file, path)| (*file, path.clone()))
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let thumb = files
+        .get(slot.preview_file)
+        .or_else(|| files.values().next())
+        .cloned()
+        .expect("slot entry has at least one file");
+    Some(PoolEntry {
+        skin: set.skin.clone(),
+        files,
+        thumb,
+        also_in: set.also_in.clone(),
+        is_blank: false,
+    })
 }
 
 /// Image file fingerprint: size plus mtime. Cheap (`metadata` only) and
@@ -1271,11 +1374,14 @@ fn run_cached_skin_scan(skins_dir: PathBuf, cache_path: Option<PathBuf>) -> Skin
     // set): plain uncached scan, same as before the disk cache existed.
     if cache_path.is_none() {
         let skins = scan_skins(&skins_dir);
-        let pool = build_pool(&skins);
+        let mut key_cache = VisualKeyCache::new();
+        let pool = build_pool_with_keys(&skins, &mut key_cache);
+        let cursor_sets = build_cursor_sets_with_keys(&skins, &mut key_cache);
         return SkinScanResult {
             dir: Some(skins_dir),
             skins,
             pool,
+            cursor_sets,
         };
     }
     let cached: HashMap<String, CachedSkin> = cache_path
@@ -1387,6 +1493,7 @@ fn run_cached_skin_scan(skins_dir: PathBuf, cache_path: Option<PathBuf>) -> Skin
 
     warm_visual_keys(&skins, &mut key_cache);
     let pool = build_pool_with_keys(&skins, &mut key_cache);
+    let cursor_sets = build_cursor_sets_with_keys(&skins, &mut key_cache);
 
     // Persist only when something actually changed: a fully cached scan
     // would just rewrite the identical cache file.
@@ -1414,6 +1521,7 @@ fn run_cached_skin_scan(skins_dir: PathBuf, cache_path: Option<PathBuf>) -> Skin
         dir: Some(skins_dir),
         skins,
         pool,
+        cursor_sets,
     }
 }
 
@@ -1622,8 +1730,10 @@ pub struct SaveOutcome {
 /// Writes `<base> v<N>` next to the base skin: a full copy of the base folder
 /// (so the skin loads in game), a skin.ini whose `Name:` is the new version
 /// name, then every picked pool asset copied in under its canonical element
-/// name (existing variants of that element are removed first, since the game
-/// would prefer a leftover `@2x`). Members a partial set pick doesn't include
+/// name, keeping the source's `@2x` marker so the art renders at the size its
+/// donor skin (and the preview) shows (see `override_dest_name`; existing
+/// variants of that element are removed first, since the game would prefer a
+/// leftover `@2x`). Members a partial set pick doesn't include
 /// keep the base skin's files, matching the game's fallback behaviour.
 ///
 /// `resizes` (slot key → scale) scales the artwork of the slot's files inside
@@ -1888,12 +1998,22 @@ fn write_scaled_image(source: &Path, dest: &Path, scale: f32, centre_anchor: boo
     Ok(())
 }
 
-/// The pooled file keeps its own container (`default-2@2x.png` →
-/// `default-2.png`): the canonical stem with the source extension.
+/// The pooled file keeps its own container and `@2x` marker
+/// (`default-2@2x.png` → `default-2@2x.png`): the canonical stem, plus `@2x`
+/// when the source carries it, with the source extension. Keeping `@2x`
+/// matters because the game draws `@2x` elements at half their pixel size —
+/// a pick then renders exactly as large as in its donor skin, which is also
+/// what the preview shows (it halves `@2x` art). Writing the art under the
+/// plain name would double its in-game size.
 fn override_dest_name(slot_file: &str, source_file_name: &str) -> String {
     let lower = source_file_name.to_ascii_lowercase();
-    let ext = lower.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("png");
-    format!("{}.{ext}", slot_stem(slot_file))
+    let (source_stem, ext) = lower.rsplit_once('.').unwrap_or((lower.as_str(), "png"));
+    let stem = if source_stem.ends_with("@2x") {
+        format!("{}@2x", slot_stem(slot_file))
+    } else {
+        slot_stem(slot_file).to_owned()
+    };
+    format!("{stem}.{ext}")
 }
 
 /// Deletes `<stem>.png` / `<stem>@2x.jpg`-style leftovers so the game loads
@@ -2159,12 +2279,17 @@ struct SkinScanResult {
     dir: Option<PathBuf>,
     skins: Vec<SkinSummary>,
     pool: BTreeMap<&'static str, Vec<PoolEntry>>,
+    /// Whole-cursor set tiles for the "Whole cursor" picker (see
+    /// `build_cursor_sets_with_keys`).
+    cursor_sets: Vec<PoolEntry>,
 }
 
 pub struct SkinEditorState {
     scanned_dir: Option<PathBuf>,
     skins: Vec<SkinSummary>,
     pool: BTreeMap<&'static str, Vec<PoolEntry>>,
+    /// Whole-cursor set tiles for the Cursor group's "Whole cursor" picker.
+    cursor_sets: Vec<PoolEntry>,
     /// Background scan (`scan_skins` + `build_pool`, which decodes image
     /// content for dedup) in flight. While set, the tab shows a spinner
     /// instead of blocking the UI thread on the filesystem.
@@ -2235,6 +2360,7 @@ impl SkinEditorState {
             scanned_dir: None,
             skins: Vec::new(),
             pool: BTreeMap::new(),
+            cursor_sets: Vec::new(),
             scan_in_flight: false,
             scan_rx: None,
             selected: None,
@@ -2298,6 +2424,7 @@ impl SkinEditorState {
                     dir: None,
                     skins: Vec::new(),
                     pool: BTreeMap::new(),
+                    cursor_sets: Vec::new(),
                 },
             };
             let _ = tx.send(result);
@@ -2337,6 +2464,7 @@ impl SkinEditorState {
         self.scanned_dir = result.dir;
         self.skins = result.skins;
         self.pool = result.pool;
+        self.cursor_sets = result.cursor_sets;
         // A rescan refreshes every skin's file list — drop a pending
         // hide confirmation rather than acting on stale paths.
         self.failsound_armed_for = None;
@@ -3399,6 +3527,9 @@ impl SkinEditorState {
                     .default_open(group.default_open)
                     .show(ui, |ui| {
                         set_width(ui, ui.available_width());
+                        if is_cursor_group(group) {
+                            self.cursor_set_row(ui);
+                        }
                         for slot in group.slots {
                             self.slot_row(ui, slot);
                         }
@@ -3531,6 +3662,119 @@ impl SkinEditorState {
             // Approach circle + cursor are animated.
             ui.ctx().request_repaint_after(Duration::from_millis(33));
         });
+    }
+
+    /// The "Whole cursor" strip at the top of the Cursor group: one tile per
+    /// distinct cursor set (cursor, trail and middle as the donor skin pairs
+    /// them). Clicking applies every cursor slot at once, so mixing skin A's
+    /// cursor into skin B keeps A's sizes and trail instead of only the
+    /// single-slot piece.
+    fn cursor_set_row(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Whole cursor").strong());
+            muted_label(ui, "cursor + trail + middle from one skin, as one set");
+        });
+        ui.horizontal(|ui| {
+            let sets = self.cursor_sets.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for entry in &sets {
+                    let picked = self.cursor_set_picked(entry);
+                    let (tile_rect, tile_response) =
+                        ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::click());
+                    let painter = ui.painter_at(tile_rect);
+                    painter.rect_filled(tile_rect, 6.0, egui::Color32::from_rgb(0x26, 0x27, 0x2b));
+                    let stroke_color = if picked {
+                        ACCENT
+                    } else if tile_response.hovered() {
+                        egui::Color32::from_rgb(0x8a, 0x86, 0x80)
+                    } else {
+                        egui::Color32::from_rgb(0x3a, 0x3b, 0x40)
+                    };
+                    painter.rect_stroke(
+                        tile_rect,
+                        6.0,
+                        egui::Stroke::new(if picked { 2.0_f32 } else { 1.0_f32 }, stroke_color),
+                    );
+                    if let Some(texture) = self.texture(&entry.thumb, THUMB_DIM) {
+                        draw_fitted(
+                            &painter,
+                            &texture.handle,
+                            tile_rect.shrink(4.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    let copies = 1 + entry.also_in.len();
+                    if copies > 1 {
+                        painter.text(
+                            tile_rect.right_bottom() + egui::vec2(-3.0, -2.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            format!("×{copies}"),
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_rgb(0xc4, 0xa2, 0x6a),
+                        );
+                    }
+                    if tile_response.clicked() {
+                        self.apply_cursor_set(entry);
+                    }
+                    let names = entry
+                        .files
+                        .keys()
+                        .map(|file| slot_stem(file))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    let mut hover = format!("{} — whole cursor set ({names})", entry.skin);
+                    if !entry.also_in.is_empty() {
+                        hover.push_str(&format!(
+                            "\nIdentical set in {} other {}: {}",
+                            plural_word(entry.also_in.len(), "skin", "skins"),
+                            entry.also_in.join(", "),
+                            entry.also_in.join(", ")
+                        ));
+                    }
+                    hover.push_str(
+                        "\nClick to use this whole cursor — cursor, trail and middle together",
+                    );
+                    tile_response.on_hover_text(hover);
+                }
+            });
+            if sets.is_empty() {
+                muted_label(ui, "no skin ships cursor assets");
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Is this whole-cursor set the active pick? True when every cursor slot's
+    /// override is exactly the set's contribution for it — including the slots
+    /// the set leaves at the base skin's own asset.
+    fn cursor_set_picked(&self, set: &PoolEntry) -> bool {
+        CURSOR_SLOT_KEYS.iter().all(|slot_key| {
+            let expected = cursor_set_slot_entry(set, slot_key);
+            match (self.overrides.get(*slot_key), expected) {
+                (Some(pick), Some(expected)) => pick.thumb == expected.thumb,
+                (None, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    /// Applies a whole-cursor set: each cursor slot picks the set's files for
+    /// it; slots the donor skin has no asset for drop back to the base skin,
+    /// matching the game's fallback.
+    fn apply_cursor_set(&mut self, set: &PoolEntry) {
+        for slot_key in CURSOR_SLOT_KEYS {
+            match cursor_set_slot_entry(set, slot_key) {
+                Some(entry) => {
+                    self.overrides.insert(slot_key, entry);
+                }
+                None => {
+                    self.overrides.remove(slot_key);
+                }
+            }
+        }
     }
 
     fn slot_row(&mut self, ui: &mut egui::Ui, slot: &Slot) {
@@ -5162,6 +5406,128 @@ mod tests {
             .find(|s| s.folder_name == "Base v1")
             .unwrap();
         assert_eq!(save_skin(&derived, &[], &[], None).unwrap().name, "Base v2");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_keeps_2x_variant_name_of_pooled_pick() {
+        // The game draws @2x elements at half their pixel size, so a pooled
+        // @2x pick must keep its @2x name: writing it under the plain name
+        // would double the cursor's in-game size versus its donor skin.
+        let dir = unique_temp_dir("osu-skin-save-2x");
+        let skins = dir.join("Skins");
+        let base = skins.join("Base");
+        let donor = skins.join("Donor");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&donor).unwrap();
+        fs::write(base.join("skin.ini"), "[General]\nName: Base\n").unwrap();
+        write_png(&base.join("cursor.png"), [255, 0, 0, 255]);
+        write_png(&donor.join("cursor@2x.png"), [0, 0, 255, 255]);
+
+        let scanned = scan_skins(&skins);
+        let base_skin = scanned
+            .iter()
+            .find(|s| s.folder_name == "Base")
+            .unwrap()
+            .clone();
+        let donor_cursor = scanned
+            .iter()
+            .find(|s| s.folder_name == "Donor")
+            .unwrap()
+            .elements
+            .get("cursor.png")
+            .cloned()
+            .unwrap();
+        assert!(donor_cursor.ends_with("cursor@2x.png"));
+
+        let mut override_files = BTreeMap::new();
+        override_files.insert("cursor.png", donor_cursor.clone());
+        save_skin(
+            &base_skin,
+            &[(
+                "cursor".to_owned(),
+                PoolEntry {
+                    skin: "Donor".to_owned(),
+                    files: override_files,
+                    thumb: donor_cursor,
+                    also_in: Vec::new(),
+                    is_blank: false,
+                },
+            )],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let target = skins.join("Base v1");
+        assert!(
+            target.join("cursor@2x.png").exists(),
+            "the @2x pick keeps its @2x name"
+        );
+        assert!(
+            !target.join("cursor.png").exists(),
+            "the base 1x cursor is removed so the game loads the pick"
+        );
+        let saved = image::io::Reader::open(target.join("cursor@2x.png"))
+            .unwrap()
+            .decode()
+            .unwrap();
+        let pixel = saved.to_rgba8().get_pixel(8, 8).0;
+        assert_eq!(pixel, [0, 0, 255, 255]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cursor_sets_pool_identical_skins_and_split_per_slot() {
+        let dir = unique_temp_dir("osu-skin-cursor-sets");
+        let skins = dir.join("Skins");
+        for name in ["A", "B", "C"] {
+            fs::create_dir_all(skins.join(name)).unwrap();
+            fs::write(
+                skins.join(name).join("skin.ini"),
+                format!("[General]\nName: {name}\n"),
+            )
+            .unwrap();
+        }
+        // A and B ship the identical whole cursor; C differs in the trail.
+        write_png(&skins.join("A").join("cursor@2x.png"), [255, 0, 0, 255]);
+        write_png(&skins.join("A").join("cursortrail.png"), [0, 255, 0, 255]);
+        write_png(&skins.join("B").join("cursor@2x.png"), [255, 0, 0, 255]);
+        write_png(&skins.join("B").join("cursortrail.png"), [0, 255, 0, 255]);
+        write_png(&skins.join("C").join("cursor@2x.png"), [255, 0, 0, 255]);
+        write_png(&skins.join("C").join("cursortrail.png"), [0, 0, 255, 255]);
+        // D ships only a cursor — a partial set of its own.
+        fs::create_dir_all(skins.join("D")).unwrap();
+        fs::write(skins.join("D").join("skin.ini"), "[General]\nName: D\n").unwrap();
+        write_png(&skins.join("D").join("cursor@2x.png"), [255, 0, 0, 255]);
+
+        let scanned = scan_skins(&skins);
+        let mut key_cache = VisualKeyCache::new();
+        let sets = build_cursor_sets_with_keys(&scanned, &mut key_cache);
+
+        assert_eq!(sets.len(), 3, "A+B collapse; C and D stay separate");
+        let ab = sets
+            .iter()
+            .find(|set| set.skin == "A" && set.also_in == vec!["B".to_owned()])
+            .expect("A and B share one tile");
+        assert_eq!(ab.files.len(), 2);
+        let c = sets.iter().find(|set| set.skin == "C").unwrap();
+        assert!(c.also_in.is_empty());
+        assert_eq!(c.files.len(), 2);
+        let d = sets.iter().find(|set| set.skin == "D").unwrap();
+        assert_eq!(d.files.len(), 1, "partial sets pool what the skin has");
+
+        // The set splits into per-slot picks: cursor and trail for A/B,
+        // nothing for the missing middle slot.
+        let cursor = cursor_set_slot_entry(ab, "cursor").unwrap();
+        assert_eq!(cursor.files.len(), 1);
+        assert!(cursor.files.contains_key("cursor.png"));
+        let trail = cursor_set_slot_entry(ab, "cursortrail").unwrap();
+        assert_eq!(trail.files.len(), 1);
+        assert!(cursor_set_slot_entry(ab, "cursormiddle").is_none());
+        assert!(cursor_set_slot_entry(ab, "hitcircle").is_none());
 
         let _ = fs::remove_dir_all(dir);
     }
