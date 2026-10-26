@@ -3314,6 +3314,32 @@ impl SkinEditorState {
 
     // ── Center panel ──
 
+    /// The Save skin / Reset picks buttons, drawn in the tab header so they
+    /// stay visible while the pane scrolls.
+    pub fn header_actions(&mut self, ui: &mut egui::Ui) {
+        let save_enabled = self.selected_skin().is_some() && !self.is_saving;
+        if ui
+            .add_enabled(save_enabled, egui::Button::new("💾 Save skin"))
+            .on_hover_text("Opens the save dialog — the original skin is never modified")
+            .clicked()
+        {
+            self.open_save_dialog();
+        }
+        if ui
+            .add_enabled(
+                !self.overrides.is_empty() || self.cursor_resize != 1.0,
+                egui::Button::new("↺ Reset picks"),
+            )
+            .on_hover_text(
+                "Drop every pooled pick, reset the cursor size and show the base skin again",
+            )
+            .clicked()
+        {
+            self.overrides.clear();
+            self.cursor_resize = 1.0;
+        }
+    }
+
     pub fn center_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.poll(ctx);
         let content_width = ui.available_width().max(1.0);
@@ -3381,30 +3407,6 @@ impl SkinEditorState {
                     ui,
                     "A live mock of the playfield — it updates as you switch skins or pick pooled elements.",
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let save_enabled = self.selected_skin().is_some() && !self.is_saving;
-                    if ui
-                        .add_enabled(save_enabled, egui::Button::new("💾 Save skin"))
-                        .on_hover_text("Opens the save dialog — the original skin is never modified")
-                        .clicked()
-                    {
-                        self.open_save_dialog();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.overrides.is_empty() || self.cursor_resize != 1.0,
-                            egui::Button::new("↺ Reset picks"),
-                        )
-                        .on_hover_text(
-                            "Drop every pooled pick, reset the cursor size and show the base \
-                             skin again",
-                        )
-                        .clicked()
-                    {
-                        self.overrides.clear();
-                        self.cursor_resize = 1.0;
-                    }
-                });
             });
             ui.horizontal(|ui| {
                 if let Some(skin) = self.selected_skin() {

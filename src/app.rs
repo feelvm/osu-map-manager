@@ -6673,6 +6673,13 @@ impl eframe::App for MapManagerApp {
                 ui.horizontal(|ui| {
                     ui.heading(self.active_tab.label());
                     muted_label(ui, self.active_tab.subtitle());
+                    if self.active_tab == AppTab::SkinEditor {
+                        // Always-visible skin editor actions: the pane below
+                        // scrolls, this header row does not.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.skin_editor.header_actions(ui);
+                        });
+                    }
                 });
                 ui.add_space(6.0);
 
