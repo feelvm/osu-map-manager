@@ -2172,6 +2172,8 @@ pub struct SkinEditorState {
     scan_rx: Option<Receiver<SkinScanResult>>,
     selected: Option<usize>,
     /// slot key → pool entry picked by the user (wins over the base skin).
+    /// Working state for the focused skin: cleared when another skin is
+    /// selected or "Reset picks" is pressed.
     overrides: BTreeMap<&'static str, PoolEntry>,
     /// Artwork scale for the whole cursor (`CURSOR_SLOT_KEYS` assets are
     /// resized together): the art is scaled inside each file's original
@@ -2399,6 +2401,11 @@ impl SkinEditorState {
                     match result {
                         Ok(outcome) => {
                             self.save_ok = true;
+                            // The picks were baked into the saved copy; the
+                            // rescan this triggers selects that new skin, so
+                            // drop the working state rather than carrying it
+                            // into the fresh focus.
+                            self.reset_picks();
                             // The rescan this triggers lands the new versioned
                             // folder; select it once it arrives.
                             self.pending_select_folder = Some(outcome.name.clone());
@@ -2729,9 +2736,7 @@ impl SkinEditorState {
 
             if response.clicked() && self.selected != Some(index) {
                 self.selected = Some(index);
-                // The cursor scale is an editor-level control (applied on
-                // save), so it must not leak from one skin into the next.
-                self.cursor_resize = 1.0;
+                self.reset_picks();
             }
             let skin = &self.skins[index];
             ui.horizontal(|ui| {
@@ -3203,6 +3208,14 @@ impl SkinEditorState {
         });
     }
 
+    /// Per-skin working state for the currently focused skin: pooled picks
+    /// and the cursor scale. Focusing a different skin (or "Reset picks")
+    /// starts from the base skin's defaults again.
+    fn reset_picks(&mut self) {
+        self.overrides.clear();
+        self.cursor_resize = 1.0;
+    }
+
     /// "Cursor size" block: one scale for the whole cursor — the cursor,
     /// trail and middle assets are resized together. The art is scaled
     /// inside each file's original canvas resolution (see
@@ -3335,8 +3348,7 @@ impl SkinEditorState {
             )
             .clicked()
         {
-            self.overrides.clear();
-            self.cursor_resize = 1.0;
+            self.reset_picks();
         }
     }
 
