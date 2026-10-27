@@ -11,7 +11,14 @@
 //! The cursor group additionally offers "Whole cursor" tiles: each skin's
 //! cursor, trail and middle pooled as one set (deduplicated like the slots),
 //! picked with a single click so the mixed skin keeps the donor's whole
-//! cursor — sizes and pairings included — instead of per-slot pieces.
+//! cursor — sizes and pairings included — instead of per-slot pieces. The
+//! set also owns each member's *presence*: a member the donor doesn't ship
+//! is dropped from the saved skin, because `cursormiddle.png` is not just
+//! another sprite — in osu, its presence switches the trail to the long
+//! continuous mode while its absence gives the short disjoint trail, so
+//! silently keeping the base skin's middle would change the trail's whole
+//! look. Every cursor slot also has an explicit "✕ none" pick that ships no
+//! file, removing the base skin's element on save.
 //!
 //! The cursor additionally gets a "Cursor size" control in the Skin extras
 //! panel: one scale for all cursor assets (cursor, trail, middle), scaled
@@ -1008,9 +1015,12 @@ fn build_cursor_sets_with_keys(
 }
 
 /// The per-slot pick a whole-cursor set contributes: the set's files that
-/// belong to `slot_key`, or `None` when the donor skin has no asset there
-/// (the slot then keeps the base skin's own file, matching the game's
-/// fallback).
+/// belong to `slot_key`, or `None` when the donor skin has no asset there.
+/// `None` does *not* mean "keep the base skin's file": the game's fallback
+/// isn't per-file. `cursormiddle` is the trail-mode switch (present = long
+/// continuous trail, absent = short disjoint trail), so a set without a
+/// middle must ship the mixed skin without one too — [`PoolEntry::removal`]
+/// encodes that.
 fn cursor_set_slot_entry(set: &PoolEntry, slot_key: &str) -> Option<PoolEntry> {
     let slot = find_slot(slot_key)?;
     let files: BTreeMap<&'static str, PathBuf> = set
@@ -1733,8 +1743,10 @@ pub struct SaveOutcome {
 /// name, keeping the source's `@2x` marker so the art renders at the size its
 /// donor skin (and the preview) shows (see `override_dest_name`; existing
 /// variants of that element are removed first, since the game would prefer a
-/// leftover `@2x`). Members a partial set pick doesn't include
-/// keep the base skin's files, matching the game's fallback behaviour.
+/// leftover `@2x`). A pick with no files ("ship no file", used by the whole
+/// cursor set for members the donor doesn't ship) deletes the base skin's
+/// variants of that slot instead — needed for `cursormiddle`, whose presence
+/// alone switches the trail to the long continuous mode in osu.
 ///
 /// `resizes` (slot key → scale) scales the artwork of the slot's files inside
 /// their original canvas resolution — the file keeps its exact pixel size, so
@@ -1795,6 +1807,20 @@ pub fn save_skin(
 
     for (slot_key, entry) in overrides {
         let scale = resize_by_slot.get(slot_key.as_str()).copied();
+        if entry.files.is_empty() {
+            // "Ship no file" pick: delete every variant of the slot's
+            // members from the copied base skin. `cursormiddle` matters most
+            // — its presence switches osu's trail to the long continuous
+            // mode, so a donor set without a middle must not inherit the
+            // base skin's one.
+            let Some(slot) = find_slot(slot_key) else {
+                continue;
+            };
+            for member_file in slot.files {
+                overrides_applied += remove_slot_variants(&target, slot_stem(member_file));
+            }
+            continue;
+        }
         for (member_file, path) in &entry.files {
             remove_slot_variants(&target, slot_stem(member_file));
             let source_name = path
@@ -2036,10 +2062,13 @@ fn override_dest_name(slot_file: &str, source_file_name: &str) -> String {
 
 /// Deletes `<stem>.png` / `<stem>@2x.jpg`-style leftovers so the game loads
 /// the freshly copied element instead of a higher-res variant of the old one.
-fn remove_slot_variants(target: &Path, stem: &str) {
+/// Returns how many files were deleted (a "ship no file" pick reports that
+/// as its applied count).
+fn remove_slot_variants(target: &Path, stem: &str) -> usize {
     let Ok(read_dir) = fs::read_dir(target) else {
-        return;
+        return 0;
     };
+    let mut removed = 0;
     for entry in read_dir.filter_map(|entry| entry.ok()) {
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
         let Some((file_stem, ext)) = name.rsplit_once('.') else {
@@ -2047,9 +2076,13 @@ fn remove_slot_variants(target: &Path, stem: &str) {
         };
         let base_stem = file_stem.strip_suffix("@2x").unwrap_or(file_stem);
         if base_stem == stem && matches!(ext, "png" | "jpg" | "jpeg") {
+            // `fs::remove_file` on an already-removed path races nothing
+            // here: entries are collected from a snapshot read above.
             let _ = fs::remove_file(entry.path());
+            removed += 1;
         }
     }
+    removed
 }
 
 fn collect_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
@@ -2076,6 +2109,9 @@ fn collect_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
 
 /// The skin name shown on imported pool tiles.
 const IMPORTED_SKIN: &str = "Imported";
+
+/// The "skin" name on a "ship no file" pick (see [`PoolEntry::removal`]).
+const REMOVAL_SKIN: &str = "none";
 
 /// Image containers the import accepts — the same ones the game loads skin
 /// elements from.
@@ -2509,8 +2545,10 @@ impl SkinEditorState {
             })
             .or(previous_index.filter(|&index| index < self.skins.len()))
             .or(if self.skins.is_empty() { None } else { Some(0) });
-        // Pooled files may have vanished (skins deleted/renamed).
-        self.overrides.retain(|_, entry| entry.path_exists());
+        // Pooled files may have vanished (skins deleted/renamed). "Ship no
+        // file" picks carry no paths and stay.
+        self.overrides
+            .retain(|_, entry| entry.files.is_empty() || entry.path_exists());
         self.retain_live_imports();
         true
     }
@@ -2627,13 +2665,24 @@ impl SkinEditorState {
         self.selected.and_then(|index| self.skins.get(index))
     }
 
-    /// What the preview shows: the base skin's elements with user picks on top.
+    /// What the preview shows: the base skin's elements with user picks on
+    /// top. A "ship no file" pick removes the slot's members instead, so the
+    /// preview sees exactly the file set that will be saved — which is what
+    /// picks the game's trail mode (cursormiddle present or not).
     fn preview_elements(&self) -> BTreeMap<&'static str, PathBuf> {
         let mut elements = self
             .selected_skin()
             .map(|skin| skin.elements.clone())
             .unwrap_or_default();
-        for entry in self.overrides.values() {
+        for (slot_key, entry) in &self.overrides {
+            if entry.is_removal() {
+                if let Some(slot) = find_slot(slot_key) {
+                    for member_file in slot.files {
+                        elements.remove(member_file);
+                    }
+                }
+                continue;
+            }
             for (member_file, path) in &entry.files {
                 elements.insert(*member_file, path.clone());
             }
@@ -2654,13 +2703,19 @@ impl SkinEditorState {
                 .get(file)
                 .and_then(|path| self.texture(path, max_dim))
         };
+        let cursor_loaded = get("cursor.png");
+        let trail_loaded = get("cursortrail.png");
+        let middle_loaded = get("cursormiddle.png");
         let hitcircle = get("hitcircle.png");
         let overlay = get("hitcircleoverlay.png");
         let approach = get("approachcircle.png");
         let mut assets = SceneAssets {
-            cursor: get("cursor.png").map(|loaded| loaded.handle),
-            trail: get("cursortrail.png").map(|loaded| loaded.handle),
-            middle: get("cursormiddle.png").map(|loaded| loaded.handle),
+            cursor: cursor_loaded.as_ref().map(|loaded| loaded.handle.clone()),
+            trail: trail_loaded.as_ref().map(|loaded| loaded.handle.clone()),
+            middle: middle_loaded.as_ref().map(|loaded| loaded.handle.clone()),
+            cursor_game_height: cursor_loaded.as_ref().map(|loaded| loaded.game_height),
+            trail_game_height: trail_loaded.as_ref().map(|loaded| loaded.game_height),
+            middle_game_height: middle_loaded.as_ref().map(|loaded| loaded.game_height),
             cursor_scale,
             hitcircle: hitcircle.as_ref().map(|loaded| loaded.handle.clone()),
             overlay: overlay.as_ref().map(|loaded| loaded.handle.clone()),
@@ -3840,6 +3895,12 @@ impl SkinEditorState {
                     hover.push_str(
                         "\nClick to use this whole cursor — cursor, trail and middle together",
                     );
+                    hover.push_str(if entry.files.contains_key("cursormiddle.png") {
+                        "\nShips cursormiddle — osu renders the trail long and continuous."
+                    } else {
+                        "\nNo cursormiddle — osu renders the short disjoint trail, and the \
+                         base skin's cursormiddle (if any) is dropped on save."
+                    });
                     tile_response.on_hover_text(hover);
                 }
             });
@@ -3850,23 +3911,27 @@ impl SkinEditorState {
         ui.add_space(4.0);
     }
 
-    /// Is this whole-cursor set the active pick? True when every cursor slot's
-    /// override is exactly the set's contribution for it — including the slots
-    /// the set leaves at the base skin's own asset.
+    /// Is this whole-cursor set the active pick? True when every cursor
+    /// slot's override is exactly the set's contribution for it — a member
+    /// the set doesn't ship matches a "ship no file" pick (the base skin's
+    /// own asset must be dropped, not kept).
     fn cursor_set_picked(&self, set: &PoolEntry) -> bool {
         CURSOR_SLOT_KEYS.iter().all(|slot_key| {
             let expected = cursor_set_slot_entry(set, slot_key);
             match (self.overrides.get(*slot_key), expected) {
                 (Some(pick), Some(expected)) => pick.thumb == expected.thumb,
+                (Some(pick), None) => pick.is_removal(),
                 (None, None) => true,
                 _ => false,
             }
         })
     }
 
-    /// Applies a whole-cursor set: each cursor slot picks the set's files for
-    /// it; slots the donor skin has no asset for drop back to the base skin,
-    /// matching the game's fallback.
+    /// Applies a whole-cursor set: each cursor slot picks the set's files
+    /// for it; slots the donor skin has no asset for get a "ship no file"
+    /// pick, which drops the base skin's element on save — so the mixed
+    /// skin renders the trail exactly the way the donor does (no stray
+    /// `cursormiddle` flipping the trail into the long continuous mode).
     fn apply_cursor_set(&mut self, set: &PoolEntry) {
         for slot_key in CURSOR_SLOT_KEYS {
             match cursor_set_slot_entry(set, slot_key) {
@@ -3874,7 +3939,7 @@ impl SkinEditorState {
                     self.overrides.insert(slot_key, entry);
                 }
                 None => {
-                    self.overrides.remove(slot_key);
+                    self.overrides.insert(slot_key, PoolEntry::removal());
                 }
             }
         }
@@ -3903,7 +3968,20 @@ impl SkinEditorState {
         ui.add_space(6.0);
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(slot.label).strong());
+            ui.label(egui::RichText::new(slot.label).strong())
+                .on_hover_text(match slot.key {
+                    "cursormiddle" => {
+                        "Shipping cursormiddle.png switches osu's trail to the long \
+                         continuous mode; picking “✕” ships no file and keeps the short \
+                         disjoint trail."
+                    }
+                    "cursortrail" => {
+                        "With no cursormiddle in the saved skin, osu renders the short \
+                         disjoint trail from this sprite; picking “✕” ships no file and \
+                         disables the trail."
+                    }
+                    _ => "",
+                });
             if slot.files.len() == 1 {
                 muted_label(ui, slot.files[0]);
             } else {
@@ -3916,7 +3994,14 @@ impl SkinEditorState {
                 );
             }
             if let Some(entry) = &override_entry {
-                muted_label(ui, format!("← {} ({})", entry.skin, entry.files.len()));
+                muted_label(
+                    ui,
+                    if entry.is_removal() {
+                        "← none — removed on save".to_owned()
+                    } else {
+                        format!("← {} ({})", entry.skin, entry.files.len())
+                    },
+                );
                 if ui
                     .small_button("↺")
                     .on_hover_text("Back to the base skin's own asset")
@@ -3957,18 +4042,76 @@ impl SkinEditorState {
                 );
                 draw_fitted(&painter, &texture.handle, fit_box, egui::Color32::WHITE);
             }
-            thumb_response.on_hover_text(match &current_path {
-                Some(path) => format!("In use: {}", path.display()),
-                None => "No asset for this element yet".to_owned(),
+            thumb_response.on_hover_text(match (&override_entry, &current_path) {
+                (Some(entry), _) if entry.is_removal() => "No file is shipped for this \
+                     element — saving removes the base skin's file."
+                    .to_owned(),
+                (_, Some(path)) => format!("In use: {}", path.display()),
+                _ => "No asset for this element yet".to_owned(),
             });
 
             muted_label(ui, "Pool:");
 
-            let entries = pool.len();
+            let entries = pool.len() + usize::from(CURSOR_SLOT_KEYS.contains(&slot.key));
             // Wrapping tile grid, not a scroller: tiles flow left-to-right
             // and continue on the next line when the row fills up.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                // Cursor slots lead with a "✕ none" tile: shipping no file
+                // is a meaningful state there — it drops the base skin's
+                // element on save, and for the middle it is the trail-mode
+                // switch (no cursormiddle = short disjoint trail).
+                if CURSOR_SLOT_KEYS.contains(&slot.key) {
+                    let picked = override_entry
+                        .as_ref()
+                        .is_some_and(|pick| pick.is_removal());
+                    let (tile_rect, tile_response) =
+                        ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::click());
+                    let painter = ui.painter_at(tile_rect);
+                    painter.rect_filled(tile_rect, 6.0, egui::Color32::from_rgb(0x26, 0x27, 0x2b));
+                    let stroke_color = if picked {
+                        ACCENT
+                    } else if tile_response.hovered() {
+                        egui::Color32::from_rgb(0x8a, 0x86, 0x80)
+                    } else {
+                        egui::Color32::from_rgb(0x3a, 0x3b, 0x40)
+                    };
+                    painter.rect_stroke(
+                        tile_rect,
+                        6.0,
+                        egui::Stroke::new(if picked { 2.0_f32 } else { 1.0_f32 }, stroke_color),
+                    );
+                    painter.text(
+                        tile_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✕",
+                        egui::FontId::monospace(20.0),
+                        if picked {
+                            ACCENT
+                        } else {
+                            egui::Color32::from_rgb(0x8a, 0x86, 0x80)
+                        },
+                    );
+                    if tile_response.clicked() {
+                        self.overrides.insert(slot.key, PoolEntry::removal());
+                    }
+                    let hover = match slot.key {
+                        "cursormiddle" => {
+                            "Ship no cursormiddle — saving removes the base skin's file, \
+                             and osu renders the short disjoint trail instead of the \
+                             long continuous one."
+                        }
+                        "cursortrail" => {
+                            "Ship no trail — saving removes the base skin's file and \
+                             osu draws no trail."
+                        }
+                        _ => {
+                            "Ship no cursor — saving removes the base skin's file (only \
+                             useful while the slot has a wrong base asset)."
+                        }
+                    };
+                    tile_response.on_hover_text(hover);
+                }
                 for entry in &pool {
                     // Imported tiles must match by exact content: "Imported"
                     // is every import's skin name, not an identity.
@@ -4075,6 +4218,25 @@ impl PoolEntry {
     fn path_exists(&self) -> bool {
         self.files.values().any(|path| path.exists())
     }
+
+    /// A "ship no file" pick: `files` is empty, so saving deletes the slot's
+    /// variants from the copied base skin instead of writing anything. For
+    /// `cursormiddle` this is the trail-mode switch (see
+    /// [`CURSOR_SLOT_KEYS`]); for `cursortrail` it disables the trail.
+    fn is_removal(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// The override entry expressing "ship no file for this slot".
+    fn removal() -> Self {
+        PoolEntry {
+            skin: REMOVAL_SKIN.to_owned(),
+            files: BTreeMap::new(),
+            thumb: PathBuf::new(),
+            also_in: Vec::new(),
+            is_blank: false,
+        }
+    }
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x9a, 0xb0);
@@ -4099,6 +4261,13 @@ struct SceneAssets {
     cursor: Option<egui::TextureHandle>,
     trail: Option<egui::TextureHandle>,
     middle: Option<egui::TextureHandle>,
+    /// Trimmed artwork heights of the cursor layers in 1x game units (`None`
+    /// until the layer decodes). The mock draws each layer at this height —
+    /// `@2x` files count half their pixels, like the game — so the cursor
+    /// stack keeps the sizes the skin (or the picked donor set) authored.
+    cursor_game_height: Option<f32>,
+    trail_game_height: Option<f32>,
+    middle_game_height: Option<f32>,
     /// Artwork scale of the whole cursor from the editor's "Cursor size"
     /// control (1.0 = untouched): cursor, trail and middle layers all
     /// multiply their drawn size with it, so the mock shows the resize
@@ -4547,30 +4716,72 @@ fn draw_scene(painter: &egui::Painter, rect: egui::Rect, assets: &SceneAssets, t
             egui::vec2(width * 0.5, height * 0.5)
         }
     };
+    // Trail mode follows `cursormiddle`'s presence in the saved file set —
+    // osu (stable and lazer alike) uses its presence as a mode switch, not
+    // just another sprite: with a middle the trail is the long continuous
+    // additive one (stamped densely along the path, 500 ms fade); without
+    // one the disjoint mode stamps the trail sprite at a fixed 60 Hz cadence
+    // with a quick 150 ms fade (lazer's `LegacyCursorTrail`). Picking a
+    // middle into a skin that had none therefore lengthens the trail, and
+    // the mock shows both so the preview matches what will be saved.
     let trail_texture = assets.trail.as_ref().or(assets.cursor.as_ref());
-    for step in (1..=6).rev() {
-        let Some(texture) = trail_texture else {
-            break;
+    if let Some(texture) = trail_texture {
+        let height = match (assets.trail.is_some(), assets.trail_game_height) {
+            (true, Some(game_height)) => game_height * scale * assets.cursor_scale,
+            (true, None) => dim(40.0),
+            // No trail file: osu falls back to stretching the cursor sprite.
+            (false, _) => dim(36.0),
         };
-        let alpha = (1.0 - step as f32 / 7.0) * 0.85;
-        let height = dim(if assets.trail.is_some() { 40.0 } else { 36.0 }) * assets.cursor_scale;
         let width = height * texture_aspect(texture);
-        draw_cursor_quad(
-            painter,
-            texture,
-            cursor_pos(time - 0.05 * step as f64) + origin_shift(width, height),
-            width,
-            height,
-            if assets.cursortrail_rotate {
-                cursor_spin
-            } else {
-                0.0
-            },
-            egui::Color32::WHITE.gamma_multiply(alpha),
-        );
+        if assets.middle.is_none() {
+            // Disjoint: one stamp per 1/60 s, fading within 150 ms.
+            for step in 1..=9 {
+                let age = f64::from(step) / 60.0;
+                let alpha = (1.0 - age / 0.15) * 0.85;
+                if alpha <= 0.0 {
+                    break;
+                }
+                draw_cursor_quad(
+                    painter,
+                    texture,
+                    cursor_pos(time - age) + origin_shift(width, height),
+                    width,
+                    height,
+                    if assets.cursortrail_rotate {
+                        cursor_spin
+                    } else {
+                        0.0
+                    },
+                    egui::Color32::WHITE.gamma_multiply(alpha as f32),
+                );
+            }
+        } else {
+            // Continuous: additive blending, dense interpolated stamps over
+            // the 500 ms fade (lazer skips the ones right at the cursor).
+            for step in 2..=40u32 {
+                let age = f64::from(step) * 0.0125;
+                let alpha = (1.0 - (age / 0.5) as f32) * 0.25;
+                draw_cursor_quad(
+                    painter,
+                    texture,
+                    cursor_pos(time - age) + origin_shift(width, height),
+                    width,
+                    height,
+                    if assets.cursortrail_rotate {
+                        cursor_spin
+                    } else {
+                        0.0
+                    },
+                    egui::Color32::WHITE.gamma_multiply(alpha),
+                );
+            }
+        }
     }
     if let Some(middle) = &assets.middle {
-        let height = dim(30.0) * assets.cursor_scale;
+        let height = match assets.middle_game_height {
+            Some(game_height) => game_height * scale * assets.cursor_scale,
+            None => dim(30.0),
+        };
         let width = height * texture_aspect(middle);
         draw_cursor_quad(
             painter,
@@ -4583,7 +4794,10 @@ fn draw_scene(painter: &egui::Painter, rect: egui::Rect, assets: &SceneAssets, t
         );
     }
     if let Some(cursor) = &assets.cursor {
-        let height = dim(46.0) * assets.cursor_scale * cursor_expand;
+        let height = match assets.cursor_game_height {
+            Some(game_height) => game_height * scale * assets.cursor_scale,
+            None => dim(46.0),
+        } * cursor_expand;
         let width = height * texture_aspect(cursor);
         draw_cursor_quad(
             painter,
@@ -5739,6 +5953,9 @@ mod tests {
             cursor: None,
             trail: None,
             middle: None,
+            cursor_game_height: None,
+            trail_game_height: None,
+            middle_game_height: None,
             cursor_scale: 1.0,
             hitcircle: None,
             overlay: None,
@@ -6070,10 +6287,158 @@ mod tests {
             state.overrides["circle-numbers"].files["default-2.png"],
             nested.join("default-2@2x.png")
         );
+        assert_eq!(
+            state.overrides["circle-numbers"].files["default-2.png"],
+            nested.join("default-2@2x.png")
+        );
         // Non-image files (skin.ini) are filtered before classification, so
         // they are not reported as skipped surprises.
         let status = state.import_status.clone().unwrap();
         assert!(!status.contains("skin.ini"), "{status}");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn whole_cursor_set_drops_base_middle_and_saves_without_it() {
+        // The trail-mode switch: a whole-cursor set from a donor without a
+        // cursormiddle must not inherit the base skin's one — its presence
+        // alone makes osu render the long continuous trail instead of the
+        // donor's short disjoint trail.
+        let dir = unique_temp_dir("osu-skin-set-middle");
+        let skins = dir.join("Skins");
+        let base = skins.join("Base");
+        let donor = skins.join("Donor");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&donor).unwrap();
+        fs::write(base.join("skin.ini"), "[General]\nName: Base\n").unwrap();
+        write_png(&base.join("cursor.png"), [255, 0, 0, 255]);
+        write_png(&base.join("cursortrail.png"), [255, 0, 0, 255]);
+        write_png(&base.join("cursormiddle.png"), [255, 0, 0, 255]);
+        fs::write(donor.join("skin.ini"), "[General]\nName: Donor\n").unwrap();
+        write_png(&donor.join("cursor@2x.png"), [0, 0, 255, 255]);
+        write_png(&donor.join("cursortrail.png"), [0, 255, 0, 255]);
+
+        let scanned = scan_skins(&skins);
+        let base_skin = scanned
+            .iter()
+            .find(|s| s.folder_name == "Base")
+            .unwrap()
+            .clone();
+        let mut key_cache = VisualKeyCache::new();
+        let sets = build_cursor_sets_with_keys(&scanned, &mut key_cache);
+        let donor_set = sets.iter().find(|set| set.skin == "Donor").unwrap();
+        assert!(
+            !donor_set.files.contains_key("cursormiddle.png"),
+            "donor ships no middle"
+        );
+
+        let mut state = SkinEditorState::new();
+        state.apply_cursor_set(donor_set);
+        // cursor and trail pick the donor's files; the middle slot carries
+        // an explicit "ship no file" pick.
+        assert_eq!(state.overrides["cursor"].skin, "Donor");
+        assert_eq!(state.overrides["cursortrail"].skin, "Donor");
+        assert!(state.overrides["cursormiddle"].is_removal());
+        assert!(state.cursor_set_picked(donor_set));
+
+        let overrides: Vec<(String, PoolEntry)> = state
+            .overrides
+            .iter()
+            .map(|(slot_key, entry)| ((*slot_key).to_owned(), entry.clone()))
+            .collect();
+        let outcome = save_skin(&base_skin, &overrides, &[], Some("Mixed")).unwrap();
+        assert_eq!(outcome.overrides_applied, 3, "2 picks + 1 removal");
+
+        let target = skins.join("Mixed");
+        assert!(target.join("cursor@2x.png").exists(), "donor cursor kept");
+        assert!(target.join("cursortrail.png").exists(), "donor trail kept");
+        assert!(
+            !target.join("cursormiddle.png").exists(),
+            "the base middle is dropped so the trail stays disjoint"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removal_pick_removes_slot_variants_from_save() {
+        let dir = unique_temp_dir("osu-skin-removal-save");
+        let skins = dir.join("Skins");
+        let base = skins.join("Base");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("skin.ini"), "[General]\nName: Base\n").unwrap();
+        write_png(&base.join("cursortrail.png"), [255, 0, 0, 255]);
+        write_png(&base.join("cursortrail@2x.jpg"), [255, 0, 0, 255]);
+
+        let base_skin = scan_skins(&skins)
+            .into_iter()
+            .find(|s| s.folder_name == "Base")
+            .unwrap();
+        save_skin(
+            &base_skin,
+            &[("cursortrail".to_owned(), PoolEntry::removal())],
+            &[],
+            Some("NoTrail"),
+        )
+        .unwrap();
+
+        let target = skins.join("NoTrail");
+        assert!(!target.join("cursortrail.png").exists());
+        assert!(!target.join("cursortrail@2x.jpg").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removal_pick_hides_slot_from_preview() {
+        let dir = unique_temp_dir("osu-skin-removal-preview");
+        let base = dir.join("Base");
+        fs::create_dir_all(&base).unwrap();
+        let mut skin = SkinSummary {
+            display_name: "Base".to_owned(),
+            folder_name: "Base".to_owned(),
+            path: base,
+            author: None,
+            combo_colours: Vec::new(),
+            render_opts: SkinRenderOpts::default(),
+            file_count: 0,
+            elements: BTreeMap::new(),
+            failsound: Vec::new(),
+            failsound_hidden: Vec::new(),
+        };
+        skin.elements
+            .insert("cursor.png", PathBuf::from("Base/cursor.png"));
+        skin.elements
+            .insert("cursormiddle.png", PathBuf::from("Base/cursormiddle.png"));
+
+        let mut state = SkinEditorState::new();
+        state.skins.push(skin);
+        state.selected = Some(0);
+        assert!(state.preview_elements().contains_key("cursormiddle.png"));
+
+        state.overrides.insert("cursormiddle", PoolEntry::removal());
+        let preview = state.preview_elements();
+        assert!(
+            !preview.contains_key("cursormiddle.png"),
+            "a removal pick must drop the element from the preview file set"
+        );
+        assert!(
+            preview.contains_key("cursor.png"),
+            "other elements keep their files"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removal_pick_survives_rescan_prune() {
+        let mut state = SkinEditorState::new();
+        state.overrides.insert("cursormiddle", PoolEntry::removal());
+        // The scan prune keeps picks with live files; the no-file pick has
+        // none and must not be dropped by that rule.
+        state
+            .overrides
+            .retain(|_, entry| entry.files.is_empty() || entry.path_exists());
+        assert!(state.overrides.contains_key("cursormiddle"));
     }
 }
