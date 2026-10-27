@@ -1927,6 +1927,24 @@ pub fn rename_skin(skin_path: &Path, new_name: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Permanently removes a skin: the folder and everything in it is deleted
+/// from disk — unlike saving, nothing is copied and there is no undo. The
+/// guard only accepts a real folder whose name passes the skin-folder
+/// checks, so a nameless or path-shaped target (a drive root, `.`/`..`, a
+/// plain file) is refused instead of wiped.
+pub fn delete_skin(skin_path: &Path) -> Result<()> {
+    let name = skin_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .with_context(|| format!("skin folder {} has no name", skin_path.display()))?;
+    validate_skin_folder_name(&name)
+        .with_context(|| format!("deleting {}", skin_path.display()))?;
+    if !skin_path.is_dir() {
+        anyhow::bail!("{} is not a folder.", skin_path.display());
+    }
+    fs::remove_dir_all(skin_path).with_context(|| format!("deleting {}", skin_path.display()))
+}
+
 /// The editor slot table entry for a slot key.
 fn find_slot(slot_key: &str) -> Option<&'static Slot> {
     active_groups()
@@ -2341,6 +2359,16 @@ pub struct SkinEditorState {
     /// Skin path the rename status belongs to (same pin rationale as the
     /// failsound status above).
     rename_status_for: Option<PathBuf>,
+    /// Delete result message. Unpinned (like the save status): the deleted
+    /// skin no longer exists to pin to, so the message stays until the next
+    /// delete attempt.
+    delete_status: Option<String>,
+    delete_ok: bool,
+    /// Skin path the armed delete confirmation belongs to. Deleting needs
+    /// two clicks (arm, then confirm); pinning the arm to the skin path
+    /// keeps it attached to the skin it was armed on, like the failsound
+    /// hide arm above.
+    delete_armed_for: Option<PathBuf>,
     /// Skin folder to select once the in-flight scan lands (used after
     /// saving, which creates a new versioned folder the old index can't
     /// point at).
@@ -2388,6 +2416,9 @@ impl SkinEditorState {
             rename_status: None,
             rename_ok: false,
             rename_status_for: None,
+            delete_status: None,
+            delete_ok: false,
+            delete_armed_for: None,
             pending_select_folder: None,
             imported: BTreeMap::new(),
             import_status: None,
@@ -2465,9 +2496,10 @@ impl SkinEditorState {
         self.skins = result.skins;
         self.pool = result.pool;
         self.cursor_sets = result.cursor_sets;
-        // A rescan refreshes every skin's file list — drop a pending
-        // hide confirmation rather than acting on stale paths.
+        // A rescan refreshes every skin's file list — drop pending hide and
+        // delete confirmations rather than acting on stale paths.
         self.failsound_armed_for = None;
+        self.delete_armed_for = None;
         let wanted = self.pending_select_folder.take().or(previous_folder);
         self.selected = wanted
             .and_then(|folder| {
@@ -3192,6 +3224,75 @@ impl SkinEditorState {
         self.rename_status_for = Some(base_path.to_path_buf());
     }
 
+    /// "Delete skin" row: removes the selected skin's folder from disk for
+    /// good — no copy is kept and the game loses the skin too, unlike
+    /// saving a remixed version. Two clicks (arm, then confirm), armed per
+    /// skin like the failsound hide.
+    fn delete_section(&mut self, ui: &mut egui::Ui, base_label: &str, base_path: &Path) {
+        ui.label(egui::RichText::new("Delete skin").strong());
+        // Stacked (not side-by-side): the preview side panel is narrow and
+        // the full confirm label needs the width.
+        ui.vertical(|ui| {
+            let armed = self.delete_armed_for.as_deref() == Some(base_path);
+            let clicked = if armed {
+                ui.add_enabled(
+                    !self.scan_in_flight,
+                    egui::Button::new("⚠️ Click again to confirm delete"),
+                )
+                .on_hover_text(format!(
+                    "Deletes the \"{base_label}\" folder and every file in it from the \
+                     Skins directory. This cannot be undone."
+                ))
+                .clicked()
+            } else {
+                ui.add_enabled(!self.scan_in_flight, egui::Button::new("🗑️ Delete skin"))
+                    .on_hover_text(
+                        "Permanently deletes this skin's folder and every file in it. \
+                         The skin disappears from the game and this editor — nothing is \
+                         kept. Needs a second click to confirm.",
+                    )
+                    .clicked()
+            };
+            if clicked {
+                if armed {
+                    self.delete_armed_for = None;
+                    match delete_skin(base_path) {
+                        Ok(()) => {
+                            // The folder is gone; the rescan refreshes the
+                            // list — selection falls back to a neighbouring
+                            // skin and picks pointing at the deleted files
+                            // are dropped by the rescan's retain checks.
+                            self.force_rescan = true;
+                            self.delete_ok = true;
+                            self.delete_status = Some(format!(
+                                "Deleted \"{base_label}\" — the skin folder was removed \
+                                 from disk."
+                            ));
+                        }
+                        Err(err) => {
+                            self.delete_ok = false;
+                            self.delete_status = Some(format!("Delete failed: {err:#}"));
+                        }
+                    }
+                } else {
+                    self.delete_armed_for = Some(base_path.to_path_buf());
+                }
+            }
+        });
+        if let Some(status) = &self.delete_status {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(status)
+                    .small()
+                    .color(if self.delete_ok {
+                        egui::Color32::from_rgb(0x7f, 0xa6, 0x86)
+                    } else {
+                        egui::Color32::from_rgb(0xc2, 0x6b, 0x72)
+                    }),
+            );
+        }
+    }
+
     /// Mirrors a successful hide (`to_hidden`) or restore into the skin
     /// summary with the same renames `hide`/`restore_failsound_files`
     /// perform, so the lists update without a rescan.
@@ -3644,6 +3745,7 @@ impl SkinEditorState {
                             Some((label, path, live, hidden)) => {
                                 self.rename_section(ui, label, path);
                                 self.failsound_section(ui, label, path, live, hidden);
+                                self.delete_section(ui, label, path);
                             }
                             None => muted_label(ui, "Select a base skin in the sidebar."),
                         }
@@ -3657,6 +3759,7 @@ impl SkinEditorState {
                 if let Some((label, path, live, hidden)) = &failsound {
                     self.rename_section(ui, label, path);
                     self.failsound_section(ui, label, path, live, hidden);
+                    self.delete_section(ui, label, path);
                 }
             }
             // Approach circle + cursor are animated.
@@ -4724,6 +4827,47 @@ mod tests {
             fs::read_to_string(skin.join("skin.ini")).unwrap(),
             "[General]\nName: Skin\n"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_skin_removes_folder_and_contents() {
+        let dir = unique_temp_dir("osu-skin-delete");
+        let skins = dir.join("Skins");
+        let skin = skins.join("Doomed");
+        let nested = skin.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(skin.join("skin.ini"), "[General]\nName: Doomed\n").unwrap();
+        fs::write(nested.join("hitcircle.png"), b"png").unwrap();
+
+        delete_skin(&skin).unwrap();
+        assert!(!skin.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_skin_rejects_non_skin_targets() {
+        let dir = unique_temp_dir("osu-skin-delete-guard");
+        let skins = dir.join("Skins");
+        fs::create_dir_all(&skins).unwrap();
+        // A plain file is not a skin folder.
+        let file = skins.join("plain.txt");
+        fs::write(&file, b"x").unwrap();
+        assert!(delete_skin(&file).is_err());
+        assert!(file.exists());
+        // Nameless and path-shaped targets are refused, not wiped.
+        for bad in [
+            PathBuf::from("."),
+            PathBuf::from(".."),
+            skins.join("Missing"),
+        ] {
+            assert!(
+                delete_skin(&bad).is_err(),
+                "expected {} to be rejected",
+                bad.display()
+            );
+        }
+        assert!(skins.is_dir());
         let _ = fs::remove_dir_all(dir);
     }
 
