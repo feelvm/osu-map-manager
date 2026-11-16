@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use rosu_pp::{Beatmap, Difficulty};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -174,6 +174,8 @@ fn scan_songs_dir_streaming_inner(
     });
     let mut maps = Vec::new();
     let mut thread_budget = ParseThreadBudget::new(MAX_LINGERING_PARSE_THREADS);
+    let calculate_local_stars = db_index.is_none();
+    let mut in_flight: VecDeque<InFlightParse> = VecDeque::new();
     let cached_maps = cached_scan
         .as_ref()
         .map(|scan| {
@@ -252,64 +254,52 @@ fn scan_songs_dir_streaming_inner(
                 continue;
             }
 
-            let calculate_local_stars = db_index.is_none();
-            match parse_osu_file_with_timeout(
+            // Keep the parse window bounded but full: files parse
+            // concurrently, while events still stream out in folder order.
+            while in_flight.len() >= SCAN_PARSE_WINDOW {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ScanEvent::Stopped {
+                        sets: build_sets(&maps),
+                    });
+                    return Ok(());
+                }
+                let next = in_flight.pop_front().expect("window is bounded");
+                finish_parse(
+                    next,
+                    db_index.as_ref(),
+                    &mut maps,
+                    tx,
+                    &mut thread_budget,
+                    skip_issue_kinds,
+                    cancel,
+                );
+            }
+            in_flight.push_back(spawn_parse(
                 path.clone(),
-                Duration::from_secs(8),
+                current_meta,
                 calculate_local_stars,
                 &mut thread_budget,
-            ) {
-                Ok(mut map) => {
-                    if let Some(index) = &db_index
-                        && map.stars.is_none()
-                        && let Some(file_name) = map.path.file_name().and_then(|file| file.to_str())
-                        && let Some(meta) = index.get(&map.md5, file_name)
-                    {
-                        map.stars = meta.standard_stars;
-                    }
-                    if map.stars.is_none() && map.mode.unwrap_or(0) == 0 {
-                        map.stars = calculate_stars_for_path_with_timeout(
-                            path.clone(),
-                            Duration::from_secs(8),
-                            &mut thread_budget,
-                        )
-                        .ok()
-                        .flatten();
-                    }
-                    let issues = find_repair_issues(&map);
-                    // Re-stat after parsing: the file could theoretically have
-                    // changed mid-parse, in which case the next scan picks up
-                    // the newer metadata instead of trusting this entry.
-                    let (file_len, file_mtime_secs) =
-                        current_meta.or_else(|| file_meta(&path)).unwrap_or((0, 0));
-                    maps.push(map.clone());
-                    let _ = tx.send(ScanEvent::Map {
-                        map: Box::new(map),
-                        file_len,
-                        file_mtime_secs,
-                        issues,
-                    });
-                }
-                Err((kind, err)) => {
-                    let issue_kind = kind.as_str();
-                    if skip_issue_kinds.contains(issue_kind) {
-                        continue;
-                    }
-                    let issue = RepairIssue {
-                        beatmap: path,
-                        message: match kind {
-                            ParseIssueKind::Timeout => {
-                                format!("Timed out parsing map file after 8 seconds: {err}")
-                            }
-                            ParseIssueKind::ParseError => err.to_string(),
-                        },
-                        severity: RepairSeverity::ParseWarning,
-                        missing_file: None,
-                    };
-                    let _ = tx.send(ScanEvent::Problem { issue });
-                }
-            }
+            ));
         }
+    }
+
+    // Drain the parse window before reporting completion.
+    while let Some(next) = in_flight.pop_front() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(ScanEvent::Stopped {
+                sets: build_sets(&maps),
+            });
+            return Ok(());
+        }
+        finish_parse(
+            next,
+            db_index.as_ref(),
+            &mut maps,
+            tx,
+            &mut thread_budget,
+            skip_issue_kinds,
+            cancel,
+        );
     }
 
     let _ = tx.send(ScanEvent::Finished {
@@ -349,6 +339,141 @@ fn build_sets(maps: &[LocalBeatmap]) -> Vec<LocalBeatmapSet> {
 /// loop pauses spawning new ones.
 const MAX_LINGERING_PARSE_THREADS: usize = 4;
 
+/// Per-file parse timeout (the timeout error message below mirrors it).
+const PARSE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How many `.osu` files may parse concurrently during a scan. Results are
+/// awaited in dispatch order, so events still stream out in folder order;
+/// the window bounds peak memory and disk thrash while still overlapping
+/// IO and CPU across cores.
+const SCAN_PARSE_WINDOW: usize = 8;
+
+/// One `.osu` parse in flight: the worker's result channel plus the file
+/// metadata captured at dispatch time. The channel carries the raw parse
+/// result; `await_parse_result` classifies timeouts and errors.
+struct InFlightParse {
+    rx: mpsc::Receiver<Result<LocalBeatmap>>,
+    path: PathBuf,
+    current_meta: Option<(u64, u64)>,
+}
+
+type ParseOutcome = std::result::Result<LocalBeatmap, (ParseIssueKind, anyhow::Error)>;
+
+/// Spawns one `.osu` parse worker (bounded by the lingering-thread budget)
+/// and returns its result channel for later `finish_parse`.
+fn spawn_parse(
+    path: PathBuf,
+    current_meta: Option<(u64, u64)>,
+    calculate_local_stars: bool,
+    budget: &mut ParseThreadBudget,
+) -> InFlightParse {
+    let (tx, rx) = mpsc::channel();
+    budget.wait_for_slot();
+    let worker_path = path.clone();
+    let handle = thread::spawn(move || {
+        let mut result = parse_osu_file_inner(&worker_path, false);
+        if calculate_local_stars
+            && let Ok(map) = &mut result
+            && map.mode.unwrap_or(0) == 0
+        {
+            map.stars = fs::read(&worker_path)
+                .ok()
+                .and_then(|bytes| calculate_stars(&bytes));
+        }
+        let _ = tx.send(result);
+    });
+    budget.track(handle);
+    InFlightParse {
+        rx,
+        path,
+        current_meta,
+    }
+}
+
+/// Awaits one in-flight parse (up to [`PARSE_TIMEOUT`]) and emits its map
+/// event or parse issue. Called in dispatch order, so events stream out in
+/// folder order even though the parses ran concurrently.
+fn finish_parse(
+    in_flight: InFlightParse,
+    db_index: Option<&OsuDbIndex>,
+    maps: &mut Vec<LocalBeatmap>,
+    tx: &Sender<ScanEvent>,
+    budget: &mut ParseThreadBudget,
+    skip_issue_kinds: &BTreeSet<String>,
+    cancel: &AtomicBool,
+) {
+    if cancel.load(Ordering::Relaxed) {
+        // Cancelled: leave the result unread; the Stop path reports the
+        // maps parsed so far.
+        return;
+    }
+    match await_parse_result(in_flight.rx, PARSE_TIMEOUT) {
+        Ok(mut map) => {
+            if let Some(index) = db_index
+                && map.stars.is_none()
+                && let Some(file_name) = map.path.file_name().and_then(|file| file.to_str())
+                && let Some(meta) = index.get(&map.md5, file_name)
+            {
+                map.stars = meta.standard_stars;
+            }
+            if map.stars.is_none() && map.mode.unwrap_or(0) == 0 {
+                map.stars =
+                    calculate_stars_for_path_with_timeout(map.path.clone(), PARSE_TIMEOUT, budget)
+                        .ok()
+                        .flatten();
+            }
+            let issues = find_repair_issues(&map);
+            // Re-stat after parsing: the file could theoretically have
+            // changed mid-parse, in which case the next scan picks up the
+            // newer metadata instead of trusting this entry.
+            let (file_len, file_mtime_secs) = in_flight
+                .current_meta
+                .or_else(|| file_meta(&in_flight.path))
+                .unwrap_or((0, 0));
+            maps.push(map.clone());
+            let _ = tx.send(ScanEvent::Map {
+                map: Box::new(map),
+                file_len,
+                file_mtime_secs,
+                issues,
+            });
+        }
+        Err((kind, err)) => {
+            let issue_kind = kind.as_str();
+            if skip_issue_kinds.contains(issue_kind) {
+                return;
+            }
+            let issue = RepairIssue {
+                beatmap: in_flight.path,
+                message: match kind {
+                    ParseIssueKind::Timeout => {
+                        format!("Timed out parsing map file after 8 seconds: {err}")
+                    }
+                    ParseIssueKind::ParseError => err.to_string(),
+                },
+                severity: RepairSeverity::ParseWarning,
+                missing_file: None,
+            };
+            let _ = tx.send(ScanEvent::Problem { issue });
+        }
+    }
+}
+
+fn await_parse_result(rx: mpsc::Receiver<Result<LocalBeatmap>>, timeout: Duration) -> ParseOutcome {
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(map)) => Ok(map),
+        Ok(Err(err)) => Err((ParseIssueKind::ParseError, err)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err((
+            ParseIssueKind::Timeout,
+            anyhow::anyhow!("parser did not finish in time"),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err((
+            ParseIssueKind::ParseError,
+            anyhow::anyhow!("parser worker disconnected"),
+        )),
+    }
+}
+
 /// Bounds pile-up of timed-out parse workers. The scan loop is sequential
 /// (spawn, wait, next), but a worker that hits the timeout keeps running
 /// detached — a run of slow files would otherwise accumulate CPU-heavy
@@ -385,42 +510,6 @@ impl ParseThreadBudget {
     #[cfg(test)]
     fn pending(&self) -> usize {
         self.handles.len()
-    }
-}
-
-fn parse_osu_file_with_timeout(
-    path: PathBuf,
-    timeout: Duration,
-    calculate_local_stars: bool,
-    budget: &mut ParseThreadBudget,
-) -> std::result::Result<LocalBeatmap, (ParseIssueKind, anyhow::Error)> {
-    let (tx, rx) = mpsc::channel();
-    budget.wait_for_slot();
-    let handle = thread::spawn(move || {
-        let mut result = parse_osu_file_inner(&path, false);
-        if calculate_local_stars
-            && let Ok(map) = &mut result
-            && map.mode.unwrap_or(0) == 0
-        {
-            map.stars = fs::read(&path)
-                .ok()
-                .and_then(|bytes| calculate_stars(&bytes));
-        }
-        let _ = tx.send(result);
-    });
-    budget.track(handle);
-
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(map)) => Ok(map),
-        Ok(Err(err)) => Err((ParseIssueKind::ParseError, err)),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err((
-            ParseIssueKind::Timeout,
-            anyhow::anyhow!("parser did not finish in time"),
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err((
-            ParseIssueKind::ParseError,
-            anyhow::anyhow!("parser worker disconnected"),
-        )),
     }
 }
 
@@ -970,8 +1059,8 @@ CircleSize:4
         .unwrap();
 
         let mut budget = ParseThreadBudget::new(MAX_LINGERING_PARSE_THREADS);
-        let map = parse_osu_file_with_timeout(osu_path, Duration::from_secs(1), true, &mut budget)
-            .unwrap();
+        let in_flight = spawn_parse(osu_path, None, true, &mut budget);
+        let map = await_parse_result(in_flight.rx, Duration::from_secs(1)).unwrap();
 
         assert_eq!(map.mode, Some(3));
         assert!(map.has_mode_field);
