@@ -259,7 +259,44 @@ fn contains_lowered(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
+    // Allocation-free ASCII path: case-insensitive byte search matches
+    // exactly what `to_lowercase` does when both sides are ASCII. Only
+    // when that misses and the haystack carries non-ASCII characters do we
+    // pay for a full Unicode lowercase (İ, ß and friends fold differently).
+    if needle_lower.is_ascii() {
+        return ascii_contains_ignore_case(haystack, needle_lower)
+            || (!haystack.is_ascii() && haystack.to_lowercase().contains(needle_lower));
+    }
     haystack.to_lowercase().contains(needle_lower)
+}
+
+/// Case-insensitive substring search over bytes, without allocating.
+/// Multi-byte UTF-8 sequences never contain ASCII bytes, so byte matching
+/// cannot cross a character boundary.
+fn ascii_contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle_lower.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let fold = |byte: u8| byte.to_ascii_lowercase();
+    let first = fold(needle[0]);
+    let mut start = 0;
+    while let Some(offset) = haystack[start..]
+        .iter()
+        .position(|&byte| fold(byte) == first)
+    {
+        let at = start + offset;
+        if haystack[at..at + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(hay, nee)| fold(*hay) == fold(*nee))
+        {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
 }
 
 fn parse_bound(text: &str) -> Option<f32> {
@@ -390,5 +427,77 @@ mod tests {
         // Missing values never match an enabled numeric filter.
         let unknown = LocalBeatmap::default();
         assert!(!query.matches_local(&unknown));
+    }
+
+    #[test]
+    fn text_filters_match_case_insensitively() {
+        // Enabled numeric filters hide maps with unknown values, so the
+        // probe maps carry values inside the default full ranges.
+        let mut query = filters();
+        query.artist = "camellia".into();
+
+        let map = LocalBeatmap {
+            artist: "Camellia".into(),
+            stars: Some(6.0),
+            ar: Some(8.0),
+            cs: Some(4.0),
+            ..Default::default()
+        };
+        assert!(query.matches_local(&map));
+
+        let map = LocalBeatmap {
+            artist: "CAMELLIA".into(),
+            stars: Some(6.0),
+            ar: Some(8.0),
+            cs: Some(4.0),
+            ..Default::default()
+        };
+        assert!(query.matches_local(&map));
+
+        let map = LocalBeatmap {
+            artist: "kamex".into(),
+            stars: Some(6.0),
+            ar: Some(8.0),
+            cs: Some(4.0),
+            ..Default::default()
+        };
+        assert!(!query.matches_local(&map));
+    }
+
+    #[test]
+    fn text_filters_stay_unicode_correct() {
+        // Different scripts never fold into ASCII: no match, no crash.
+        let mut query = filters();
+        query.artist = "yuki".into();
+        let map = LocalBeatmap {
+            artist: "ユキ".into(),
+            stars: Some(6.0),
+            ar: Some(8.0),
+            cs: Some(4.0),
+            ..Default::default()
+        };
+        assert!(!query.matches_local(&map));
+
+        // Non-ASCII needles and haystacks take the full Unicode path, so
+        // their folds keep their real semantics (no ASCII-only shortcut).
+        assert!(contains_lowered("CAFÉ", "café"));
+        // Accents are preserved by folding: an ASCII needle never matches
+        // an accented haystack.
+        assert!(!contains_lowered("CAFÉ", "cafe"));
+        // Sharp s stays sharp under lowercase folding: neither direction
+        // matches the ASCII spelling.
+        assert!(!contains_lowered("STRASSE", "straße"));
+        assert!(!contains_lowered("Straße", "strasse"));
+        // İ folds to i + combining dot, so plain "i" does not match it.
+        assert!(!contains_lowered("İstanbul", "istanbul"));
+    }
+
+    #[test]
+    fn ascii_search_matches_beside_non_ascii_text() {
+        // The needle appears verbatim beside non-ASCII neighbours: the
+        // byte-level search must find it inside mixed-content haystacks.
+        assert!(contains_lowered("DJ Strawberry ❄ remix", "strawberry"));
+        assert!(contains_lowered("Strawberry ❄ Shortcake", "SHORTCAKE"));
+        assert!(!contains_lowered("DJ ❄ remix", "strawberry"));
     }
 }

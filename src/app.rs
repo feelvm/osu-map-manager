@@ -94,16 +94,19 @@ pub struct MapManagerApp {
     selected_maps: Vec<LocalBeatmap>,
     selected_md5s: BTreeSet<String>,
     filtered_map_indexes: Vec<usize>,
-    filtered_cache_key: String,
+    filtered_cache_key: FilteredCacheKey,
     /// md5 → position inside `filtered_map_indexes`, rebuilt together with
     /// the filtered list so inspector/prefetch lookups stay O(1) instead of
     /// scanning the list every frame.
     filtered_pos_by_map_index: HashMap<usize, usize>,
-    /// md5 → position inside the scan's map list, rebuilt lazily when the
-    /// scan changes. Avoids a full linear scan on every frame while a map
-    /// is selected.
+    /// md5 → position inside the scan's map list. Rebuilds when the scan
+    /// generation changes and extends incrementally while a scan streams
+    /// new maps in, so lookups stay O(1) even mid-scan.
     md5_to_map_index: HashMap<String, usize>,
-    md5_index_key: (u64, usize),
+    /// Scan generation the md5 index was built for (`u64::MAX` = never).
+    md5_index_generation: u64,
+    /// How many `scan.maps` entries the md5 index already covers.
+    md5_index_built_len: usize,
     /// Cached `collection_backup_info` result: re-parsing `collection.db`
     /// every frame (sidebar + center + dialogs all ask for it) means disk
     /// I/O plus a full parse at 60 fps. The key is the db path plus the
@@ -126,8 +129,9 @@ pub struct MapManagerApp {
     /// diff against the full previous library.
     last_scan_md5s: HashSet<String>,
     /// Cached "N library maps match" count for the auto-add editor, keyed by
-    /// serialized filters + scan generation (same idea as `filtered_cache_key`).
-    auto_match_cache_key: (String, u64),
+    /// the collection's filters + scan generation (same idea as
+    /// `filtered_cache_key`).
+    auto_match_cache_key: (BeatmapFilters, u64),
     auto_match_cache_count: Option<usize>,
     /// Bumped on every scan mutation (finish, stop, prune, delete) so the
     /// filtered-list and repair-job caches cannot go stale when the map count
@@ -695,6 +699,20 @@ struct ScanCacheRef<'a> {
     scan: &'a LibraryScan,
 }
 
+/// What the filtered map list depends on. Compared structurally per frame —
+/// serializing the filters to JSON every frame used to cost more than the
+/// comparison it replaced.
+#[derive(Debug, Clone, PartialEq)]
+struct FilteredCacheKey {
+    filters: BeatmapFilters,
+    generation: u64,
+    map_count: usize,
+}
+
+/// While a scan streams, the filtered list rebuilds at most once per this
+/// many newly discovered maps (the next generation change rebuilds all).
+const FILTER_REBUILD_BATCH: usize = 512;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct IgnoredRepairIssue {
     beatmapset_id: Option<i64>,
@@ -789,10 +807,15 @@ impl MapManagerApp {
             selected_maps: Vec::new(),
             selected_md5s: BTreeSet::new(),
             filtered_map_indexes: Vec::new(),
-            filtered_cache_key: String::new(),
+            filtered_cache_key: FilteredCacheKey {
+                filters: BeatmapFilters::default(),
+                generation: u64::MAX,
+                map_count: usize::MAX,
+            },
             filtered_pos_by_map_index: HashMap::new(),
             md5_to_map_index: HashMap::new(),
-            md5_index_key: (u64::MAX, usize::MAX),
+            md5_index_generation: u64::MAX,
+            md5_index_built_len: 0,
             backup_info_cache_path: None,
             backup_info_cache_file: None,
             backup_info_cached: None,
@@ -800,7 +823,7 @@ impl MapManagerApp {
             collection_contents_cache: BTreeMap::new(),
             auto_collections,
             last_scan_md5s,
-            auto_match_cache_key: (String::new(), 0),
+            auto_match_cache_key: (BeatmapFilters::default(), 0),
             auto_match_cache_count: None,
             scan_generation: 0,
             repair_jobs_cache: Vec::new(),
@@ -2050,10 +2073,7 @@ impl MapManagerApp {
         let Some(config) = self.auto_collections.collections.get(&picked) else {
             return (0, 0);
         };
-        let key = (
-            serde_json::to_string(&config.filters).unwrap_or_default(),
-            self.scan_generation,
-        );
+        let key = (config.filters.clone(), self.scan_generation);
         if self.auto_match_cache_key == key
             && let Some(count) = self.auto_match_cache_count
         {
@@ -2160,7 +2180,7 @@ impl MapManagerApp {
         self.auto_collections =
             collection::AutoCollectionStore::load(&auto_collections_path(&root));
         self.last_scan_md5s = scan_md5_baseline(self.scan.as_deref());
-        self.auto_match_cache_key = (String::new(), 0);
+        self.auto_match_cache_key = (BeatmapFilters::default(), 0);
         self.auto_match_cache_count = None;
         self.expanded_map_md5 = None;
         self.clear_background_preview();
@@ -3818,32 +3838,41 @@ impl MapManagerApp {
 
     fn invalidate_scan_caches(&mut self) {
         self.scan_generation += 1;
-        self.filtered_cache_key.clear();
+        self.filtered_cache_key = FilteredCacheKey {
+            filters: BeatmapFilters::default(),
+            generation: u64::MAX,
+            map_count: usize::MAX,
+        };
         self.filtered_map_indexes.clear();
         self.filtered_pos_by_map_index.clear();
         self.repair_jobs_cache_key.clear();
         self.repair_jobs_cache.clear();
-        // The md5 index and the collection-contents cache key off the
-        // generation/map count, so they go stale automatically.
+        // The md5 index keys off the generation, so it goes stale
+        // automatically; the collection-contents cache keys off it too.
         self.collection_contents_key = (None, u64::MAX);
     }
 
-    /// md5 → index inside the scan's map list, rebuilding the index when the
-    /// scan changed. Keeps per-frame inspector/prefetch lookups O(1).
+    /// md5 → index inside the scan's map list. The index rebuilds when the
+    /// scan generation changes and extends incrementally while a scan
+    /// streams new maps in, so per-frame inspector/prefetch lookups stay
+    /// O(1) even mid-scan.
     fn map_index_for_md5(&mut self, md5: &str) -> Option<usize> {
-        let key = (
-            self.scan_generation,
-            self.scan.as_ref().map_or(0, |scan| scan.maps.len()),
-        );
-        if self.md5_index_key != key {
+        if self.md5_index_generation != self.scan_generation {
             self.md5_to_map_index.clear();
-            if let Some(scan) = &self.scan {
-                self.md5_to_map_index.reserve(scan.maps.len());
-                for (index, map) in scan.maps.iter().enumerate() {
-                    self.md5_to_map_index.insert(map.md5.clone(), index);
-                }
+            self.md5_index_built_len = 0;
+            self.md5_index_generation = self.scan_generation;
+        }
+        if let Some(scan) = &self.scan
+            && self.md5_index_built_len < scan.maps.len()
+        {
+            self.md5_to_map_index
+                .reserve(scan.maps.len() - self.md5_index_built_len);
+            let built = self.md5_index_built_len;
+            for (offset, map) in scan.maps[built..].iter().enumerate() {
+                self.md5_to_map_index
+                    .insert(map.md5.clone(), built + offset);
             }
-            self.md5_index_key = key;
+            self.md5_index_built_len = scan.maps.len();
         }
         self.md5_to_map_index.get(md5).copied()
     }
@@ -3897,21 +3926,31 @@ impl MapManagerApp {
         self.collection_contents_key = key;
     }
 
-    fn filtered_cache_key(&self) -> String {
+    fn filtered_cache_key(&self) -> FilteredCacheKey {
         // Generation (not just the map count) keys the cache, so any scan
         // mutation refreshes the list even when the count does not change.
         // The count is kept too so the list still grows live while scanning.
-        let map_count = self.scan.as_ref().map_or(0, |scan| scan.maps.len());
-        serde_json::to_string(&self.filters).unwrap_or_default()
-            + "#"
-            + &self.scan_generation.to_string()
-            + "#"
-            + &map_count.to_string()
+        FilteredCacheKey {
+            filters: self.filters.clone(),
+            generation: self.scan_generation,
+            map_count: self.scan.as_ref().map_or(0, |scan| scan.maps.len()),
+        }
     }
 
     fn refresh_filtered_maps(&mut self) {
         let key = self.filtered_cache_key();
         if key == self.filtered_cache_key {
+            return;
+        }
+        // While a scan streams, the only change is the map count growing
+        // every frame; a full re-filter pass at 100k maps would cost more
+        // per frame than the paint itself, so rebuild in batches (the next
+        // generation change rebuilds everything anyway).
+        if self.is_scanning
+            && key.filters == self.filtered_cache_key.filters
+            && key.generation == self.filtered_cache_key.generation
+            && key.map_count < self.filtered_cache_key.map_count + FILTER_REBUILD_BATCH
+        {
             return;
         }
 
