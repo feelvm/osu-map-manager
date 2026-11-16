@@ -124,7 +124,7 @@ enum ParseIssueKind {
 pub fn scan_songs_dir_streaming(
     songs_dir: PathBuf,
     osu_root: Option<PathBuf>,
-    cached_scan: Option<LibraryScan>,
+    cached_scan: Option<Arc<LibraryScan>>,
     cancel: Arc<AtomicBool>,
     skip_issue_kinds: BTreeSet<String>,
     tx: Sender<ScanEvent>,
@@ -147,7 +147,7 @@ pub fn scan_songs_dir_streaming(
 fn scan_songs_dir_streaming_inner(
     songs_dir: &Path,
     osu_root: Option<&Path>,
-    cached_scan: Option<LibraryScan>,
+    cached_scan: Option<Arc<LibraryScan>>,
     cancel: &AtomicBool,
     skip_issue_kinds: &BTreeSet<String>,
     tx: &Sender<ScanEvent>,

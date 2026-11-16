@@ -138,7 +138,9 @@ pub struct MapManagerApp {
     /// Last time the repair-jobs cache was rebuilt, used to rate-limit
     /// rebuilds while a scan is streaming (see `refresh_repair_jobs`).
     repair_jobs_last_rebuild: Instant,
-    scan: Option<LibraryScan>,
+    scan: Option<Arc<LibraryScan>>,
+    /// Failure messages from the off-thread scan-cache writer.
+    cache_save_rx: Option<mpsc::Receiver<String>>,
     is_scanning: bool,
     is_repairing: bool,
     skip_parse_timeouts: bool,
@@ -685,6 +687,14 @@ struct ScanCacheFile {
     scan: LibraryScan,
 }
 
+/// Serialize-only twin of [`ScanCacheFile`]: borrows the scan so saving a
+/// 100k-map library never deep-copies it on the UI thread.
+#[derive(Serialize)]
+struct ScanCacheRef<'a> {
+    version: u32,
+    scan: &'a LibraryScan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct IgnoredRepairIssue {
     beatmapset_id: Option<i64>,
@@ -735,8 +745,8 @@ impl MapManagerApp {
             "Not signed in with osu!".to_owned()
         };
         let filters = BeatmapFilters::with_full_ranges();
-        let cached_scan = load_scan_cache(&osu_root).ok().flatten();
-        let last_scan_md5s = scan_md5_baseline(cached_scan.as_ref());
+        let cached_scan = load_scan_cache(&osu_root).ok().flatten().map(Arc::new);
+        let last_scan_md5s = scan_md5_baseline(cached_scan.as_deref());
         let auto_collections =
             collection::AutoCollectionStore::load(&auto_collections_path(&osu_root));
         let cached_status = cached_scan.as_ref().map(|scan| {
@@ -797,6 +807,7 @@ impl MapManagerApp {
             repair_jobs_cache_key: String::new(),
             repair_jobs_last_rebuild: Instant::now(),
             scan: cached_scan,
+            cache_save_rx: None,
             is_scanning: false,
             is_repairing: false,
             skip_parse_timeouts: false,
@@ -934,6 +945,7 @@ impl MapManagerApp {
         self.poll_extras(ctx);
         self.poll_extras_rollback();
         self.poll_app_update();
+        self.poll_cache_save();
         if let Some(rx) = self.scan_rx.take() {
             let mut keep_rx = true;
             let mut disconnected = false;
@@ -951,7 +963,7 @@ impl MapManagerApp {
                         total_osu_files,
                         star_parse_error,
                     } => {
-                        self.scan = Some(LibraryScan::default());
+                        self.scan = Some(Arc::new(LibraryScan::default()));
                         self.expanded_map_md5 = None;
                         self.clear_background_preview();
                         self.selected_maps.clear();
@@ -986,6 +998,7 @@ impl MapManagerApp {
                             .filter(|issue| !self.repair_ignores.ignores(&map, issue))
                             .collect::<Vec<_>>();
                         if let Some(scan) = &mut self.scan {
+                            let scan = Arc::make_mut(scan);
                             scan.file_meta
                                 .insert(map.path.clone(), (file_len, file_mtime_secs));
                             scan.problems.extend(visible_issues);
@@ -999,7 +1012,7 @@ impl MapManagerApp {
                     }
                     ScanEvent::Problem { issue } => {
                         if let Some(scan) = &mut self.scan {
-                            scan.problems.push(issue);
+                            Arc::make_mut(scan).problems.push(issue);
                         }
                     }
                     ScanEvent::Finished { sets } => {
@@ -1010,7 +1023,7 @@ impl MapManagerApp {
                             self.repair_ignores.ignore_missing_backgrounds;
                         let cache_root = self.osu_root();
                         if let Some(scan) = &mut self.scan {
-                            scan.sets = sets;
+                            Arc::make_mut(scan).sets = sets;
                             let matching_maps = scan
                                 .maps
                                 .iter()
@@ -1026,10 +1039,18 @@ impl MapManagerApp {
                                 scan.sets.len(),
                                 plural(repair_issues, "repair issue", "repair issues")
                             );
-                            if let Err(err) = save_scan_cache(&cache_root, scan) {
-                                self.status =
-                                    format!("{}; cache save failed: {err:#}", self.status);
-                            }
+                            // The scan is complete and immutable now: hand
+                            // the Arc to a worker so the multi-second
+                            // serialize+write never blocks the UI. Failures
+                            // report through `cache_save_rx`.
+                            let (cache_err_tx, cache_err_rx) = mpsc::channel();
+                            self.cache_save_rx = Some(cache_err_rx);
+                            let snapshot = Arc::clone(scan);
+                            std::thread::spawn(move || {
+                                if let Err(err) = save_scan_cache(&cache_root, &snapshot) {
+                                    let _ = cache_err_tx.send(format!("{err:#}"));
+                                }
+                            });
                         } else {
                             self.status = "Scan complete".to_owned();
                         }
@@ -1056,7 +1077,7 @@ impl MapManagerApp {
                                 .unwrap_or_default();
                             self.auto_add_new_maps(&new_maps);
                         }
-                        self.last_scan_md5s = scan_md5_baseline(self.scan.as_ref());
+                        self.last_scan_md5s = scan_md5_baseline(self.scan.as_deref());
                         keep_rx = false;
                     }
                     ScanEvent::Stopped { sets } => {
@@ -1066,7 +1087,7 @@ impl MapManagerApp {
                         let ignore_missing_backgrounds =
                             self.repair_ignores.ignore_missing_backgrounds;
                         if let Some(scan) = &mut self.scan {
-                            scan.sets = sets;
+                            Arc::make_mut(scan).sets = sets;
                             let matching_maps = scan
                                 .maps
                                 .iter()
@@ -2135,10 +2156,10 @@ impl MapManagerApp {
         self.collections.clear();
         self.selected_collection_index = None;
         self.collection_missing_hashes.clear();
-        self.scan = load_scan_cache(&root).ok().flatten();
+        self.scan = load_scan_cache(&root).ok().flatten().map(Arc::new);
         self.auto_collections =
             collection::AutoCollectionStore::load(&auto_collections_path(&root));
-        self.last_scan_md5s = scan_md5_baseline(self.scan.as_ref());
+        self.last_scan_md5s = scan_md5_baseline(self.scan.as_deref());
         self.auto_match_cache_key = (String::new(), 0);
         self.auto_match_cache_count = None;
         self.expanded_map_md5 = None;
@@ -2379,6 +2400,7 @@ impl MapManagerApp {
             self.status = "Scan your Songs directory before deleting non-std maps".to_owned();
             return;
         };
+        let scan = Arc::make_mut(scan);
 
         let targets = scan
             .maps
@@ -3580,6 +3602,22 @@ impl MapManagerApp {
         });
     }
 
+    /// Drains scan-cache save failures from the off-thread writer. The
+    /// write runs after `ScanEvent::Finished`, so its errors cannot update
+    /// the status inline anymore.
+    fn poll_cache_save(&mut self) {
+        let Some(rx) = self.cache_save_rx.as_ref() else {
+            return;
+        };
+        let mut failure = None;
+        while let Ok(message) = rx.try_recv() {
+            failure = Some(message);
+        }
+        if let Some(message) = failure {
+            self.status = format!("{}; cache save failed: {message}", self.status);
+        }
+    }
+
     fn poll_app_update(&mut self) {
         let Some(rx) = self.app_update_rx.take() else {
             return;
@@ -3683,6 +3721,7 @@ impl MapManagerApp {
         let Some(scan) = self.scan.as_mut() else {
             return;
         };
+        let scan = Arc::make_mut(scan);
         scan.maps.retain(|map| !folders.contains(&map.folder));
         scan.file_meta
             .retain(|path, _| path.parent().is_none_or(|parent| !folders.contains(parent)));
@@ -9161,9 +9200,9 @@ fn save_scan_cache(osu_root: &str, scan: &LibraryScan) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let text = serde_json::to_string(&ScanCacheFile {
+    let text = serde_json::to_string(&ScanCacheRef {
         version: SCAN_CACHE_VERSION,
-        scan: scan.clone(),
+        scan,
     })?;
     collection::write_atomic(&path, text.as_bytes())
         .with_context(|| format!("writing {}", path.display()))
