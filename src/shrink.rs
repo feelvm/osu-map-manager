@@ -367,30 +367,46 @@ fn norm_name(name: &str) -> String {
     name.trim().trim_matches('"').replace('\\', "/")
 }
 
-fn collect_references(folder: &Path, maps: &[LocalBeatmap]) -> SetReferences {
+/// Collects the referenced asset names, plus a fail-safe flag: `true` when
+/// any chart could not be read (`map.audio_filename` is mandatory in the
+/// format, so a missing one marks a chart the parser could not fully read;
+/// UTF-16 files fail `read_to_string`). Callers must not delete orphans
+/// from such a set — a referenced file may simply not be known.
+fn collect_references(folder: &Path, maps: &[LocalBeatmap]) -> (SetReferences, bool) {
     let mut refs = SetReferences::default();
+    let mut unreadable = false;
     for map in maps {
         if let Some(audio) = &map.audio_filename {
             refs.audio.insert(norm_name(audio).to_lowercase());
+        } else {
+            unreadable = true;
         }
         if let Some(bg) = &map.background_filename {
             refs.backgrounds.insert(norm_name(bg).to_lowercase());
         }
-        for events in event_sources(&map.path, folder) {
+        let (events, charts_unreadable) = event_sources(&map.path, folder);
+        if charts_unreadable {
+            unreadable = true;
+        }
+        for events in events {
             let (videos, sprites, samples) = parse_event_assets(&events);
             refs.videos.extend(videos);
             refs.sprites.extend(sprites);
             refs.samples.extend(samples);
         }
     }
-    refs
+    (refs, unreadable)
 }
 
-/// `.osu` `[Events]` sections plus every `.osb` in the folder.
-fn event_sources(osu_path: &Path, folder: &Path) -> Vec<String> {
+/// `.osu` `[Events]` sections plus every `.osb` in the folder. The bool is
+/// `true` when a chart file exists but could not be read (UTF-16, or an
+/// unreadable file) — its references are then unknown, not absent.
+fn event_sources(osu_path: &Path, folder: &Path) -> (Vec<String>, bool) {
     let mut out = Vec::new();
-    if let Ok(text) = fs::read_to_string(osu_path) {
-        out.push(events_section(&text));
+    let mut unreadable = false;
+    match fs::read_to_string(osu_path) {
+        Ok(text) => out.push(events_section(&text)),
+        Err(_) => unreadable = true,
     }
     if let Ok(entries) = fs::read_dir(folder) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -399,13 +415,15 @@ fn event_sources(osu_path: &Path, folder: &Path) -> Vec<String> {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("osb"))
-                && let Ok(text) = fs::read_to_string(&path)
             {
-                out.push(events_section(&text));
+                match fs::read_to_string(&path) {
+                    Ok(text) => out.push(events_section(&text)),
+                    Err(_) => unreadable = true,
+                }
             }
         }
     }
-    out
+    (out, unreadable)
 }
 
 /// The `[Events]` section body (`.osb` files are all events).
@@ -671,7 +689,7 @@ pub fn analyze_set(
     cache: &mut ProbeCache,
     shrink_cache: &ShrinkCache,
 ) -> SetShrinkReport {
-    let refs = collect_references(folder, maps);
+    let (refs, charts_unreadable) = collect_references(folder, maps);
     let settings = options.fingerprint();
     let mut assets = Vec::new();
 
@@ -765,11 +783,18 @@ pub fn analyze_set(
             ));
         } else if is_audio_ext(&ext) || is_image_ext(&ext) || is_video_ext(&ext) {
             let kind = ShrinkAssetKind::Orphan;
-            let action = if options.delete_orphans {
+            // Fail safe: when any chart could not be read, a "referenced"
+            // file may be unknown, so deletion is refused for the whole set.
+            let action = if options.delete_orphans && !charts_unreadable {
                 ShrinkAction::DeleteOrphan
             } else {
+                let reason = if charts_unreadable {
+                    "unreferenced, but a chart could not be read — deletion disabled"
+                } else {
+                    "unreferenced"
+                };
                 ShrinkAction::Skip {
-                    reason: "unreferenced".to_owned(),
+                    reason: reason.to_owned(),
                 }
             };
             let est_bytes = if action == ShrinkAction::DeleteOrphan {
@@ -2818,6 +2843,119 @@ mod tests {
             .unwrap();
         assert_eq!(orphan.action, ShrinkAction::DeleteOrphan);
         assert_eq!(orphan.est_bytes, 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unreadable_chart_disables_orphan_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-shrink-utf16-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // A UTF-16 .osu (BOM + LE) — real for some locales. The byte-wise
+        // parser cannot read it, so the audio reference stays unknown.
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(
+            "[General]\nAudioFilename: audio.mp3\n"
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes()),
+        );
+        fs::write(dir.join("map.osu"), &utf16).unwrap();
+        fs::write(dir.join("audio.mp3"), vec![0u8; 2048]).unwrap();
+        fs::write(dir.join("leftover.ogg"), vec![0u8; 4096]).unwrap();
+        let maps = vec![beatmap(dir.join("map.osu"), dir.clone(), None, None)];
+        let bins = ShrinkBins {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: None,
+        };
+        let on = ShrinkOptions {
+            delete_orphans: true,
+            ..Default::default()
+        };
+        let report = analyze_set(
+            &dir,
+            "set".into(),
+            &maps,
+            &bins,
+            &on,
+            &mut ProbeCache::new(),
+            &ShrinkCache::default(),
+        );
+        // audio.mp3 is referenced by the (unreadable) chart, so it must not
+        // be offered for deletion even with the opt-in on.
+        for name in ["audio.mp3", "leftover.ogg"] {
+            let asset = report.assets.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(asset.kind, ShrinkAssetKind::Orphan);
+            match &asset.action {
+                ShrinkAction::Skip { reason } => {
+                    assert!(reason.contains("deletion disabled"), "reason: {reason}");
+                }
+                other => panic!("expected Skip for {name}, got {other:?}"),
+            }
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unreadable_osb_disables_orphan_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-shrink-utf16-osb-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("map.osu"), "[General]\nAudioFilename: audio.mp3\n").unwrap();
+        // The storyboard references are unreadable, so anything may be a
+        // storyboard asset: no deletions for the set.
+        let mut utf16 = vec![0xFE, 0xFF];
+        utf16.extend(
+            "Sprite,Background,Centre,\"art.png\",320,240\n"
+                .encode_utf16()
+                .flat_map(|unit| unit.to_be_bytes()),
+        );
+        fs::write(dir.join("story.osb"), &utf16).unwrap();
+        fs::write(dir.join("audio.mp3"), vec![0u8; 2048]).unwrap();
+        fs::write(dir.join("leftover.ogg"), vec![0u8; 4096]).unwrap();
+        let maps = vec![beatmap(
+            dir.join("map.osu"),
+            dir.clone(),
+            Some("audio.mp3"),
+            None,
+        )];
+        let bins = ShrinkBins {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: None,
+        };
+        let on = ShrinkOptions {
+            delete_orphans: true,
+            ..Default::default()
+        };
+        let report = analyze_set(
+            &dir,
+            "set".into(),
+            &maps,
+            &bins,
+            &on,
+            &mut ProbeCache::new(),
+            &ShrinkCache::default(),
+        );
+        let orphan = report
+            .assets
+            .iter()
+            .find(|a| a.name == "leftover.ogg")
+            .unwrap();
+        match &orphan.action {
+            ShrinkAction::Skip { reason } => {
+                assert!(reason.contains("deletion disabled"), "reason: {reason}");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
