@@ -49,8 +49,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/osu-map-manager.exe dist/osu-map-manager.exe
           Compress-Archive -Path dist/osu-map-manager.exe -DestinationPath osu-map-manager-windows-x86_64.zip -Force
+          # sha256sum-style line; the updater verifies this before installing.
+          $hash = (Get-FileHash -Algorithm SHA256 osu-map-manager-windows-x86_64.zip).Hash.ToLowerInvariant()
+          "$hash  osu-map-manager-windows-x86_64.zip" | Set-Content -Path checksums.txt -Encoding ascii -NoNewline
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: osu-map-manager-windows-x86_64.zip
+          files: |
+            osu-map-manager-windows-x86_64.zip
+            checksums.txt
           generate_release_notes: true

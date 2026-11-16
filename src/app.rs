@@ -3565,6 +3565,10 @@ impl MapManagerApp {
                     return;
                 }
             };
+            // The staged zip is no longer needed once the exe is extracted.
+            if staged != fresh {
+                let _ = fs::remove_file(&staged);
+            }
             let _ = tx.send(AppUpdateEvent::DownloadFinished);
             if let Err(err) = app_update::install_and_restart(&fresh) {
                 let _ = tx.send(AppUpdateEvent::Failed {
