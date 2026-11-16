@@ -971,6 +971,9 @@ impl MapManagerApp {
             skin_editor: SkinEditorState::new(),
         };
         app.load_collections();
+        if looks_like_lazer_root(&osu_root) {
+            app.status = LAZER_ROOT_WARNING.to_owned();
+        }
         app.start_app_update_background_check();
         app
     }
@@ -1865,6 +1868,7 @@ impl MapManagerApp {
                 return;
             }
         };
+        let fingerprint = collection_db_fingerprint(&path);
         if db
             .collections
             .iter()
@@ -1885,8 +1889,8 @@ impl MapManagerApp {
             return;
         };
         entry.name = new.to_owned();
-        match collection::write_db(&path, &db) {
-            Ok(()) => {
+        match write_collection_db_checked(&path, &db, fingerprint) {
+            Ok(true) => {
                 self.set_collection_notice(true, format!("Renamed \"{old}\" to \"{new}\""));
                 // Auto-add settings are keyed by collection name — move them
                 // along with the rename.
@@ -1903,6 +1907,7 @@ impl MapManagerApp {
                     .position(|collection| collection.name == new);
                 self.collection_name = new.to_owned();
             }
+            Ok(false) => self.set_collection_notice(false, COLLECTION_DB_CHANGED_NOTE.to_owned()),
             Err(err) => self.set_collection_notice(false, format!("Rename failed: {err:#}")),
         }
     }
@@ -2198,6 +2203,9 @@ impl MapManagerApp {
         self.expanded_map_md5 = None;
         self.clear_background_preview();
         self.invalidate_scan_caches();
+        if looks_like_lazer_root(&root) {
+            self.status = LAZER_ROOT_WARNING.to_owned();
+        }
     }
 
     fn load_collections(&mut self) {
@@ -2311,6 +2319,7 @@ impl MapManagerApp {
                 return;
             }
         };
+        let fingerprint = collection_db_fingerprint(&path);
 
         if let Some(original_name) = original_name.as_deref()
             && original_name != self.collection_name
@@ -2334,8 +2343,8 @@ impl MapManagerApp {
 
         let saved_count = hashes.len();
         collection::upsert_collection_hashes(&mut db, &self.collection_name, hashes);
-        match collection::write_db(&path, &db) {
-            Ok(()) => {
+        match write_collection_db_checked(&path, &db, fingerprint) {
+            Ok(true) => {
                 self.set_collection_notice(
                     true,
                     format!(
@@ -2361,6 +2370,7 @@ impl MapManagerApp {
                     self.save_auto_collections();
                 }
             }
+            Ok(false) => self.set_collection_notice(false, COLLECTION_DB_CHANGED_NOTE.to_owned()),
             Err(err) => {
                 self.set_collection_notice(false, format!("Collection save failed: {err:#}"))
             }
@@ -2388,14 +2398,15 @@ impl MapManagerApp {
                 return;
             }
         };
+        let fingerprint = collection_db_fingerprint(&path);
 
         if !collection::delete_collection(&mut db, &collection_name) {
             self.status = format!("Collection not found: {collection_name}");
             return;
         }
 
-        match collection::write_db(&path, &db) {
-            Ok(()) => {
+        match write_collection_db_checked(&path, &db, fingerprint) {
+            Ok(true) => {
                 self.set_collection_notice(
                     true,
                     format!("Deleted collection \"{collection_name}\""),
@@ -2412,6 +2423,7 @@ impl MapManagerApp {
                 }
                 self.load_collections();
             }
+            Ok(false) => self.set_collection_notice(false, COLLECTION_DB_CHANGED_NOTE.to_owned()),
             Err(err) => {
                 self.set_collection_notice(false, format!("Collection delete failed: {err:#}"))
             }
@@ -9410,6 +9422,44 @@ fn derive_osu_root(songs_dir: &str) -> String {
     display_prefilled_path(&songs)
 }
 
+/// `(len, mtime secs, nanos)` of a file, for change detection between a
+/// read and a later write. `None` when the file does not exist.
+fn collection_db_fingerprint(path: &Path) -> Option<(u64, u64, u32)> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((meta.len(), age.as_secs(), age.subsec_nanos()))
+}
+
+/// osu! rewrites `collection.db` when it exits; a save landing after that
+/// would silently discard the client's version. The write is refused when
+/// the file changed since `fingerprint` was taken at load time — the caller
+/// asks the user to try again (the next attempt reads the newer file).
+fn write_collection_db_checked(
+    path: &Path,
+    db: &collection::CollectionDb,
+    fingerprint: Option<(u64, u64, u32)>,
+) -> Result<bool> {
+    if collection_db_fingerprint(path) != fingerprint {
+        return Ok(false);
+    }
+    collection::write_db(path, db)?;
+    Ok(true)
+}
+
+/// osu!lazer keeps its library in a realm database; `collection.db` is a
+/// stable-client concept, so a lazer install yields an empty scan and
+/// silent no-op saves. Warn instead of pretending everything is fine.
+fn looks_like_lazer_root(root: &str) -> bool {
+    let root = expand_prefilled_path(root);
+    !root.as_os_str().is_empty() && root.join("client.realm").is_file()
+}
+
+const LAZER_ROOT_WARNING: &str = "This looks like an osu!lazer install: Map Manager edits the stable client's collection.db, which lazer does not use";
+
+const COLLECTION_DB_CHANGED_NOTE: &str =
+    "collection.db changed while saving (osu! may have just exited) — try again";
+
 fn default_osu_root() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
@@ -9501,6 +9551,64 @@ mod tests {
             derive_osu_root("C:\\Games\\osu!"),
             "C:\\Games\\osu!".to_owned()
         );
+    }
+
+    #[test]
+    fn collection_write_refuses_after_external_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-map-manager-db-guard-{}",
+            collection_db_fingerprint(&std::env::temp_dir())
+                .map(|f| f.1)
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collection.db");
+
+        let mut v1 = collection::CollectionDb::empty();
+        collection::upsert_collection_hashes(&mut v1, "v1", vec!["a".to_owned()]);
+        collection::write_db(&path, &v1).unwrap();
+        let fingerprint = collection_db_fingerprint(&path);
+
+        // An external writer (osu! exit-save) lands between the load and
+        // the app's write, with different content on top.
+        let mut external = collection::CollectionDb::empty();
+        collection::upsert_collection_hashes(
+            &mut external,
+            "from-osu",
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        collection::write_db(&path, &external).unwrap();
+
+        let mut mine = collection::CollectionDb::empty();
+        collection::upsert_collection_hashes(&mut mine, "mine", vec!["c".to_owned()]);
+        assert!(!write_collection_db_checked(&path, &mine, fingerprint).unwrap());
+        // The external version survived the refused write.
+        let loaded = collection::load_collection_db(&path).unwrap();
+        assert_eq!(loaded.collections[0].name, "from-osu");
+
+        // With the current fingerprint the write goes through.
+        let fresh = collection_db_fingerprint(&path);
+        assert!(write_collection_db_checked(&path, &mine, fresh).unwrap());
+        let loaded = collection::load_collection_db(&path).unwrap();
+        assert_eq!(loaded.collections[0].name, "mine");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lazer_roots_are_recognized() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-map-manager-lazer-{}",
+            collection_db_fingerprint(&std::env::temp_dir())
+                .map(|f| f.1)
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let root = dir.display().to_string();
+        assert!(!looks_like_lazer_root(&root));
+        fs::write(dir.join("client.realm"), b"realm").unwrap();
+        assert!(looks_like_lazer_root(&root));
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn drive_rail_frame(
