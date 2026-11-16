@@ -154,7 +154,8 @@ impl ExtrasCache {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        crate::collection::write_atomic(path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
@@ -278,6 +279,14 @@ pub fn run_background_jobs(
                         replaced: report.replaced,
                         created: report.created,
                     });
+                    // Journal after every folder: a crash mid-job still
+                    // leaves a manifest covering everything applied so far,
+                    // so no backup dir is ever orphaned.
+                    if let Err(err) = journal_manifest(&records, &image_name, &manifest_path) {
+                        let _ = tx.send(ExtrasEvent::Failed {
+                            message: format!("rollback manifest could not be written: {err:#}"),
+                        });
+                    }
                 }
                 let _ = tx.send(ExtrasEvent::FolderDone {
                     folder,
@@ -304,18 +313,12 @@ pub fn run_background_jobs(
 
     // Folders processed before a cancel were modified on disk, so their
     // records must survive: write the manifest even for a partial run.
-    if !records.is_empty() {
-        let manifest = ExtrasManifest {
-            version: MANIFEST_VERSION,
-            when: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            image_name,
-            folders: records,
-        };
-        if let Err(err) = write_manifest(&manifest, &manifest_path) {
-            let _ = tx.send(ExtrasEvent::Failed {
-                message: format!("rollback manifest could not be written: {err:#}"),
-            });
-        }
+    if !records.is_empty()
+        && let Err(err) = journal_manifest(&records, &image_name, &manifest_path)
+    {
+        let _ = tx.send(ExtrasEvent::Failed {
+            message: format!("rollback manifest could not be written: {err:#}"),
+        });
     }
 
     let _ = tx.send(ExtrasEvent::Finished {
@@ -412,6 +415,17 @@ fn rollback_folder(
     );
     let mut restored = 0;
 
+    // The manifest is app-written JSON in a user-writable folder; treat its
+    // fields as untrusted and keep every target inside the set folder.
+    if let Some(name) = record
+        .replaced
+        .iter()
+        .chain(record.created.iter())
+        .find(|name| !is_plain_filename(name))
+    {
+        bail!("rollback manifest lists a non-plain filename: {name}");
+    }
+
     for name in &record.replaced {
         if cancel.load(Ordering::Relaxed) {
             bail!("cancelled");
@@ -421,7 +435,8 @@ fn rollback_folder(
         if !source.is_file() {
             continue;
         }
-        fs::copy(&source, &destination).with_context(|| {
+        let bytes = fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
+        crate::collection::write_atomic(&destination, &bytes).with_context(|| {
             format!(
                 "restoring {} to {}",
                 source.display(),
@@ -612,7 +627,9 @@ fn apply_to_folder(
             fs::copy(&target, folder_backup_dir.join(&name))
                 .with_context(|| format!("backing up {}", target.display()))?;
         }
-        fs::write(&target, bytes.as_slice())
+        // Atomic replacement: a crash mid-write never leaves a truncated
+        // background image behind.
+        crate::collection::write_atomic(&target, bytes.as_slice())
             .with_context(|| format!("writing {}", target.display()))?;
         cache.record(&target, fingerprint);
         if existed {
@@ -660,7 +677,26 @@ fn write_manifest(manifest: &ExtrasManifest, manifest_path: &Path) -> Result<()>
     if let Some(parent) = manifest_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(manifest_path, json).with_context(|| format!("writing {}", manifest_path.display()))
+    // Atomic: the manifest is the undo record — a torn write must never
+    // leave a manifest that survives but cannot be parsed.
+    crate::collection::write_atomic(manifest_path, json.as_bytes())
+        .with_context(|| format!("writing {}", manifest_path.display()))
+}
+
+/// Serializes the rollback manifest for the records gathered so far and
+/// writes it, journaling one apply job's progress.
+fn journal_manifest(
+    records: &[FolderBackup],
+    image_name: &str,
+    manifest_path: &Path,
+) -> Result<()> {
+    let manifest = ExtrasManifest {
+        version: MANIFEST_VERSION,
+        when: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        image_name: image_name.to_owned(),
+        folders: records.to_vec(),
+    };
+    write_manifest(&manifest, manifest_path)
 }
 
 /// Per-folder backup directory names must be unique within one job and
