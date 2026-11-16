@@ -47,3 +47,12 @@ The app is organized into tabs: `Library`, `Collections`, `Fix maps`, `Shrink`,
 2. Add filters to find the maps you want.
 3. Select the maps you want in the collection.
 4. Choose a collection name and click `Apply`.
+
+## License
+
+Copyright (C) 2026 Stanislav
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3. The full text is in [LICENSE](LICENSE); the source is
+provided without warranty — see the license for details.

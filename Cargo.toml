@@ -2,6 +2,7 @@
 name = "osu-map-manager"
 version = "0.8.4"
 edition = "2024"
+license = "GPL-3.0-only"
 
 [dependencies]
 anyhow = "1.0"
