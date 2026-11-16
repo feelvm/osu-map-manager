@@ -120,6 +120,10 @@ browser legitimately opens) is restricted to the desktop app:
   determined attacker — it raises the bar against casual abuse, it is not a
   secret in the strong sense.
 
+  `npm run deploy` refuses to deploy while the gate is open (`scripts/check-token-enforcement.mjs`
+  checks `wrangler secret list`); a deliberate tokenless deploy needs
+  `ALLOW_TOKENLESS_DEPLOY=1`.
+
 The Worker also caches the osu! access token in memory until close to expiry
 to avoid requesting a new token per metadata burst.
 
