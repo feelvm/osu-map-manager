@@ -43,19 +43,46 @@ jobs:
       - run: cargo build --release --locked
         env:
           OSU_MAP_MANAGER_CLIENT_TOKEN: ${{ secrets.WORKER_CLIENT_TOKEN }}
-      - name: Package exe
+      # Portable zip: what the in-app updater downloads and verifies, so its
+      # name and its checksums.txt entry are load-bearing (src/app_update.rs).
+      - name: Package the portable exe
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/osu-map-manager.exe dist/osu-map-manager.exe
-          Compress-Archive -Path dist/osu-map-manager.exe -DestinationPath osu-map-manager-windows-x86_64.zip -Force
-          # sha256sum-style line; the updater verifies this before installing.
-          $hash = (Get-FileHash -Algorithm SHA256 osu-map-manager-windows-x86_64.zip).Hash.ToLowerInvariant()
-          "$hash  osu-map-manager-windows-x86_64.zip" | Set-Content -Path checksums.txt -Encoding ascii -NoNewline
+          Compress-Archive -Path dist/osu-map-manager.exe -DestinationPath dist/osu-map-manager-windows-x86_64.zip -Force
+      # Inno Setup installer, attached to every release alongside the zip.
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+].+)?$') {
+            throw "release tag '$tag' must be vX.Y.Z so the installer reports exactly the tag"
+          }
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "/DAppVersion=$version" "/Odist" "installers/windows/osu-map-manager.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path dist/osu-map-manager-windows-x86_64-setup.exe)) {
+            throw "the installer was not produced"
+          }
+      # sha256sum-style lines, one per artifact; the updater matches entries
+      # by asset name before installing the zip, so extra entries are safe.
+      - name: Publish checksums
+        shell: pwsh
+        run: |
+          $zip = (Get-FileHash -Algorithm SHA256 dist/osu-map-manager-windows-x86_64.zip).Hash.ToLowerInvariant()
+          $setup = (Get-FileHash -Algorithm SHA256 dist/osu-map-manager-windows-x86_64-setup.exe).Hash.ToLowerInvariant()
+          "$zip  osu-map-manager-windows-x86_64.zip`n$setup  osu-map-manager-windows-x86_64-setup.exe" |
+            Set-Content -Path checksums.txt -Encoding ascii -NoNewline
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            osu-map-manager-windows-x86_64.zip
+            dist/osu-map-manager-windows-x86_64.zip
+            dist/osu-map-manager-windows-x86_64-setup.exe
             checksums.txt
           generate_release_notes: true

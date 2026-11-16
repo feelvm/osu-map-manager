@@ -27,9 +27,15 @@ results into osu!'s `collection.db`.
 
 ## Install
 
-**Download a release:** grab the latest build from
-[Releases](https://github.com/feelvm/osu-map-manager/releases), unzip, and run
-`osu-map-manager.exe`.
+**Installer:** grab `osu-map-manager-windows-x86_64-setup.exe` from
+[Releases](https://github.com/feelvm/osu-map-manager/releases) and run it. It
+installs the app with Start Menu (and optional desktop) shortcuts and an
+uninstaller — per user or for all users, your choice in the wizard.
+
+**Portable:** grab `osu-map-manager-windows-x86_64.zip` instead, unzip, and run
+`osu-map-manager.exe` from anywhere.
+
+Every release also publishes `checksums.txt` with the SHA-256 of both files.
 
 **Build from source:** requires
 [Rustup](https://doc.rust-lang.org/cargo/getting-started/installation.html):

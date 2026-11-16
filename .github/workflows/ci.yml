@@ -16,6 +16,26 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Compiles the Inno Setup script against a stub exe, so a broken
+      # installer fails CI instead of silently going missing at release time.
+      - shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force -Path target/release | Out-Null
+          Set-Content -Path target/release/osu-map-manager.exe -Value 'stub' -Encoding ascii -NoNewline
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "/DAppVersion=0.0.0" "/Odist" "installers/windows/osu-map-manager.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path dist/osu-map-manager-windows-x86_64-setup.exe)) {
+            throw "the installer was not produced"
+          }
+
   worker:
     runs-on: ubuntu-latest
     defaults:

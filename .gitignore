@@ -1,4 +1,6 @@
 /target
+/dist
+/checksums.txt
 /target-repair-build
 /target-latest-build
 /target-no-token-build
