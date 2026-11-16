@@ -145,6 +145,9 @@ pub struct MapManagerApp {
     scan: Option<Arc<LibraryScan>>,
     /// Failure messages from the off-thread scan-cache writer.
     cache_save_rx: Option<mpsc::Receiver<String>>,
+    /// Startup library load running on a worker thread: `(osu root, scan)`.
+    /// Discarded when the root changed before it lands.
+    scan_cache_rx: Option<mpsc::Receiver<(String, Option<Arc<LibraryScan>>)>>,
     is_scanning: bool,
     is_repairing: bool,
     skip_parse_timeouts: bool,
@@ -713,6 +716,11 @@ struct FilteredCacheKey {
 /// many newly discovered maps (the next generation change rebuilds all).
 const FILTER_REBUILD_BATCH: usize = 512;
 
+/// Status shown while the startup library load runs on a worker; replaced
+/// with the summary once the load lands (unless something else said
+/// something in between).
+const LOADING_LIBRARY_STATUS: &str = "Loading cached library…";
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct IgnoredRepairIssue {
     beatmapset_id: Option<i64>,
@@ -763,30 +771,33 @@ impl MapManagerApp {
             "Not signed in with osu!".to_owned()
         };
         let filters = BeatmapFilters::with_full_ranges();
-        let cached_scan = load_scan_cache(&osu_root).ok().flatten().map(Arc::new);
-        let last_scan_md5s = scan_md5_baseline(cached_scan.as_deref());
+        // Parsing the cached library takes seconds at 100k maps, and the
+        // window must paint first: the load runs on a worker and lands via
+        // `poll_scan_cache_load`.
+        let scan_cache_rx = if osu_root.is_empty() {
+            None
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let root_for_cache = osu_root.clone();
+            std::thread::spawn(move || {
+                let scan = load_scan_cache(&root_for_cache)
+                    .ok()
+                    .flatten()
+                    .map(Arc::new);
+                let _ = tx.send((root_for_cache, scan));
+            });
+            Some(rx)
+        };
         let auto_collections =
             collection::AutoCollectionStore::load(&auto_collections_path(&osu_root));
-        let cached_status = cached_scan.as_ref().map(|scan| {
-            let matching_maps = scan
-                .maps
-                .iter()
-                .filter(|map| matches_visible_filters(&filters, map))
-                .count();
-            let repair_issues = visible_problems(
-                &scan.problems,
-                repair_ignores.ignore_missing_backgrounds,
-            )
-            .count();
-            format!(
-                "Loaded cached scan: {matching_maps} matching maps from {} scanned maps, {} sets, {}",
-                scan.maps.len(),
-                scan.sets.len(),
-                plural(repair_issues, "repair issue", "repair issues")
-            )
-        });
 
         let (background_load_tx, background_load_rx) = mpsc::channel();
+
+        let initial_status = if scan_cache_rx.is_some() {
+            LOADING_LIBRARY_STATUS.to_owned()
+        } else {
+            "Ready".to_owned()
+        };
 
         let mut app = Self {
             active_tab: AppTab::Library,
@@ -822,15 +833,16 @@ impl MapManagerApp {
             collection_contents_key: (None, u64::MAX),
             collection_contents_cache: BTreeMap::new(),
             auto_collections,
-            last_scan_md5s,
+            last_scan_md5s: HashSet::new(),
             auto_match_cache_key: (BeatmapFilters::default(), 0),
             auto_match_cache_count: None,
             scan_generation: 0,
             repair_jobs_cache: Vec::new(),
             repair_jobs_cache_key: String::new(),
             repair_jobs_last_rebuild: Instant::now(),
-            scan: cached_scan,
+            scan: None,
             cache_save_rx: None,
+            scan_cache_rx,
             is_scanning: false,
             is_repairing: false,
             skip_parse_timeouts: false,
@@ -884,7 +896,7 @@ impl MapManagerApp {
             audio_backend: None,
             audio_player: None,
             audio_volume: 0.8,
-            status: cached_status.unwrap_or_else(|| "Ready".to_owned()),
+            status: initial_status,
             scan_rx: None,
             scan_cancel: None,
             repair_rx: None,
@@ -969,6 +981,7 @@ impl MapManagerApp {
         self.poll_extras_rollback();
         self.poll_app_update();
         self.poll_cache_save();
+        self.poll_scan_cache_load();
         if let Some(rx) = self.scan_rx.take() {
             let mut keep_rx = true;
             let mut disconnected = false;
@@ -3638,6 +3651,52 @@ impl MapManagerApp {
         }
     }
 
+    /// Lands the library loaded off-thread at startup. The app stays
+    /// usable meanwhile; the per-generation caches rebuild themselves when
+    /// the scan appears. Results for a different root (picked while the
+    /// load was running) are discarded.
+    fn poll_scan_cache_load(&mut self) {
+        let Some(rx) = self.scan_cache_rx.as_ref() else {
+            return;
+        };
+        let mut loaded = None;
+        while let Ok((root, scan)) = rx.try_recv() {
+            loaded = Some((root, scan));
+        }
+        let Some((root, scan)) = loaded else {
+            return;
+        };
+        self.scan_cache_rx = None;
+        // The user pointed at another install while the load ran: the
+        // result is for a library that is no longer selected.
+        if self.osu_root() != root {
+            return;
+        }
+        let Some(scan) = scan else {
+            return;
+        };
+        let matching_maps = scan
+            .maps
+            .iter()
+            .filter(|map| matches_visible_filters(&self.filters, map))
+            .count();
+        let repair_issues = visible_problems(
+            &scan.problems,
+            self.repair_ignores.ignore_missing_backgrounds,
+        )
+        .count();
+        if self.status == LOADING_LIBRARY_STATUS {
+            self.status = format!(
+                "Loaded cached scan: {matching_maps} matching maps from {} scanned maps, {} sets, {}",
+                scan.maps.len(),
+                scan.sets.len(),
+                plural(repair_issues, "repair issue", "repair issues")
+            );
+        }
+        self.last_scan_md5s = scan_md5_baseline(Some(&scan));
+        self.scan = Some(scan);
+    }
+
     fn poll_app_update(&mut self) {
         let Some(rx) = self.app_update_rx.take() else {
             return;
@@ -6241,6 +6300,7 @@ impl eframe::App for MapManagerApp {
             || self.extras_image_rx.is_some()
             || self.audio_player.is_some()
             || self.app_update_checking
+            || self.scan_cache_rx.is_some()
             || !self.background_in_flight.is_empty()
             || self.skin_editor.needs_repaint()
         {
