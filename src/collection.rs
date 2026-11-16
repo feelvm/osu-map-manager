@@ -174,16 +174,34 @@ pub fn write_db(path: &Path, db: &CollectionDb) -> Result<()> {
     write_atomic(path, &bytes).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Writes `bytes` to `path` atomically: the data lands in a temp file in the
-/// same directory (same volume, so the final rename cannot span filesystems)
-/// and is then renamed over the destination. A crash mid-write can leave a
-/// stale `.tmp` file behind, but never a truncated destination.
+/// Writes `bytes` to `path` atomically: the data lands in a uniquely named
+/// temp file in the same directory (same volume, so the final rename cannot
+/// span filesystems) and is flushed to disk before it is renamed over the
+/// destination. A crash mid-write can leave a stale temp file behind, but
+/// never a truncated destination; the unique name also keeps two concurrent
+/// writers (or two app instances) from corrupting each other's staging.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    let tmp = path.with_extension(format!("tmp-{}", unique_tmp_suffix()));
+    let mut file = fs::File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
     Ok(())
+}
+
+fn unique_tmp_suffix() -> String {
+    let mut bytes = [0_u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        bytes = nanos.to_le_bytes();
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Rotates `collection.db.bak` generations so more than one previous version
@@ -222,9 +240,12 @@ pub fn restore_collection_backup(path: &Path) -> Result<()> {
             )
         })?;
     }
-    fs::copy(&backup, path)
-        .with_context(|| format!("restoring {} to {}", backup.display(), path.display()))?;
-    Ok(())
+    // Restore through the atomic path: copying over the live database
+    // directly would truncate it in place, and a crash or full disk
+    // mid-copy would leave a partial file that osu! blanks on next start.
+    let bytes = fs::read(&backup).with_context(|| format!("reading {}", backup.display()))?;
+    write_atomic(path, &bytes)
+        .with_context(|| format!("restoring {} to {}", backup.display(), path.display()))
 }
 
 fn write_i32(bytes: &mut Vec<u8>, value: i32) -> Result<()> {
@@ -464,6 +485,79 @@ mod tests {
 
         // Atomic write leaves no temp file behind.
         assert!(!path.with_extension("tmp").exists());
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("collection.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_atomic_is_repeatable_and_clean() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-map-manager-atomic-test-{}",
+            unique_tmp_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+
+        let files: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(files, ["data.bin".to_owned()]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_round_trips_through_the_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "osu-map-manager-restore-test-{}",
+            unique_tmp_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collection.db");
+        let names = |path: &Path| {
+            load_collection_db(path)
+                .unwrap()
+                .collections
+                .iter()
+                .map(|collection| collection.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut v1 = CollectionDb::empty();
+        upsert_collection_hashes(&mut v1, "v1", vec!["aaa".to_owned()]);
+        write_db(&path, &v1).unwrap();
+
+        let mut v2 = CollectionDb::empty();
+        upsert_collection_hashes(&mut v2, "v2", vec!["bbb".to_owned()]);
+        write_db(&path, &v2).unwrap();
+        assert_eq!(names(&path), ["v2"]);
+
+        restore_collection_backup(&path).unwrap();
+        assert_eq!(names(&path), ["v1"]);
+        // The pre-restore snapshot of the live database exists for undo.
+        assert!(path.with_extension("db.before-restore").exists());
+        // The restore itself left no temp files behind.
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("collection.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
 
         let _ = fs::remove_dir_all(dir);
     }
