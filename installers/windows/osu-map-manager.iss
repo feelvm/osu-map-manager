@@ -28,6 +28,9 @@ DefaultDirName={autopf}\osu! Map Manager
 DefaultGroupName=osu! Map Manager
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\osu-map-manager.exe
+; Setup wizard, Add/Remove Programs and shortcut icons all come from the
+; app's own icon, the same app.ico embedded in the exe.
+SetupIconFile=..\..\app.ico
 OutputBaseFilename=osu-map-manager-windows-x86_64-setup
 ; The published exe is x86_64-only; install it into the real Program Files
 ; instead of Program Files (x86) and refuse 32-bit Windows.
