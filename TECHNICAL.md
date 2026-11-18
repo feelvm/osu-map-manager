@@ -220,8 +220,8 @@ Use `Export list` when you want a plain-text (TSV) list of the selected maps bef
 The `⚙` button in the top bar opens an `App update` window that checks GitHub Releases
 for a newer version. If one is available, `Download & restart` fetches it, replaces the app
 executable, and restarts the app automatically. Checking is manual; nothing happens in the
-background. The Windows installer attached to each release is only for fresh installs; the
-updater always swaps the executable from the release zip.
+background. The setup exe attached to each release handles fresh installs and
+manual upgrades; the updater always swaps the executable from the release zip.
 
 ## Notes and Limitations
 

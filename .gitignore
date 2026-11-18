@@ -26,3 +26,5 @@
 backend/cloudflare-worker/node_modules/
 backend/cloudflare-worker/.wrangler/
 backend/cloudflare-worker/.dev.vars
+
+/installers/windows/target

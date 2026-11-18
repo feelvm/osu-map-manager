@@ -20,21 +20,60 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      # Compiles the Inno Setup script against a stub exe, so a broken
-      # installer fails CI instead of silently going missing at release time.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The setup only embeds bytes, so a stub exe is enough to exercise it.
       - shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
-          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
           New-Item -ItemType Directory -Force -Path target/release | Out-Null
-          Set-Content -Path target/release/osu-map-manager.exe -Value 'stub' -Encoding ascii -NoNewline
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
-          & $iscc "/DAppVersion=0.0.0" "/Odist" "installers/windows/osu-map-manager.iss"
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path dist/osu-map-manager-windows-x86_64-setup.exe)) {
-            throw "the installer was not produced"
+          Set-Content -Path target/release/osu-map-manager.exe -Value 'stub payload' -Encoding ascii -NoNewline
+      - run: cargo fmt --manifest-path installers/windows/Cargo.toml --all --check
+      - name: Build and lint the installer
+        env:
+          OSU_MAP_MANAGER_PAYLOAD: ${{ github.workspace }}\target\release\osu-map-manager.exe
+          OSU_MAP_MANAGER_UNINSTALLER: ${{ github.workspace }}\installers\windows\target\release\osu-map-manager-uninstaller.exe
+        run: |
+          cargo build --release --locked --manifest-path installers/windows/Cargo.toml -p osu-map-manager-uninstaller
+          cargo clippy --manifest-path installers/windows/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo build --release --locked --manifest-path installers/windows/Cargo.toml -p osu-map-manager-setup
+      - name: Exercise install and uninstall
+        shell: pwsh
+        run: |
+          function Start-And-Wait($file, $argLine) {
+            $info = New-Object System.Diagnostics.ProcessStartInfo
+            $info.FileName = $file
+            $info.Arguments = $argLine
+            $info.UseShellExecute = $false
+            $process = [System.Diagnostics.Process]::Start($info)
+            if (-not $process.WaitForExit(60000)) {
+              $process.Kill()
+              throw "timed out: $file $argLine"
+            }
+            return $process.ExitCode
           }
+
+          $setup = (Resolve-Path "installers/windows/target/release/osu-map-manager-setup.exe").Path
+          $dir = Join-Path $env:RUNNER_TEMP "omm install test"
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{39302626-0751-446A-B69C-61480EF09C17}"
+          $lnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\osu! Map Manager.lnk"
+
+          $code = Start-And-Wait $setup "/S `"/D=$dir`""
+          if ($code -ne 0) { throw "setup exited with $code" }
+          if (-not (Test-Path (Join-Path $dir "osu-map-manager.exe"))) { throw "the app was not installed" }
+          if (-not (Test-Path (Join-Path $dir "uninstall.exe"))) { throw "the uninstaller was not installed" }
+          if (-not (Test-Path $lnk)) { throw "the Start Menu shortcut was not created" }
+          if (-not (Test-Path $key)) { throw "the uninstall registry entry was not written" }
+
+          $code = Start-And-Wait (Join-Path $dir "uninstall.exe") "/S"
+          if ($code -ne 0) { throw "uninstaller exited with $code" }
+          for ($i = 0; $i -lt 80; $i++) {
+            if (-not (Test-Path $dir) -and -not (Test-Path $key) -and -not (Test-Path $lnk)) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          if (Test-Path $dir) { throw "the install directory survived the uninstall" }
+          if (Test-Path $key) { throw "the uninstall registry entry survived the uninstall" }
+          if (Test-Path $lnk) { throw "the Start Menu shortcut survived the uninstall" }
 
   worker:
     runs-on: ubuntu-latest

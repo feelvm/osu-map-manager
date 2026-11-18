@@ -29,8 +29,11 @@ results into osu!'s `collection.db`.
 
 **Installer:** grab `osu-map-manager-windows-x86_64-setup.exe` from
 [Releases](https://github.com/feelvm/osu-map-manager/releases) and run it. It
-installs the app with Start Menu (and optional desktop) shortcuts and an
-uninstaller — per user or for all users, your choice in the wizard.
+installs for the current user without an administrator prompt; the setup dialog
+also offers an all-users install (which asks for administrator approval). Both
+create Start Menu shortcuts, an optional desktop shortcut and an uninstaller.
+For an unattended per-user install, run
+`osu-map-manager-windows-x86_64-setup.exe /S`.
 
 **Portable:** grab `osu-map-manager-windows-x86_64.zip` instead, unzip, and run
 `osu-map-manager.exe` from anywhere.
@@ -43,6 +46,16 @@ Every release also publishes `checksums.txt` with the SHA-256 of both files.
 ```powershell
 cargo run --release
 ```
+
+**Build the installer:** after `cargo build --release`, the setup exe embeds the
+built app, so build the uninstaller first and then the setup:
+
+```powershell
+cargo build --release --locked --manifest-path installers/windows/Cargo.toml -p osu-map-manager-uninstaller
+cargo build --release --locked --manifest-path installers/windows/Cargo.toml -p osu-map-manager-setup
+```
+
+The result is `installers/windows/target/release/osu-map-manager-setup.exe`.
 
 ## Usage
 

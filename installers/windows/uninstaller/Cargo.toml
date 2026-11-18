@@ -1,0 +1,21 @@
+[package]
+name = "osu-map-manager-uninstaller"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "osu-map-manager-uninstaller"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+common = { package = "osu-map-manager-installer-common", path = "../common" }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+embed-resource = "3"
