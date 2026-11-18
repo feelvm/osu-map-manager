@@ -1,4 +1,5 @@
 use crate::{
+    app_icon,
     app_update::{self, AppRelease},
     collection,
     extras::{self, ExtrasEvent, ExtrasManifest, RollbackEvent},
@@ -69,6 +70,8 @@ const UPDATE_CHECK_DELAY: Duration = Duration::from_millis(300);
 const UPDATE_CHECK_DELAY_ANONYMOUS: Duration = Duration::from_millis(1100);
 
 pub struct MapManagerApp {
+    /// App icon decoded from `app.ico`, drawn beside the top-bar title.
+    app_logo: Option<egui::TextureHandle>,
     active_tab: AppTab,
     filters: BeatmapFilters,
     /// Mode filter as of the previous frame, so switching it can report how
@@ -800,6 +803,7 @@ impl MapManagerApp {
         };
 
         let mut app = Self {
+            app_logo: app_icon::header_texture(&cc.egui_ctx),
             active_tab: AppTab::Library,
             filters,
             last_mode_filter: ModeFilter::default(),
@@ -6330,6 +6334,15 @@ impl eframe::App for MapManagerApp {
             .frame(panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if let Some(logo) = &self.app_logo {
+                        // Square to the heading's line height, so the lockup
+                        // stays balanced if the heading style changes.
+                        let side = ui.text_style_height(&egui::TextStyle::Heading);
+                        ui.add(egui::Image::from_texture((
+                            logo.id(),
+                            egui::vec2(side, side),
+                        )));
+                    }
                     ui.heading("osu! Map Manager");
                     ui.separator();
                     for tab in [

@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+mod app_icon;
 mod app_update;
 mod collection;
 mod extras;
@@ -15,10 +16,16 @@ mod updates;
 use anyhow::Result;
 
 fn main() -> Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([1180.0, 640.0]);
+    // The same app.ico embedded in the exe: the title bar and taskbar match
+    // the file users see in Explorer.
+    if let Some(icon) = app_icon::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([1180.0, 640.0]),
+        viewport,
         ..Default::default()
     };
 
