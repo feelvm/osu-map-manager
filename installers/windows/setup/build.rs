@@ -39,6 +39,7 @@ fn main() -> Result<()> {
 
     println!("cargo:rerun-if-changed=setup.rc");
     println!("cargo:rerun-if-changed=../installer.manifest");
+    println!("cargo:rerun-if-changed=../../../app.ico");
     if let Err(err) = embed_resource::compile("setup.rc", embed_resource::NONE).manifest_optional()
     {
         panic!("embedding the Windows manifest failed: {err:?}");
